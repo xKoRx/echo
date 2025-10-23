@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package echo.v1;
+
+import "v1/common.proto";
+
+option go_package = "github.com/xKoRx/echo/sdk/pb/v1;echov1";
+
+// TradeIntent representa la intención de un trade desde un Master
+message TradeIntent {
+  string trade_id = 1;           // UUIDv7 único para este trade
+  int64 timestamp_ms = 2;        // Timestamp en milisegundos
+  string client_id = 3;          // Identificador del cliente EA (master)
+  string symbol = 4;             // Símbolo del instrumento
+  OrderSide side = 5;            // BUY o SELL
+  double lot_size = 6;           // Tamaño en lotes
+  double price = 7;              // Precio de apertura en el master
+  int64 magic_number = 8;        // MagicNumber MT4/MT5
+  int32 ticket = 9;              // Ticket MT4/MT5 del master
+  
+  // Opcional para iteraciones futuras
+  optional double stop_loss = 10;
+  optional double take_profit = 11;
+  optional string comment = 12;
+  optional int32 attempt = 13;   // Número de intento para reintentos
+}
+
+// TradeClose representa el cierre de un trade del Master
+message TradeClose {
+  string trade_id = 1;
+  int64 timestamp_ms = 2;
+  int32 ticket = 3;
+  double close_price = 4;
+  optional double profit = 5;
+  optional string reason = 6;    // "manual", "sl", "tp", "signal"
+}
+
+// TradeModify representa la modificación de SL/TP de un trade del Master
+message TradeModify {
+  string trade_id = 1;
+  int64 timestamp_ms = 2;
+  int32 ticket = 3;
+  optional double new_stop_loss = 4;
+  optional double new_take_profit = 5;
+}
+
+// ExecuteOrder comando para que un slave ejecute una orden
+message ExecuteOrder {
+  string command_id = 1;         // UUID del comando
+  string trade_id = 2;           // TradeID original del master
+  int64 timestamp_ms = 3;
+  string symbol = 4;
+  OrderSide side = 5;
+  double lot_size = 6;
+  int64 magic_number = 7;
+  
+  optional double stop_loss = 8;
+  optional double take_profit = 9;
+  optional string comment = 10;
+}
+
+// CloseOrder comando para cerrar una orden en slave
+message CloseOrder {
+  string command_id = 1;
+  string trade_id = 2;
+  int64 timestamp_ms = 3;
+  int32 ticket = 4;              // Ticket del slave a cerrar
+  optional double lot_size = 5;  // Para cierres parciales
+}
+
+// ModifyOrder comando para modificar SL/TP en slave
+message ModifyOrder {
+  string command_id = 1;
+  string trade_id = 2;
+  int64 timestamp_ms = 3;
+  int32 ticket = 4;
+  optional double new_stop_loss = 5;
+  optional double new_take_profit = 6;
+}
+
+// ExecutionResult resultado de la ejecución de un comando en slave
+message ExecutionResult {
+  string command_id = 1;
+  bool success = 2;
+  int32 ticket = 3;              // Ticket generado si success=true
+  ErrorCode error_code = 4;
+  optional string error_message = 5;
+  optional double executed_price = 6;
+  optional int64 execution_time_ms = 7;
+}
+
+// AccountInfo información de cuenta reportada por cliente
+message AccountInfo {
+  string account_id = 1;         // Identificador de cuenta
+  double balance = 2;
+  double equity = 3;
+  double margin = 4;
+  double margin_free = 5;
+  double margin_level = 6;
+  int64 timestamp_ms = 7;
+}
+
+// PositionInfo información de posición abierta
+message PositionInfo {
+  int32 ticket = 1;
+  string symbol = 2;
+  OrderSide side = 3;
+  double volume = 4;
+  double open_price = 5;
+  optional double stop_loss = 6;
+  optional double take_profit = 7;
+  double profit = 8;
+  int64 magic_number = 9;
+  optional string comment = 10;
+  int64 open_time_ms = 11;
+}
+
+// SymbolInfo especificaciones de un símbolo del broker
+message SymbolInfo {
+  string broker_symbol = 1;      // Nombre del símbolo en el broker
+  string canonical_symbol = 2;   // Nombre canónico normalizado
+  int32 digits = 3;              // Decimales
+  double point = 4;              // Tamaño del point
+  double tick_size = 5;
+  double tick_value = 6;
+  double min_lot = 7;
+  double max_lot = 8;
+  double lot_step = 9;
+  int32 stop_level = 10;         // Nivel mínimo de stop en points
+  optional double contract_size = 11;
+  optional string description = 12;
+}
+

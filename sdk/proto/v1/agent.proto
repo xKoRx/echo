@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package echo.v1;
+
+import "v1/trade.proto";
+
+option go_package = "github.com/xKoRx/echo/sdk/pb/v1;echov1";
+
+// AgentService define el servicio de comunicación Agent ↔ Core
+service AgentService {
+  // StreamBidi es el streaming bidireccional principal
+  rpc StreamBidi(stream AgentMessage) returns (stream CoreMessage);
+  
+  // Ping para health checks
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// AgentMessage mensajes que el Agent envía al Core
+message AgentMessage {
+  string agent_id = 1;
+  int64 timestamp_ms = 2;
+  
+  oneof payload {
+    AgentHello hello = 10;
+    TradeIntent trade_intent = 11;
+    TradeClose trade_close = 12;
+    TradeModify trade_modify = 13;
+    ExecutionResult execution_result = 14;
+    StateSnapshot state_snapshot = 15;
+    AgentHeartbeat heartbeat = 16;
+  }
+}
+
+// CoreMessage mensajes que el Core envía al Agent
+message CoreMessage {
+  int64 timestamp_ms = 1;
+  
+  oneof payload {
+    ExecuteOrder execute_order = 10;
+    CloseOrder close_order = 11;
+    ModifyOrder modify_order = 12;
+    ConfigUpdate config_update = 13;
+    Ack ack = 14;
+  }
+}
+
+// AgentHello mensaje inicial de conexión del Agent
+message AgentHello {
+  string agent_id = 1;
+  string version = 2;
+  string hostname = 3;
+  string os = 4;
+  repeated string connected_clients = 5;
+  map<string, SymbolInfo> symbols = 6;
+}
+
+// StateSnapshot snapshot de estado de cuentas/posiciones
+message StateSnapshot {
+  repeated AccountInfo accounts = 1;
+  repeated PositionInfo positions = 2;
+  int64 timestamp_ms = 3;
+}
+
+// AgentHeartbeat heartbeat periódico
+message AgentHeartbeat {
+  string agent_id = 1;
+  int64 timestamp_ms = 2;
+  repeated string connected_clients = 3;
+  optional int32 pending_commands = 4;
+}
+
+// ConfigUpdate actualización de configuración desde Core
+message ConfigUpdate {
+  string version = 1;
+  map<string, string> config = 2;
+}
+
+// Ack confirmación de recepción
+message Ack {
+  string message_id = 1;
+  bool success = 2;
+  optional string error = 3;
+}
+
+// PingRequest/Response para health checks
+message PingRequest {
+  string agent_id = 1;
+}
+
+message PingResponse {
+  string status = 1;
+  int64 timestamp_ms = 2;
+}
+

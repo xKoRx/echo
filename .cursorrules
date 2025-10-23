@@ -1,0 +1,463 @@
+# Echo Project Rules
+
+## 🎯 Contexto del Proyecto
+
+**Echo** es un sistema de copiado de operaciones de trading algorítmico.
+- **Objetivo**: Replicar trades de masters MT4/MT5 a múltiples slaves con latencia <1s
+- **Arquitectura**: Monorepo Go con gRPC bidi + Named Pipes IPC
+- **Stack**: Go 1.25, PostgreSQL 16, etcd v3, OpenTelemetry
+- **Versión**: 0.0.1 (MVP V1)
+
+## 🚫 Regla Fundamental: Independencia Total
+
+**CRÍTICO**: Echo es un proyecto **INDEPENDIENTE** del ecosistema xKoRx/sdk y xKoRx/symphony.
+
+### Prohibido Absolutamente
+- ❌ Importar código de `github.com/xKoRx/sdk` (excepto referencia documental)
+- ❌ Importar código de `github.com/xKoRx/symphony`
+- ❌ Copiar patrones problemáticos de proyectos anteriores
+- ❌ Crear dependencias cruzadas con otros proyectos
+
+### Permitido
+- ✅ Usar la **arquitectura conceptual** como referencia
+- ✅ Aprender de errores pasados (evitar deuda técnica)
+- ✅ Crear implementaciones **limpias desde cero**
+- ✅ Documentar decisiones en ADRs
+
+---
+
+## 🏗️ Arquitectura
+
+### Módulos Independientes
+
+```
+echo/
+├── core/          go.mod independiente
+├── agent/         go.mod independiente
+├── sdk/           go.mod independiente (publicable)
+├── test_e2e/      go.mod independiente
+└── clients/       MQL4/MQL5 (no Go)
+```
+
+- Cada módulo tiene su `go.mod` propio
+- Go workspaces (`go.work`) solo para desarrollo local
+- Sin dependencias circulares
+
+### Comunicación
+
+- **Core ↔ Agent**: gRPC bidi-streaming
+- **Agent ↔ EAs**: Named Pipes (Windows IPC) con JSON
+- **Config**: etcd v3 (live watches)
+- **State**: PostgreSQL 16
+
+---
+
+## 📦 Convenciones de Código
+
+### Go Style
+
+- **Go 1.25 idiomático**
+- **Nombres descriptivos** (no abreviaturas crípticas)
+- **Funciones cortas** (<50 líneas)
+- **Single Responsibility Principle**
+- **Prefer composition over inheritance**
+
+### Estructura de Paquetes
+
+```go
+// ✅ Correcto
+core/
+  internal/
+    engine/          // Lógica privada del core
+    policy/
+  pkg/
+    config/          // Exportable a otros módulos del monorepo
+
+// ❌ Incorrecto
+core/
+  utils/             // Nombre vago
+  helpers/           // Nombre genérico
+```
+
+### Error Handling
+
+```go
+// ✅ Correcto
+func ProcessTrade(ctx context.Context, intent *TradeIntent) error {
+    if err := validate(intent); err != nil {
+        return fmt.Errorf("validation failed: %w", err)
+    }
+    return nil
+}
+
+// ❌ Incorrecto
+func ProcessTrade(ctx context.Context, intent *TradeIntent) error {
+    if err := validate(intent); err != nil {
+        log.Println(err)  // No propagar error
+    }
+    return nil
+}
+```
+
+---
+
+## 🔧 Telemetría
+
+### Implementación Propia
+
+Echo tiene su **propia implementación** de telemetry en `/sdk/telemetry`:
+
+- Basada en `log/slog` + OpenTelemetry
+- Sin dependencias externas problemáticas (no zeromq, etc.)
+- API limpia y simple
+
+### Uso Obligatorio
+
+```go
+import "github.com/xKoRx/echo/sdk/telemetry"
+
+// ✅ Correcto
+client, err := telemetry.New(ctx, "echo-core", "production")
+if err != nil {
+    panic(err)
+}
+defer client.Shutdown(ctx)
+
+// Logs estructurados
+client.Info(ctx, "Trade copied", 
+    attribute.String("trade_id", id),
+)
+
+// Métricas
+client.RecordCounter(ctx, "trades.copied", 1)
+
+// Trazas
+ctx, span := client.StartSpan(ctx, "copy_trade")
+defer span.End()
+```
+
+### Atributos en Contexto
+
+```go
+// Al inicio de operación
+ctx = telemetry.AppendCommonAttrs(ctx,
+    attribute.String("component", "engine"),
+)
+
+ctx = telemetry.AppendEventAttrs(ctx,
+    attribute.String("trade_id", id),
+)
+
+// Los logs/métricas heredan estos atributos automáticamente
+client.Info(ctx, "Processing")  // trade_id incluido
+```
+
+---
+
+## 🗄️ Configuración
+
+### etcd Obligatorio
+
+Toda configuración **DEBE** venir de etcd:
+
+```go
+// ✅ Correcto
+import clientv3 "go.etcd.io/etcd/client/v3"
+
+etcdClient, err := clientv3.New(clientv3.Config{
+    Endpoints: []string{"localhost:2379"},
+})
+defer etcdClient.Close()
+
+resp, err := etcdClient.Get(ctx, "/echo/policy/max_spread")
+```
+
+### Excepciones ÚNICAS
+
+Solo estas variables pueden usarse con `os.Getenv`:
+
+- `ENV` (environment: development, production)
+- `HOST_KEY` (identificador de host)
+- `hostname` (via `os.Hostname()`)
+
+```go
+// ✅ Permitido
+env := os.Getenv("ENV")
+if env == "" {
+    env = "development"
+}
+
+// ❌ Prohibido
+maxSpread := os.Getenv("MAX_SPREAD")  // Debe venir de etcd
+```
+
+---
+
+## 🧪 Testing
+
+### Cobertura Objetivo
+
+- **Core**: ≥95%
+- **Agent**: ≥95%
+- **SDK**: ≥95%
+- **E2E**: Flujos críticos completos
+
+### Estructura
+
+```go
+// ✅ Correcto
+func TestEngine_ProcessIntent_Success(t *testing.T) {
+    // Arrange
+    engine := NewEngine(mockRepo, mockPolicy)
+    intent := &TradeIntent{...}
+    
+    // Act
+    err := engine.ProcessIntent(ctx, intent)
+    
+    // Assert
+    require.NoError(t, err)
+    assert.Equal(t, expected, actual)
+}
+```
+
+### Mocks
+
+Usar `testify/mock`:
+
+```go
+type MockRepository struct {
+    mock.Mock
+}
+
+func (m *MockRepository) SaveTrade(ctx context.Context, trade *Trade) error {
+    args := m.Called(ctx, trade)
+    return args.Error(0)
+}
+```
+
+---
+
+## 📝 Contratos (Proto)
+
+### Ubicación
+
+Todos los `.proto` viven en `/sdk/proto/v1/`:
+
+```
+sdk/
+  proto/
+    v1/
+      common.proto
+      trade.proto
+      agent.proto
+    buf.yaml
+    buf.gen.yaml
+  pb/               # Código generado
+    v1/
+```
+
+### Generación
+
+```bash
+cd sdk/proto
+./generate.sh
+
+# O desde raíz
+make proto
+```
+
+### Versionado
+
+- **v1**: Primera versión estable
+- **Backward compatibility**: No breaking changes en v1
+- **Deprecation**: Marcar campos obsoletos con `[deprecated=true]`
+
+---
+
+## 🔒 Idempotencia
+
+### trade_id como Clave
+
+```go
+// Generar con UUIDv7 (ordenable por tiempo)
+import "github.com/google/uuid"
+
+tradeID := uuid.NewV7().String()  // ej: "01912345-6789-7abc-def0-123456789abc"
+```
+
+### Deduplicación
+
+```go
+// Core debe mantener map de trade_ids procesados
+type TradeRegistry struct {
+    mu     sync.RWMutex
+    trades map[string]*TradeState
+}
+
+func (r *TradeRegistry) IsProcessed(tradeID string) bool {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    _, exists := r.trades[tradeID]
+    return exists
+}
+```
+
+---
+
+## 🚀 Performance
+
+### Latencia
+
+- **Objetivo**: p95 < 100ms intra-host
+- **Medición obligatoria** con métricas:
+
+```go
+start := time.Now()
+// ... operación ...
+latency := time.Since(start).Milliseconds()
+client.RecordLatency(ctx, "trade.copy", float64(latency))
+```
+
+### Concurrencia
+
+- **Multi-slave**: Enviar comandos en paralelo con goroutines
+- **Context propagation**: Propagar `context.Context` siempre
+
+```go
+// ✅ Correcto
+for _, slave := range slaves {
+    go func(s Slave) {
+        if err := sendToSlave(ctx, s, cmd); err != nil {
+            client.Error(ctx, "failed to send", err)
+        }
+    }(slave)
+}
+```
+
+---
+
+## 📚 Documentación
+
+### Obligatorio
+
+- `doc.go` en cada paquete público
+- Comentarios en funciones/tipos exportados
+- READMEs en cada módulo
+- RFCs para decisiones arquitectónicas
+- ADRs para decisiones técnicas
+
+### Formato
+
+```go
+// Package engine implementa el motor de copiado de trades.
+//
+// El engine es responsable de:
+// - Validar políticas
+// - Calcular Money Management
+// - Distribuir órdenes a slaves
+//
+// Uso básico:
+//
+//	eng := engine.New(repo, policy)
+//	err := eng.ProcessIntent(ctx, intent)
+//
+package engine
+```
+
+---
+
+## 🔄 Git Workflow
+
+### Branches
+
+- `main`: Producción (estable)
+- `develop`: Integración
+- `feature/*`: Features nuevos
+- `fix/*`: Bug fixes
+- `hotfix/*`: Fixes urgentes
+
+### Commits
+
+Conventional Commits:
+
+```
+feat: add SL/TP offset calculation
+fix: handle StopLevel rejection correctly
+docs: update RFC-001 with policy details
+test: add E2E test for multi-slave scenario
+chore: update dependencies
+```
+
+### Pull Requests
+
+- **Idioma**: Español
+- **Template**: `docs/pull_request_template.md`
+- **Límite**: ≤20 archivos por PR
+- **Tests**: CI debe pasar (build + lint + test)
+- **Revisión**: Al menos 1 aprobación
+
+---
+
+## 🛡️ Anti-Patrones Prohibidos
+
+### Código
+
+- ❌ Funciones >100 líneas
+- ❌ Comentarios redundantes (`// Get user` en `GetUser()`)
+- ❌ Magic numbers sin constantes
+- ❌ Ignorar errores (`_ = fn()`)
+- ❌ Variables de un solo caracter (excepto `i`, `j` en loops)
+
+### Arquitectura
+
+- ❌ God objects con múltiples responsabilidades
+- ❌ Dependencias circulares
+- ❌ Tight coupling entre módulos
+- ❌ Lógica de negocio en handlers HTTP/gRPC
+
+### Telemetría
+
+- ❌ Usar `fmt.Println` o `log.*` directamente
+- ❌ Nombres de métricas con IDs dinámicos
+- ❌ Spans sin `defer span.End()`
+- ❌ Perder contexto con `context.Background()` en medio del flujo
+
+---
+
+## 📋 Checklist de PR
+
+Antes de crear un PR:
+
+- [ ] Código compilado: `make build`
+- [ ] Tests pasando: `make test`
+- [ ] Linters limpios: `make lint`
+- [ ] Cobertura ≥95% en cambios: `go test -cover`
+- [ ] Proto regenerado si cambió: `make proto`
+- [ ] Documentación actualizada (READMEs, doc.go)
+- [ ] Sin imports de `github.com/xKoRx/{sdk,symphony}`
+- [ ] Telemetría presente (logs, métricas, trazas)
+- [ ] Errors manejados explícitamente
+
+---
+
+## 🎯 Principios SOLID
+
+- **S**: Single Responsibility (una clase, una razón para cambiar)
+- **O**: Open/Closed (abierto a extensión, cerrado a modificación)
+- **L**: Liskov Substitution (subtipos intercambiables)
+- **I**: Interface Segregation (interfaces pequeñas y específicas)
+- **D**: Dependency Inversion (depender de abstracciones, no concreciones)
+
+---
+
+## 📞 Contacto y Soporte
+
+- **Equipo**: Aranea Labs - Trading Copier Team
+- **Documentación**: `/docs`
+- **RFCs**: `/docs/RFC-*.md`
+- **ADRs**: `/docs/adr/*.md`
+
+---
+
+**Fin de Rules - Echo Project**
+

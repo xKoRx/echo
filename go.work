@@ -1,0 +1,9 @@
+go 1.23
+
+use (
+	./core
+	./agent
+	./sdk
+	./test_e2e
+)
+

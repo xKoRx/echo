@@ -1,0 +1,60 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+echo-core
+echo-agent
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.out
+
+# Go workspace file
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/bin/
+/dist/
+/build/
+
+# Generated code
+*.pb.go
+*_grpc.pb.go
+
+# Logs
+*.log
+
+# Config overrides
+config.local.yaml
+*.local.yaml
+
+# Telemetry data
+*.trace
+
+# MQL compiled
+*.ex4
+*.ex5
+
+# Temporary files
+tmp/
+temp/
+

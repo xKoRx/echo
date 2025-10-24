@@ -1,6 +1,6 @@
 module github.com/xKoRx/echo/agent
 
-go 1.23
+go 1.25
 
 require (
 	github.com/xKoRx/echo/sdk v0.0.0

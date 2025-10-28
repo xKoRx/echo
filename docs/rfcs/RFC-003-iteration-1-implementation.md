@@ -67,7 +67,7 @@ Fuera de alcance en i1: políticas avanzadas, ventanas de no-ejecución, sizing 
 - Retries simples y acotados sólo en canales de transporte (no price-chase).
 
 4) Configuración central:
-- Mover a ETCD (v3) las claves mínimas: endpoints Core/OTLP, toggles (`agent.flush_force`, `agent.retry_enabled`), límites (colas, buffers), y parámetros de KeepAlive. Cliente oficial: `github.com/xKoRx/sdk/pkg/shared/etcd`.
+- Mover a ETCD (v3) las claves mínimas: endpoints Core/OTLP, toggles (`agent.flush_force`, `agent.retry_enabled`), límites (colas, buffers), y parámetros de KeepAlive. Cliente oficial: `github.com/xKoRx/echo/sdk/etcd` (copiado de shared).
 
 5) Observabilidad:
 - Consolidar métricas/trazas/logs con `github.com/xKoRx/echo/sdk/telemetry`. Mantener `EchoMetrics` como bundle de métricas de dominio.
@@ -216,7 +216,110 @@ Prefijo: `/echo/`.
     /keepalive/min_time_s     → 10
 ```
 
-Cliente: `github.com/xKoRx/sdk/pkg/shared/etcd`. Carga única al inicio + watches para cambios.
+Cliente: `github.com/xKoRx/echo/sdk/etcd`. Carga única al inicio + watches para cambios.
+
+---
+
+## 17. Aplicaciones a modificar (alto nivel)
+
+- Core (Go, gRPC server):
+  - Integrar Postgres para `trades`, `executions`, `dedupe`.
+  - Dedupe persistente por `trade_id` (estados) y correlación de cierres por `ticket`.
+  - KeepAlive/heartbeats en gRPC; política de reintentos de transporte.
+  - Carga de configuración desde ETCD (endpoints, toggles, límites, KA).
+  - Telemetría con `echo/sdk/telemetry` + `EchoMetrics`.
+
+- Agent (Go, Windows Service):
+  - Heartbeats a Core; respeto de KeepAlive cliente.
+  - Toggle `FlushFileBuffers=false` por defecto; sólo benchmark bajo flag.
+  - Enriquecimiento de timestamps (t4) y forwarding sin duplicación.
+  - Carga de configuración desde ETCD.
+
+- SDK de Echo (Go):
+  - `pb/v1` estable; validadores de forma (UUIDv7, campos obligatorios).
+  - `telemetry`: bundle `EchoMetrics` (latencias hop/E2E, resultados, errores).
+  - `etcd`: cliente y helpers de carga/watches.
+  - `domain`: transformers y validaciones; helpers de timestamps.
+  - (Opcional) `grpc` helpers para KeepAlive y backoff standard.
+
+- EAs MQL4 (Master/Slave):
+  - Master: sin cambios funcionales, asegurar `trade_id` UUIDv7.
+  - Slave: incluir `trade_id` en `comment` de `OrderSend`; timestamps t5–t7 completos en `ExecutionResult`.
+
+---
+
+## 18. Mapa de capacidades i1
+
+- Impactadas (afectadas indirectamente):
+  - Observabilidad E2E (nuevas métricas y spans; mismas rutas).
+  - Transporte gRPC (KeepAlive y estabilidad de stream).
+  - IPC Named Pipes (política de flush).
+
+- Modificadas (evolución de existentes):
+  - Idempotencia/dedupe: de in-memory a persistente con estados.
+  - Cierre: de `magic_number` a `ticket` exacto por correlación persistida.
+  - Configuración: de hardcodes a ETCD (mínimo viable i1).
+
+- Nuevas (no existían en i0):
+  - Persistencia de `trades`/`executions`/`dedupe` en Postgres.
+  - Heartbeats ligeros Agent/Core.
+  - Política documentada de KeepAlive gRPC.
+  - Estampado de `trade_id` en `comment` del slave (fallback de correlación).
+
+---
+
+## 19. Componentes a crear/actualizar y responsabilidades
+
+- Core
+  - `core/repository` (nuevo): interfaces + impl Postgres para `trades`, `executions`, `dedupe`.
+  - `core/services/dedupe` (nuevo): transición de estados, TTL de limpieza.
+  - `core/services/correlation` (nuevo): `trade_id → {account_id → [tickets]}`; selección de `ticket` para `CloseOrder`.
+  - `core/services/telemetry` (actualizar): métricas E2E/hop, errores por código.
+  - `core/config` (nuevo): carga/watches de ETCD; exponer opciones inmutables.
+  - `core/grpc/stream` (actualizar): KeepAlive server, loop de lectura/escritura con canales con buffer.
+  - `core/migrations` (nuevo): migraciones SQL versionadas.
+
+- Agent
+  - `agent/config` (nuevo): carga/watches ETCD; flags `flush_force`, `retry_enabled`.
+  - `agent/ipc` (actualizar): `FlushFileBuffers=false` por defecto; writer/reader line-delimited.
+  - `agent/grpc/client` (actualizar): KeepAlive cliente; backoff de reconexión (transporte).
+  - `agent/heartbeat` (nuevo): envío periódico de `AgentHeartbeat`.
+  - `agent/telemetry` (actualizar): métricas de forwarding y delivery a pipes.
+
+- SDK Echo
+  - `sdk/etcd` (nuevo en echo): cliente con API simple + watches.
+  - `sdk/telemetry` (actualizar): `EchoMetrics` consolidado.
+  - `sdk/domain` (actualizar): validaciones/transformers i1.
+  - `sdk/utils` (actualizar): UUIDv7, timestamps helpers consistentes.
+
+- EAs
+  - `SlaveEA`: helper para insertar `trade_id` en comment; reporte completo t5–t7.
+
+---
+
+## 20. Recomendación de abordaje de la iteración
+
+Orden sugerido (SDK-first):
+1) SDK Echo: `pb/v1` validado, `telemetry` (EchoMetrics), `etcd`, `domain/utils`.
+2) Core: migraciones SQL → repositorios → servicios (dedupe/correlation) → gRPC server (KeepAlive) → config ETCD → telemetría.
+3) Agent: config ETCD → gRPC cliente (KeepAlive/backoff) → IPC writer/reader sin flush forzado → heartbeats → telemetría.
+4) EAs: ajustes mínimos en SlaveEA (comment con `trade_id`, timestamps completos).
+5) Pruebas: unitarias SDK; integración Core/Agent+DB; resiliencia KeepAlive/IPC; métricas visibles.
+
+Buenas prácticas (obligatorias):
+- Código escalable, modular, clean code y SOLID (SRP, OCP, LSP, ISP, DIP).
+- Programar contra interfaces; inyección de dependencias; bajo acoplamiento entre módulos.
+- Errores: jamás ignorarlos; propagación explícita; sin capturas vacías.
+- Contexto: propagar `context.Context`; no crear `context.Background()` en hot-path; atributos vía `telemetry`.
+- Config: sólo ETCD (`github.com/xKoRx/echo/sdk/etcd`); carga una vez y watches; sin `os.Getenv` (salvo excepciones aprobadas).
+- Observabilidad: spans cerrados, `RecordError`, métricas sin cardinalidad explosiva.
+- Performance: canales con buffer, no bloquear goroutines de stream; evitar I/O sin necesidad en hot-path.
+- Testing: table-driven, mocks de interfaces, cobertura de rutas de error.
+
+Definición de listo (DoD) i1:
+- Migraciones aplicadas; dedupe persistente operando; cierres por `ticket` verificados.
+- KeepAlive estable (>60 min); 20 ejecuciones sin duplicados; métricas E2E en Prometheus.
+- Config desde ETCD activa; toggles funcionales; telemetría visible en Jaeger/Loki.
 
 ---
 

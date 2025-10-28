@@ -16,6 +16,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"go.opentelemetry.io/otel/trace"
+	
+	"github.com/xKoRx/echo/sdk/telemetry/metricbundle"
 )
 
 // Client es el cliente unificado de telemetría para echo
@@ -32,6 +34,9 @@ type Client struct {
 	// Instrumentos de métricas comunes
 	counters   map[string]metric.Int64Counter
 	histograms map[string]metric.Float64Histogram
+	
+	// Metric bundles
+	echoMetrics *metricbundle.EchoMetrics
 }
 
 // New crea una nueva instancia del cliente de telemetría
@@ -91,10 +96,14 @@ func (c *Client) initLogs() {
 }
 
 func (c *Client) initTraces(ctx context.Context, res *resource.Resource) error {
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(c.config.OTLPEndpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+    endpoint := c.config.OTLPTracesEndpoint
+    if endpoint == "" {
+        endpoint = c.config.OTLPEndpoint
+    }
+    exporter, err := otlptracegrpc.New(ctx,
+        otlptracegrpc.WithEndpoint(endpoint),
+        otlptracegrpc.WithInsecure(),
+    )
 	if err != nil {
 		return err
 	}
@@ -111,10 +120,14 @@ func (c *Client) initTraces(ctx context.Context, res *resource.Resource) error {
 }
 
 func (c *Client) initMetrics(ctx context.Context, res *resource.Resource) error {
-	exporter, err := otlpmetricgrpc.New(ctx,
-		otlpmetricgrpc.WithEndpoint(c.config.OTLPEndpoint),
-		otlpmetricgrpc.WithInsecure(),
-	)
+    endpoint := c.config.OTLPMetricsEndpoint
+    if endpoint == "" {
+        endpoint = c.config.OTLPEndpoint
+    }
+    exporter, err := otlpmetricgrpc.New(ctx,
+        otlpmetricgrpc.WithEndpoint(endpoint),
+        otlpmetricgrpc.WithInsecure(),
+    )
 	if err != nil {
 		return err
 	}
@@ -126,6 +139,13 @@ func (c *Client) initMetrics(ctx context.Context, res *resource.Resource) error 
 	
 	otel.SetMeterProvider(c.meterProvider)
 	c.meter = c.meterProvider.Meter(c.config.ServiceName)
+	
+	// Inicializar bundles de métricas
+	echoMetrics, err := metricbundle.NewEchoMetrics(c.meter)
+	if err != nil {
+		return fmt.Errorf("failed to init echo metrics: %w", err)
+	}
+	c.echoMetrics = echoMetrics
 	
 	return nil
 }
@@ -192,5 +212,18 @@ func ExtractAttributes(ctx context.Context) []attribute.KeyValue {
 	// TODO: Implementar extracción de atributos desde context
 	// Por ahora retorna vacío
 	return []attribute.KeyValue{}
+}
+
+// EchoMetrics retorna el bundle de métricas de Echo.
+//
+// Example:
+//
+//	metrics := client.EchoMetrics()
+//	metrics.RecordIntentReceived(ctx,
+//	    semconv.Echo.TradeID.String("01HKQV8Y..."),
+//	    semconv.Echo.Symbol.String("XAUUSD"),
+//	)
+func (c *Client) EchoMetrics() *metricbundle.EchoMetrics {
+	return c.echoMetrics
 }
 

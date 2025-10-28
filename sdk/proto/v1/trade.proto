@@ -23,16 +23,23 @@ message TradeIntent {
   optional double take_profit = 11;
   optional string comment = 12;
   optional int32 attempt = 13;   // Número de intento para reintentos
+  
+  // Timestamps para latencia E2E (Issue #C1)
+  TimestampMetadata timestamps = 20;
 }
 
 // TradeClose representa el cierre de un trade del Master
 message TradeClose {
   string trade_id = 1;
   int64 timestamp_ms = 2;
-  int32 ticket = 3;
-  double close_price = 4;
-  optional double profit = 5;
-  optional string reason = 6;    // "manual", "sl", "tp", "signal"
+  string client_id = 3;          // Cliente que cerró (Issue #M4)
+  string account_id = 4;         // Account ID del master (Issue #M4)
+  int32 ticket = 5;
+  string symbol = 6;             // Símbolo para correlación (Issue #M4)
+  int64 magic_number = 7;        // MagicNumber para correlación (Issue #M4)
+  double close_price = 8;
+  optional double profit = 9;
+  optional string reason = 10;   // "manual", "sl", "tp", "signal"
 }
 
 // TradeModify representa la modificación de SL/TP de un trade del Master
@@ -49,14 +56,19 @@ message ExecuteOrder {
   string command_id = 1;         // UUID del comando
   string trade_id = 2;           // TradeID original del master
   int64 timestamp_ms = 3;
-  string symbol = 4;
-  OrderSide side = 5;
-  double lot_size = 6;
-  int64 magic_number = 7;
+  string target_client_id = 4;   // Slave destino (Issue #C5)
+  string target_account_id = 5;  // Account ID del slave destino (Issue #C5)
+  string symbol = 6;
+  OrderSide side = 7;
+  double lot_size = 8;
+  int64 magic_number = 9;
   
-  optional double stop_loss = 8;
-  optional double take_profit = 9;
-  optional string comment = 10;
+  optional double stop_loss = 10;
+  optional double take_profit = 11;
+  optional string comment = 12;
+  
+  // Timestamps para latencia E2E (Issue #C1)
+  TimestampMetadata timestamps = 20;
 }
 
 // CloseOrder comando para cerrar una orden en slave
@@ -65,7 +77,14 @@ message CloseOrder {
   string trade_id = 2;
   int64 timestamp_ms = 3;
   int32 ticket = 4;              // Ticket del slave a cerrar
-  optional double lot_size = 5;  // Para cierres parciales
+  string target_client_id = 5;   // Slave destino (Issue #C3)
+  string target_account_id = 6;  // Account ID del slave destino (Issue #C3)
+  string symbol = 7;              // Símbolo para validación (Issue #C3)
+  int64 magic_number = 8;         // MagicNumber para búsqueda si ticket==0 (Issue #C3)
+  optional double lot_size = 9;   // Para cierres parciales
+  
+  // Timestamps para latencia E2E (Issue #C1)
+  TimestampMetadata timestamps = 20;
 }
 
 // ModifyOrder comando para modificar SL/TP en slave
@@ -81,12 +100,16 @@ message ModifyOrder {
 // ExecutionResult resultado de la ejecución de un comando en slave
 message ExecutionResult {
   string command_id = 1;
-  bool success = 2;
-  int32 ticket = 3;              // Ticket generado si success=true
-  ErrorCode error_code = 4;
-  optional string error_message = 5;
-  optional double executed_price = 6;
-  optional int64 execution_time_ms = 7;
+  string trade_id = 2;           // TradeID original para correlación (Issue #C2)
+  bool success = 3;
+  int32 ticket = 4;              // Ticket generado si success=true
+  ErrorCode error_code = 5;
+  optional string error_message = 6;
+  optional double executed_price = 7;
+  optional int64 execution_time_ms = 8;
+  
+  // Timestamps para latencia E2E (Issue #C1)
+  TimestampMetadata timestamps = 20;
 }
 
 // AccountInfo información de cuenta reportada por cliente

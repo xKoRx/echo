@@ -7,13 +7,16 @@ type Config struct {
 	ServiceName    string
 	ServiceVersion string
 	Environment    string
-	
-	// OTLP Collector endpoint
-	OTLPEndpoint string
-	
+
+	// OTLP Collector endpoints
+	// Traces y métricas pueden vivir en endpoints/puertos distintos
+	OTLPEndpoint        string // Compat: si se setea, aplica a ambos si los específicos están vacíos
+	OTLPTracesEndpoint  string
+	OTLPMetricsEndpoint string
+
 	// Atributos comunes a todos los logs, métricas y trazas
 	CommonAttributes []attribute.KeyValue
-	
+
 	// Habilitar/deshabilitar componentes
 	EnableLogs    bool
 	EnableMetrics bool
@@ -23,14 +26,16 @@ type Config struct {
 // DefaultConfig retorna una configuración con valores por defecto
 func DefaultConfig(serviceName, environment string) Config {
 	return Config{
-		ServiceName:      serviceName,
-		ServiceVersion:   "0.0.1",
-		Environment:      environment,
-		OTLPEndpoint:     "localhost:4317",
-		EnableLogs:       true,
-		EnableMetrics:    true,
-		EnableTraces:     true,
-		CommonAttributes: []attribute.KeyValue{},
+		ServiceName:         serviceName,
+		ServiceVersion:      "0.0.1",
+		Environment:         environment,
+		OTLPEndpoint:        "192.168.31.60:4317",
+		OTLPTracesEndpoint:  "",
+		OTLPMetricsEndpoint: "",
+		EnableLogs:          true,
+		EnableMetrics:       true,
+		EnableTraces:        true,
+		CommonAttributes:    []attribute.KeyValue{},
 	}
 }
 
@@ -49,6 +54,16 @@ func WithOTLPEndpoint(endpoint string) Option {
 	return func(c *Config) {
 		c.OTLPEndpoint = endpoint
 	}
+}
+
+// WithTracesEndpoint establece endpoint específico para trazas
+func WithTracesEndpoint(endpoint string) Option {
+	return func(c *Config) { c.OTLPTracesEndpoint = endpoint }
+}
+
+// WithMetricsEndpoint establece endpoint específico para métricas
+func WithMetricsEndpoint(endpoint string) Option {
+	return func(c *Config) { c.OTLPMetricsEndpoint = endpoint }
 }
 
 // WithCommonAttributes añade atributos comunes
@@ -78,4 +93,3 @@ func WithTracesDisabled() Option {
 		c.EnableTraces = false
 	}
 }
-

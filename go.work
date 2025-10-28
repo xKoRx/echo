@@ -1,9 +1,8 @@
 go 1.25
 
 use (
-	./core
 	./agent
+	./core
 	./sdk
 	./test_e2e
 )
-

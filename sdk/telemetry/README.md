@@ -14,7 +14,7 @@ ctx := context.Background()
 // Inicializar
 client, err := telemetry.New(ctx, "echo-core", "production",
     telemetry.WithVersion("1.0.0"),
-    telemetry.WithOTLPEndpoint("localhost:4317"),
+    telemetry.WithOTLPEndpoint("192.168.31.60:4317"),
 )
 if err != nil {
     panic(err)

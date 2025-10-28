@@ -1,3 +1,81 @@
+# Echo — Visión General (i0)
+
+Echo es un trade copier orientado a baja latencia para replicar operaciones desde uno o más Masters hacia uno o más Slaves utilizando EAs (MT4/MT5), un Agent intermedio y un Core orquestador.
+
+## Componentes
+
+- Agent (Go, Windows):
+  - Crea servidores de Named Pipes y espera conexión de EAs (Master y Slaves).
+  - Traduce JSON↔Proto usando `sdk/domain`.
+  - Envía `TradeIntent` y `ExecutionResult` al Core por gRPC bidi.
+  - Recibe `ExecuteOrder`/`CloseOrder` desde el Core y los despacha a los Slaves por pipe.
+
+- Core (Go):
+  - Servidor gRPC bidi para Agents.
+  - Router orquesta: valida, deduplica, transforma `TradeIntent`→`ExecuteOrder` y hace broadcast a Agents.
+  - Mantiene métricas y logs con `sdk/telemetry`.
+
+- SDK (Go):
+  - Contratos Proto v1 (`sdk/pb/v1`) con `TimestampMetadata` t0…t7.
+  - Transformadores JSON↔Proto y validaciones de dominio.
+
+- EAs (MQL4/5):
+  - Master: emite `trade_intent` y `trade_close` por pipe.
+  - Slave: recibe `execute_order`/`close_order`, ejecuta en broker y reporta `execution_result`.
+
+## Flujo E2E (2 Masters × 2 Slaves)
+
+1) Master EA → Agent
+   - Master se conecta (cliente) a pipe del Agent (servidor) y envía JSON `trade_intent`.
+   - Agent parsea, valida, añade t1 y envía `TradeIntent` al Core por gRPC.
+
+2) Agent → Core (gRPC bidi)
+   - Core recibe (t2), valida símbolo, dedupe `trade_id`.
+   - Core genera N `ExecuteOrder` (uno por Slave), clona timestamps y marca t3.
+
+3) Core → Agent(s)
+   - Core hace broadcast por los streams bidi activos.
+   - Agent al recibir marca t4 y rutea por `target_account_id` al pipe del Slave correspondiente.
+
+4) Agent → Slave EA (pipe)
+   - Agent transforma Proto→JSON y escribe en el pipe del Slave.
+   - Slave ejecuta; al enviar `execution_result`, incluye `trade_id` y t5-t7.
+
+5) Slave EA → Agent → Core
+   - Agent parsea `execution_result` y lo envía al Core.
+   - Core actualiza dedupe a FILLED/REJECTED y registra latencia E2E si t0 y t7 están presentes.
+
+6) Cierres (Close)
+   - Master envía `trade_close` por pipe.
+   - Core crea `CloseOrder` por cada Slave, rellena `target_*`, inicializa timestamps y marca t3.
+   - Agent marca t4 y lo despacha al Slave destino.
+
+## Telemetría y Timestamps
+
+- `TimestampMetadata` (t0…t7) permite medir latencia por hop.
+- Agent: t1 y t4; Core: t2 y t3; Slave: t5, t6, t7; Master: t0.
+- Logs/metrics/traces via `sdk/telemetry`.
+
+## Idempotencia y Dedupe
+
+- Core: dedupe por `trade_id` (estado PENDING→FILLED/REJECTED) y registro de `command_id` emitidos.
+- Slave EA: dedupe de `command_id` para evitar ejecuciones duplicadas.
+
+## Routing
+
+- Los `ExecuteOrder`/`CloseOrder` incluyen `target_client_id` y `target_account_id`.
+- Agent rutea al pipe del Slave por `target_account_id`.
+
+## Roles de Conexión
+
+- Pipes: Agent (servidor), EAs (clientes).
+- gRPC: Core (servidor), Agent (cliente). `agent-id` se envía por metadata.
+
+## Notas i0
+
+- Config simplificada (listas estáticas de slaves y símbolos).
+- Procesamiento secuencial en Core; sin persistencia.
+
 # Echo - Trading Copier
 
 ![Version](https://img.shields.io/badge/version-0.0.1-blue)

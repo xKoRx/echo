@@ -1,0 +1,13 @@
+; echo_pipe_x86.def - Export definitions for MSVC x86 build
+; Ensures clean function names without decoration
+; Usage: cl /LD /O2 /EHsc echo_pipe.cpp /Fe:echo_pipe_x86.dll /DEF:echo_pipe_x86.def
+
+LIBRARY echo_pipe_x86
+
+EXPORTS
+    ConnectPipe
+    WritePipeW
+    WritePipe
+    ReadPipeLine
+    ClosePipe
+

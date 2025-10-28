@@ -49,3 +49,16 @@ enum ErrorCode {
   ERROR_CODE_SHORT_ONLY = 14;
 }
 
+// TimestampMetadata contiene los timestamps de latencia E2E
+// Para medir latencia por hop desde Master EA hasta Slave EA
+message TimestampMetadata {
+  int64 t0_master_ea_ms = 1;      // Master EA genera intent
+  int64 t1_agent_recv_ms = 2;     // Agent recibe de pipe
+  int64 t2_core_recv_ms = 3;      // Core recibe de stream
+  int64 t3_core_send_ms = 4;      // Core envía ExecuteOrder
+  int64 t4_agent_recv_ms = 5;     // Agent recibe ExecuteOrder
+  int64 t5_slave_ea_recv_ms = 6;  // Slave EA recibe comando
+  int64 t6_order_send_ms = 7;     // Slave EA llama OrderSend
+  int64 t7_order_filled_ms = 8;   // Slave EA recibe ticket/fill
+}
+

@@ -1,101 +1,234 @@
-# Core - Servicio Orquestador
+# Echo Core
 
-El **core** es el cerebro de echo, responsable de:
+Core es el **orquestador central** del sistema Echo Trade Copier. Actúa como cerebro del sistema, gestionando la replicación de operaciones desde cuentas Master hacia cuentas Slave.
 
-- Orquestación de copiado de trades
-- Money Management centralizado
-- Aplicación de políticas (ventanas, tolerancias, límites)
-- Reconciliación de estado
-- Deduplicación idempotente
-- Servidor gRPC bidireccional
+## 📋 Responsabilidades
 
-## Estructura
+- **Servidor gRPC bidireccional**: Acepta conexiones de múltiples Agents
+- **Validación**: Valida TradeIntents usando whitelist de símbolos
+- **Deduplicación**: Previene duplicados usando map in-memory con TTL
+- **Transformación**: Convierte TradeIntent → ExecuteOrder (con sizing)
+- **Routing**: Distribuye ExecuteOrders a los Agents correspondientes
+- **Observabilidad**: Logs estructurados + métricas OTEL + trazas
+
+## 🏗️ Arquitectura
+
+```
+┌─────────────┐
+│   Agent 1   │◄────┐
+└─────────────┘     │
+                    │
+┌─────────────┐     │    ┌──────────────┐
+│   Agent 2   │◄────┼────┤     Core     │
+└─────────────┘     │    │              │
+                    │    │ - Router     │
+┌─────────────┐     │    │ - Dedupe     │
+│   Agent N   │◄────┘    │ - Validator  │
+└─────────────┘          └──────────────┘
+```
+
+## 🚀 Iteración 0 (POC)
+
+### Alcance i0
+
+- ✅ **Servidor gRPC**: Puerto 50051, bidi-streaming
+- ✅ **Validación**: Solo símbolo XAUUSD permitido
+- ✅ **Dedupe**: Map in-memory, TTL 1 hora
+- ✅ **Procesamiento**: Secuencial FIFO (canal buffered)
+- ✅ **Lot Size**: Hardcoded 0.10 (sin Money Management)
+- ✅ **Broadcast**: Envía ExecuteOrders a TODOS los Agents
+- ✅ **Telemetría**: EchoMetrics bundle completo
+
+### Limitaciones i0
+
+- ❌ Sin Money Management (lot size fijo)
+- ❌ Sin persistencia (Postgres)
+- ❌ Sin configuración dinámica (etcd)
+- ❌ Sin routing inteligente (broadcast simple)
+- ❌ Sin concurrencia (procesamiento secuencial)
+- ❌ Sin reintentos
+- ❌ Sin SL/TP offset
+
+## 📦 Estructura
 
 ```
 core/
 ├── cmd/
 │   └── echo-core/
-│       └── main.go         # Entry point
+│       └── main.go              # Entry point
 ├── internal/
-│   ├── engine/             # Motor de copia
-│   ├── policy/             # Evaluación de políticas
-│   ├── state/              # Reconciliación y dedupe
-│   ├── repository/         # Acceso a Postgres
-│   └── grpc/               # Servidor gRPC
-├── pkg/
-│   └── config/             # Config exportable
+│   ├── core.go                  # Core principal
+│   ├── dedupe.go                # Dedupe store in-memory
+│   └── router.go                # Router/Processor
+├── go.mod
 └── README.md
 ```
 
-## Responsabilidades
+## 🔧 Dependencias SDK
 
-### Engine de Replicación
+El Core **NO reimplementa lógica**, solo usa SDK:
 
-- Recibe `TradeIntent` desde agents (masters)
-- Aplica Money Management por cuenta×estrategia
-- Valida contra políticas activas
-- Distribuye `ExecuteOrder` a agents (slaves)
+| SDK Package | Uso |
+|-------------|-----|
+| `sdk/pb/v1` | Tipos proto (TradeIntent, ExecuteOrder, etc.) |
+| `sdk/domain` | Validaciones + Transformaciones |
+| `sdk/telemetry` | Logs + Métricas + Trazas |
+| `sdk/utils` | UUIDv7, timestamps |
+| `sdk/grpc` | **NO usado en i0** (gRPC nativo) |
 
-### Policy Manager
-
-- Ventanas de no-ejecución (carga desde etcd)
-- Tolerancias (spread, slippage, delay)
-- Límites (DD diario, riesgo por trade)
-- SL catastrófico configurable
-
-### State Manager
-
-- Mantiene estado de posiciones por cuenta
-- Deduplicación por `trade_id` (UUIDv7)
-- Reconciliación periódica con snapshots de agents
-
-### gRPC Server
-
-- Streaming bidireccional con agents
-- Health checks
-- Config updates vía streaming
-
-## Configuración
-
-El core lee config desde **etcd**:
-
-```yaml
-# Ejemplo de keys en etcd
-/echo/core/policy/master_accounts: ["MT4-001", "MT4-002"]
-/echo/core/policy/spread_max: 5.0
-/echo/core/policy/slippage_max: 3.0
-/echo/core/database/postgres_url: "postgres://..."
-```
-
-## Ejecución
+## 🏃 Ejecutar
 
 ```bash
-cd core
-go run ./cmd/echo-core
+# Desde directorio core/
+go run cmd/echo-core/main.go
 
-# O compilado:
-go build -o echo-core ./cmd/echo-core
-./echo-core
+# O compilar binario
+go build -o bin/echo-core cmd/echo-core/main.go
+./bin/echo-core
 ```
 
-## Tests
+**Output esperado**:
+```
+2025-10-26 12:00:00 echo-core v0.1.0 starting...
+2025-10-26 12:00:00 INFO Core initialized grpc_port=50051
+2025-10-26 12:00:00 INFO gRPC server listening address=:50051
+2025-10-26 12:00:00 INFO Router started
+echo-core v0.1.0 is running on port 50051. Press Ctrl+C to stop.
+```
+
+## 📊 Métricas
+
+Core registra las siguientes métricas (EchoMetrics):
+
+### Counters
+- `echo.order.created`: ExecuteOrders creados
+- `echo.order.sent`: ExecuteOrders enviados a Agents
+- `echo.execution.completed`: Ejecuciones finalizadas (success/error)
+
+### Histograms (TODO i1)
+- `echo.latency.core_process`: Latencia procesamiento interno
+- `echo.latency.core_to_agent`: Latencia Core → Agent
+
+## 🔬 Logs Estructurados
+
+Todos los logs son JSON estructurado compatible con Loki:
+
+```json
+{
+  "level": "INFO",
+  "msg": "TradeIntent received",
+  "trade_id": "01HKQV8Y...",
+  "symbol": "XAUUSD",
+  "order_side": "BUY",
+  "client_id": "master_12345"
+}
+```
+
+## 🔀 Flujo de Procesamiento
+
+```
+1. Agent envía TradeIntent via gRPC stream
+   ↓
+2. Core recibe → Router encola (canal FIFO)
+   ↓
+3. Router procesa secuencialmente:
+   a. Validar símbolo (XAUUSD)
+   b. Dedupe (rechazar duplicados)
+   c. Transformar → ExecuteOrder (lot = 0.10)
+   d. Broadcast a TODOS los Agents
+   ↓
+4. Agents reciben ExecuteOrder → envían a Slaves
+   ↓
+5. Slaves ejecutan → reportan ExecutionResult
+   ↓
+6. Core recibe ExecutionResult → Métricas
+```
+
+## 🧪 Testing (TODO i1)
 
 ```bash
-cd core
-go test -v ./...
+# Unit tests
+go test ./internal/...
+
+# Integration tests (requiere Agent + EAs)
+go test ./...
 ```
 
-## Dependencias
+## 🐛 Troubleshooting
 
-- `github.com/xKoRx/echo/sdk`: Proto, telemetry, domain
-- `google.golang.org/grpc`: gRPC server
-- PostgreSQL: Estado y políticas
-- etcd: Configuración live
+### Core no arranca
 
-## Próximos Pasos (Iteración 0)
+**Error**: `failed to listen on :50051: address already in use`
 
-- [ ] Implementar engine básico
-- [ ] Servidor gRPC bidi funcional
-- [ ] Deduplicación en memoria
-- [ ] Tests del flujo happy path
+**Solución**: Puerto 50051 ya en uso. Cambiar puerto en `DefaultConfig()` o matar proceso.
 
+```bash
+# Windows
+netstat -ano | findstr :50051
+taskkill /PID <PID> /F
+
+# Linux
+lsof -i :50051
+kill -9 <PID>
+```
+
+### Agents no se conectan
+
+**Error**: Logs no muestran "Agent connected"
+
+**Verificar**:
+1. Core escuchando en puerto correcto (`INFO gRPC server listening`)
+2. Agent configurado con `core_address = "localhost:50051"`
+3. Firewall no bloqueando puerto
+
+### TradeIntents rechazados
+
+**Error**: `WARN Invalid symbol, TradeIntent rejected`
+
+**Causa**: Símbolo no está en whitelist (solo XAUUSD en i0)
+
+**Solución**: Verificar que Master EA envía `symbol = "XAUUSD"`
+
+### Duplicados no detectados
+
+**Verificar**:
+1. Master EA genera `trade_id` único (UUIDv7)
+2. Logs muestran `"Duplicate TradeIntent rejected"` si hay duplicado
+3. Dedupe store no lleno (cleanup cada 1 min)
+
+## 🚧 Roadmap
+
+### Iteración 1
+- [ ] Persistencia Postgres (órdenes, dedupe)
+- [ ] Config desde etcd (whitelist, lot sizes)
+- [ ] Money Management central (risk-based sizing)
+- [ ] Routing inteligente (config account → slaves)
+- [ ] Reintentos con backoff
+
+### Iteración 2
+- [ ] Procesamiento concurrente (locks por trade_id)
+- [ ] SL/TP con offsets configurables
+- [ ] Ventanas de no-ejecución
+- [ ] Filtros (spread, slippage, age)
+
+### Iteración 3
+- [ ] Health checks + heartbeats
+- [ ] Reconciliación de estado
+- [ ] Dashboard Grafana
+- [ ] CLI de administración
+
+## 📚 Referencias
+
+- [RFC-001: Arquitectura General](../docs/rfcs/RFC-001-architecture.md)
+- [RFC-002: Implementación i0](../docs/rfcs/RFC-002-iteration-0-implementation.md)
+- [SDK Documentation](../sdk/README.md)
+- [Proto Contracts](../sdk/proto/v1/)
+
+## 📄 Licencia
+
+Propiedad de Aranea Labs. Uso interno.
+
+---
+
+**Versión**: 0.1.0 (Iteración 0)  
+**Última actualización**: 2025-10-26

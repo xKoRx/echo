@@ -1,0 +1,26 @@
+---
+description: Code Conventions
+globs: ["**/*.go"]
+alwaysApply: true
+---
+# Code Conventions
+
+## OpenTelemetry Instrumentation
+- Implement tracing for all service calls
+- Add spans for critical operations
+- Include relevant attributes in spans
+- Propagate context across service boundaries
+- Record metrics for performance monitoring
+- Use consistent naming conventions for spans and metrics
+- Add error details to spans when exceptions occur
+- Configure appropriate sampling strategies
+- Ensure proper correlation between logs, metrics, and traces
+- Document instrumentation decisions
+
+## Testing
+- Minimum coverage of 95%
+- Unit tests per component
+- Integration tests per initiative
+- Mocks for external services
+- Structure tests with clear sections for setup, execution, and verification
+- Name tests descriptively following the pattern `TestFunctionName_Scenario`

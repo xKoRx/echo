@@ -17,17 +17,25 @@ type CoreClient struct {
 	svcClient pb.AgentServiceClient
 }
 
-// NewCoreClient crea un nuevo cliente al Core.
+// NewCoreClient crea un nuevo cliente al Core (i1).
+//
+// Usa configuración de KeepAlive desde Config (RFC-003 sección 7).
 //
 // Example:
 //
-//	client, err := NewCoreClient(ctx, "localhost:50051")
-func NewCoreClient(ctx context.Context, target string) (*CoreClient, error) {
+//	client, err := NewCoreClient(ctx, config)
+func NewCoreClient(ctx context.Context, agentConfig *Config) (*CoreClient, error) {
 	// Configuración con defaults de SDK
-	config := grpcSDK.DefaultClientConfig(target)
-	// Solicitud usuario: desactivar pings keepalive que causan ENHANCE_YOUR_CALM
-	// Dejar que el stream se mantenga sin pings de cliente
-	config.KeepAlive = nil
+	config := grpcSDK.DefaultClientConfig(agentConfig.CoreAddress)
+
+	// i1: Configurar KeepAlive cliente desde config (RFC-003 sección 7)
+	if agentConfig.KeepAliveTime > 0 {
+		config.KeepAlive = &grpcSDK.KeepAliveConfig{
+			Time:                agentConfig.KeepAliveTime,
+			Timeout:             agentConfig.KeepAliveTimeout,
+			PermitWithoutStream: agentConfig.PermitWithoutStream,
+		}
+	}
 
 	// Crear cliente usando SDK
 	grpcClient, err := grpcSDK.NewClient(ctx, config)
@@ -63,10 +71,10 @@ func (c *CoreClient) StreamBidi(ctx context.Context, agentID string) (pb.AgentSe
 	return stream, nil
 }
 
-// Ping ejecuta un health check al Core.
-func (c *CoreClient) Ping(ctx context.Context) (*pb.PingResponse, error) {
+// Ping ejecuta un health check al Core (i1).
+func (c *CoreClient) Ping(ctx context.Context, agentID string) (*pb.PingResponse, error) {
 	req := &pb.PingRequest{
-		AgentId: "agent-i0", // TODO i0: hardcoded, i1+: ID real del agent
+		AgentId: agentID, // i1: ID real del agent desde config
 	}
 
 	resp, err := c.svcClient.Ping(ctx, req)

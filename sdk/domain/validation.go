@@ -215,7 +215,8 @@ func ValidateTakeProfit(tp, entryPrice float64, side pb.OrderSide) error {
 
 // ValidateTradeID valida que un trade_id no esté vacío y tenga formato válido.
 //
-// En i0 se espera formato UUIDv7.
+// En i1 se espera formato UUIDv7 (RFC 9562).
+// En i0 se aceptaba UUIDv4 por compatibilidad con MT4.
 func ValidateTradeID(tradeID string) error {
 	if tradeID == "" {
 		return NewValidationError("trade_id", tradeID, "trade_id cannot be empty")
@@ -231,6 +232,75 @@ func ValidateTradeID(tradeID string) error {
 		return NewValidationError("trade_id", tradeID, "invalid UUID format")
 	}
 
+	return nil
+}
+
+// ValidateUUIDv7 valida que un UUID sea formato v7 específicamente.
+//
+// UUIDv7 debe tener:
+// - Formato UUID estándar (8-4-4-4-12)
+// - Versión 7 en byte 6 (nibble alto)
+// - Variant RFC 4122 en byte 8 (2 bits altos = 10)
+//
+// Example:
+//
+//	err := ValidateUUIDv7("01HKQ000-0000-7000-8000-000000000001")
+//	// => nil (válido)
+//
+//	err := ValidateUUIDv7("550e8400-e29b-41d4-a716-446655440000")  // v4
+//	// => error (no es v7)
+func ValidateUUIDv7(uuid string) error {
+	// Primero validar formato UUID básico
+	if err := ValidateTradeID(uuid); err != nil {
+		return err
+	}
+
+	// Extraer version nibble (posición 14, después del tercer guion)
+	// Formato: xxxxxxxx-xxxx-Vxxx-xxxx-xxxxxxxxxxxx
+	//                        ^
+	//                     posición 14
+	if len(uuid) < 15 {
+		return NewValidationError("uuid", uuid, "UUID too short")
+	}
+
+	versionChar := uuid[14]
+	if versionChar != '7' && versionChar != '7' {
+		return NewValidationError("uuid", uuid, fmt.Sprintf("not UUIDv7 (version nibble is '%c', expected '7')", versionChar))
+	}
+
+	// Extraer variant bits (posición 19, después del cuarto guion)
+	// Formato: xxxxxxxx-xxxx-xxxx-Yxxx-xxxxxxxxxxxx
+	//                             ^
+	//                          posición 19
+	// Variant RFC 4122 = 10xx en binario = 8, 9, A, B en hex
+	if len(uuid) < 20 {
+		return NewValidationError("uuid", uuid, "UUID too short for variant check")
+	}
+
+	variantChar := strings.ToUpper(string(uuid[19]))
+	validVariants := []string{"8", "9", "A", "B"}
+	isValidVariant := false
+	for _, v := range validVariants {
+		if variantChar == v {
+			isValidVariant = true
+			break
+		}
+	}
+
+	if !isValidVariant {
+		return NewValidationError("uuid", uuid, fmt.Sprintf("invalid UUID variant (nibble is '%s', expected 8/9/A/B)", variantChar))
+	}
+
+	return nil
+}
+
+// ValidateTradeIDv7 valida que un trade_id sea UUIDv7 específicamente (i1+).
+//
+// Wrapper sobre ValidateUUIDv7 para claridad semántica.
+func ValidateTradeIDv7(tradeID string) error {
+	if err := ValidateUUIDv7(tradeID); err != nil {
+		return WrapError(ErrInvalidTradeID, "trade_id must be UUIDv7", err)
+	}
 	return nil
 }
 

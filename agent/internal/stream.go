@@ -9,41 +9,35 @@ import (
 	"github.com/xKoRx/echo/sdk/utils"
 )
 
-// connectToCore establece la conexión gRPC con el Core.
+// connectToCore establece la conexión gRPC con el Core (i1).
 func (a *Agent) connectToCore() error {
-	a.logInfo("Connecting to Core", map[string]interface{}{
-		"address": a.config.CoreAddress,
+	a.logInfo("Connecting to Core (i1)", map[string]interface{}{
+		"address":           a.config.CoreAddress,
+		"agent_id":          a.config.AgentID,
+		"keepalive_time":    a.config.KeepAliveTime.String(),
+		"keepalive_timeout": a.config.KeepAliveTimeout.String(),
 	})
 
-	// Crear cliente usando wrapper (que usa SDK)
-	client, err := NewCoreClient(a.ctx, a.config.CoreAddress)
+	// i1: Crear cliente usando wrapper con config completa (KeepAlive)
+	client, err := NewCoreClient(a.ctx, a.config)
 	if err != nil {
 		return fmt.Errorf("failed to create core client: %w", err)
 	}
 
 	a.coreClient = client
 
-	// Issue #C7: Generar agent-id único (usa hostname)
-	agentID, err := generateAgentID()
-	if err != nil {
-		a.logWarn("Failed to get hostname, using fallback ID", map[string]interface{}{
-			"error": err.Error(),
-		})
-		agentID = "agent-unknown"
-	}
-
-	// Crear stream bidireccional (envía agent-id en metadata)
-	stream, err := client.StreamBidi(a.ctx, agentID)
+	// i1: Crear stream bidireccional con agent_id desde config
+	stream, err := client.StreamBidi(a.ctx, a.config.AgentID)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
 
 	a.coreStream = stream
-	a.logInfo("Stream connected to Core", map[string]interface{}{
-		"agent_id": agentID,
+	a.logInfo("Stream connected to Core (i1)", map[string]interface{}{
+		"agent_id": a.config.AgentID,
 	})
 
-	a.logInfo("Connected to Core", nil)
+	a.logInfo("Connected to Core (i1)", nil)
 	return nil
 }
 

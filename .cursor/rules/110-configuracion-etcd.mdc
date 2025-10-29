@@ -1,0 +1,62 @@
+---
+title: "110-configuracion-etcd"
+description: "Regla ALWAYS: toda configuración debe obtenerse desde ETCD usando el cliente oficial en github.com/xKoRx/echo/sdk/etcd. Se prohíbe el uso de variables de entorno y archivos YAML/JSON como fuente de configuración."
+alwaysApply: true
+---
+
+# ⚙️ Configuración — Uso obligatorio de ETCD mediante SDK
+
+## 🎯 Objetivo
+Centralizar y asegurar la configuración del sistema.  
+Todo desarrollo debe obtener variables de configuración desde **ETCD**, utilizando exclusivamente el **cliente oficial en `github.com/xKoRx/echo/sdk/etcd`**.
+
+---
+
+## 🟩 Principios Obligatorios (ALWAYS)
+- **ETCD Único**: toda configuración debe provenir de ETCD.  
+- **Cliente oficial**: usa solo `github.com/xKoRxecho/sdk/etcd`.  
+- **Sin Env/YAML**: prohibido usar `os.Getenv` o archivos YAML/JSON como fuente de verdad.  
+- **Carga única**: inicializa configuración una vez al inicio de la app y reutiliza instancias.  
+- **Override controlado**: si es necesario, solo mediante helpers de la SDK.
+
+---
+
+## 🚫 Anti-Patrones PROHIBIDOS
+- Uso de `os.Getenv("VAR")` en hot-path o lógica de negocio.  
+- Archivos `config.yaml` u otros como fuente de configuración.  
+- Hardcode de secretos o parámetros de entorno.  
+
+## Excepción aprobada (única)
+- `hostname`: debe obtenerse mediante `os.Hostname()`.
+- `HOST_KEY`: debe obtenerse mediante `os.Getenv("HOST_KEY")`.
+- `ENV`: debe obtenerse mediante `os.Getenv("ENV")`.
+
+---
+
+## ✅ Ejemplo Correcto
+```go
+import (
+    "context"
+    etcdconfig "github.com/xKoRx/echo/sdk/etcd"
+)
+
+func main() {
+    ctx := context.Background()
+    cfg, err := etcdconfig.New(ctx, etcdconfig.WithPrefix("myapp"))
+    if err != nil {
+        panic(err)
+    }
+    dbURL := cfg.GetString("db/url")
+    println("DB URL:", dbURL)
+}
+```
+
+## ❌ Ejemplo Incorrecto
+```go
+dbURL := os.Getenv("DB_URL") // 🚫 prohibido
+```
+
+---
+
+## 🔗 Referencias
+- `github.com/xKoRx/echo/sdk/etcd`

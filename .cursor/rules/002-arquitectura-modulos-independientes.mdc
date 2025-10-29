@@ -1,0 +1,55 @@
+---
+title: "Arquitectura de módulos independientes + política de dependencias"
+description: "Regla ALWAYS: cada módulo es autónomo. Solo puede depender de github.com/xKoRx/sdk/*"
+alwaysApply: true
+---
+
+# 🔒 Núcleo arquitectónico (obligatorio)
+
+## Principios
+- **Independencia total**: ningún módulo importa a otro módulo para no transformar en monorepo.
+- **DIP/SOLID**: programa contra **interfaces**. Composición > herencia.
+- **Config única**: usa **ETCD** de `github.com/xKoRx/echo/sdk/etcd`. Carga una vez al inicio. Inmutable en runtime.
+- **Observabilidad estándar**: `github.com/xKoRx/echo/sdk/telemetry` + bundles por dominio. Atributos en contexto.
+- **Calidad**: robustez, modularidad, escalabilidad, clean code, SOLID. Tests ≥85%.
+
+## Política de dependencias (permitido vs prohibido)
+**Permitido**:
+- **stdlib** de Go.
+- `github.com/xKoRx/echo/{agent/core}/internal/di` (inyección transversal, like `github.com/xKoRx/symphony/internal/di`)
+- `github.com/xKoRx/sdk/...` (etcd, telemetry, utils de la SDK).
+- Dependencias externas **no internas** del monorepo, justificadas en `go.mod` del módulo.
+
+**Prohibido**:
+- Cualquier import que apunte a **otro módulo** del monorepo:  
+  `github.com/xKoRx/<otro-módulo>/...` ❌
+- Variables de entorno o YAML como configuración en runtime ❌, solo etcd
+
+**Ejemplos**
+```go
+// ✅ OK
+import (
+  "context"
+  "github.com/xKoRx/echo/{core/agent}/internal/di"
+  "github.com/xKoRx/echo/sdk/etcd"
+  "github.com/xKoRx/echo/sdk/telemetry"
+)
+
+// ❌ NO OK (cross-module)
+import "github.com/xKoRx/api-core/internal/service" // prohibido
+```
+
+## Observabilidad
+- Un **span** por operación crítica.
+- Métricas de **latencia** y **volumen** por operación.
+- Logs JSON con atributos **comunes** desde contexto.
+
+## Testing
+- Table-driven. Mocks de adapters con `testify/mock`.
+- Cobertura objetivo `core` ≥95%. Integración en adapters y cmd según riesgo.
+
+## Checklist PR (bloqueante)
+- [ ] Sin imports a otros módulos del monorepo.
+- [ ] Config solo via `echo/sdk/etcd`, carga única.
+- [ ] Spans + métricas + logs con atributos en contexto.
+- [ ] Tests y linters OK; `go vet` y `staticcheck` limpios.

@@ -6,11 +6,14 @@ package internal
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/xKoRx/echo/core/internal/repository"
+	"github.com/xKoRx/echo/sdk/domain"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
 	"github.com/xKoRx/echo/sdk/telemetry/metricbundle"
@@ -18,23 +21,26 @@ import (
 	"github.com/xKoRx/echo/sdk/utils"
 	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 )
 
 // Core representa el servicio principal de Echo Core.
 //
-// Responsabilidades:
-//   - Servidor gRPC bidi (acepta streams de Agents)
+// Responsabilidades i1:
+//   - Servidor gRPC bidi con KeepAlive (acepta streams de Agents)
 //   - Validación de TradeIntents (usando SDK)
-//   - Deduplicación (map in-memory con TTL)
+//   - Deduplicación PERSISTENTE (PostgreSQL + TTL cleanup)
 //   - Transformación TradeIntent → ExecuteOrder (usando SDK)
 //   - Routing de ExecuteOrders a Agents
-//   - Telemetría (logs + métricas)
+//   - Persistencia de trades/executions/closes
+//   - Correlación trade_id ↔ tickets por slave
+//   - Telemetría (logs + métricas + trazas)
 type Core struct {
 	// Embedder para implementar AgentServiceServer
 	pb.UnimplementedAgentServiceServer
 
-	// Config
+	// Config (cargada desde ETCD)
 	config *Config
 
 	// gRPC Server
@@ -45,8 +51,15 @@ type Core struct {
 	agents   map[string]*AgentConnection // key: agent_id
 	agentsMu sync.RWMutex
 
-	// Deduplicación
-	dedupe *DedupeStore
+	// PostgreSQL
+	db *sql.DB
+
+	// Repositories (i1)
+	repoFactory    domain.RepositoryFactory
+	correlationSvc domain.CorrelationService
+
+	// Deduplicación persistente (i1)
+	dedupeService *DedupeService
 
 	// Router/Processor
 	router *Router
@@ -65,45 +78,12 @@ type Core struct {
 	closed bool
 }
 
-// Config configuración del Core.
-type Config struct {
-	// gRPC
-	GRPCPort int // Puerto del servidor gRPC (default: 50051)
-
-	// Symbol Whitelist (i0: solo XAUUSD)
-	SymbolWhitelist []string
-
-	// Lot size hardcoded (i0: 0.10)
-	// TODO i1: implementar Money Management
-	DefaultLotSize float64
-
-	// Slave Accounts (Issue #C5: crear 1 ExecuteOrder por slave)
-	// Format: ["67890", "12345"]
-	SlaveAccounts []string
-
-	// Dedupe TTL
-	DedupeTTL time.Duration
-
-	// Telemetría
-	ServiceName    string
-	ServiceVersion string
-	Environment    string
-	OTLPEndpoint   string // Opcional en i0
-}
-
-// DefaultConfig retorna configuración por defecto para i0.
+// DEPRECATED: Config moved to config.go (i1).
+// Use LoadConfig() instead of DefaultConfig().
+//
+// Kept for backwards compatibility during migration.
 func DefaultConfig() *Config {
-	return &Config{
-		GRPCPort:        50051,
-		SymbolWhitelist: []string{"XAUUSD"},                   // TODO i0: hardcoded
-		DefaultLotSize:  0.10,                                 // TODO i0: hardcoded MM
-		SlaveAccounts:   []string{"2089126183", "2089126186"}, // i0: cuentas reales MT4 Demo
-		DedupeTTL:       1 * time.Hour,
-		ServiceName:     "echo-core",
-		ServiceVersion:  "0.1.0",
-		Environment:     "dev",
-		OTLPEndpoint:    "192.168.31.60:4317", // i0: IP del servidor de métricas
-	}
+	return nil // Deprecated in i1
 }
 
 // AgentConnection representa una conexión de Agent al Core.
@@ -116,33 +96,68 @@ type AgentConnection struct {
 	createdAt time.Time
 }
 
-// New crea una nueva instancia de Core.
+// New crea una nueva instancia de Core (i1).
+//
+// Cambios i1:
+//   - Config cargada desde ETCD (no manual)
+//   - PostgreSQL para persistencia
+//   - Dedupe service persistente
+//   - Repositories y CorrelationService
 //
 // Example:
 //
-//	config := internal.DefaultConfig()
-//	core, err := internal.New(ctx, config)
+//	core, err := internal.New(ctx)
 //	if err != nil {
 //	    return err
 //	}
 //	defer core.Shutdown()
-func New(ctx context.Context, config *Config) (*Core, error) {
-	if config == nil {
-		config = DefaultConfig()
-	}
-
+func New(ctx context.Context) (*Core, error) {
 	// Crear contexto cancelable
 	coreCtx, cancel := context.WithCancel(ctx)
 
-	// Inicializar telemetría usando SDK
+	// 1. Cargar configuración desde ETCD
+	config, err := LoadConfig(coreCtx)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to load config from ETCD: %w", err)
+	}
+
+	// 2. Conectar a PostgreSQL
+	db, err := sql.Open("postgres", config.PostgresConnStr())
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to open postgres connection: %w", err)
+	}
+
+	// Verificar conexión
+	if err := db.PingContext(coreCtx); err != nil {
+		cancel()
+		db.Close()
+		return nil, fmt.Errorf("failed to ping postgres: %w", err)
+	}
+
+	// Configurar pool
+	db.SetMaxOpenConns(config.PostgresPoolMaxConn)
+	db.SetMaxIdleConns(config.PostgresPoolMinConn)
+	db.SetConnMaxLifetime(1 * time.Hour)
+
+	// 3. Crear repository factory
+	repoFactory := repository.NewPostgresFactory(db)
+	correlationSvc := repoFactory.CorrelationService()
+
+	// 4. Crear dedupe service persistente (i1)
+	dedupeService := NewDedupeService(repoFactory.DedupeRepository())
+
+	// 5. Inicializar telemetría usando SDK
 	telOpts := []telemetry.Option{
 		telemetry.WithVersion(config.ServiceVersion),
 	}
-    if config.OTLPEndpoint != "" {
-        telOpts = append(telOpts, telemetry.WithOTLPEndpoint(config.OTLPEndpoint))
-    }
-    // Endpoint específico para métricas si el collector usa puerto distinto
-    telOpts = append(telOpts, telemetry.WithMetricsEndpoint("192.168.31.60:14317"))
+	if config.OTLPEndpoint != "" {
+		telOpts = append(telOpts, telemetry.WithOTLPEndpoint(config.OTLPEndpoint))
+	}
+	if config.MetricsEndpoint != "" {
+		telOpts = append(telOpts, telemetry.WithMetricsEndpoint(config.MetricsEndpoint))
+	}
 
 	telClient, err := telemetry.New(
 		coreCtx,
@@ -152,6 +167,7 @@ func New(ctx context.Context, config *Config) (*Core, error) {
 	)
 	if err != nil {
 		cancel()
+		db.Close()
 		return nil, fmt.Errorf("failed to initialize telemetry: %w", err)
 	}
 
@@ -160,42 +176,45 @@ func New(ctx context.Context, config *Config) (*Core, error) {
 	if echoMetrics == nil {
 		cancel()
 		telClient.Shutdown(coreCtx)
+		db.Close()
 		return nil, fmt.Errorf("failed to get EchoMetrics bundle")
 	}
 
-	// Configurar atributos comunes en contexto (usando funciones del paquete)
+	// Configurar atributos comunes en contexto
 	coreCtx = telemetry.AppendCommonAttrs(coreCtx,
 		semconv.Echo.Component.String(semconv.ComponentValues.Core),
 	)
 
-	// Crear dedupe store
-	dedupe := NewDedupeStore(config.DedupeTTL)
-
-	// Crear Core
+	// 6. Crear Core
 	core := &Core{
-		config:      config,
-		agents:      make(map[string]*AgentConnection),
-		dedupe:      dedupe,
-		telemetry:   telClient,
-		echoMetrics: echoMetrics,
-		ctx:         coreCtx,
-		cancel:      cancel,
+		config:         config,
+		db:             db,
+		repoFactory:    repoFactory,
+		correlationSvc: correlationSvc,
+		dedupeService:  dedupeService,
+		agents:         make(map[string]*AgentConnection),
+		telemetry:      telClient,
+		echoMetrics:    echoMetrics,
+		ctx:            coreCtx,
+		cancel:         cancel,
 	}
 
-	// Crear router
+	// 7. Crear router
 	core.router = NewRouter(core)
 
 	// Log de inicio
-	telClient.Info(coreCtx, "Core initialized",
+	telClient.Info(coreCtx, "Core initialized (i1)",
 		attribute.Int("grpc_port", config.GRPCPort),
 		attribute.StringSlice("symbol_whitelist", config.SymbolWhitelist),
 		attribute.Float64("default_lot_size", config.DefaultLotSize),
+		attribute.String("postgres_host", config.PostgresHost),
+		attribute.String("postgres_database", config.PostgresDatabase),
 	)
 
 	return core, nil
 }
 
-// Start inicia el Core (servidor gRPC, router, dedupe cleanup).
+// Start inicia el Core (servidor gRPC con KeepAlive, router, dedupe cleanup persistente).
 func (c *Core) Start() error {
 	c.mu.Lock()
 	if c.closed {
@@ -212,16 +231,30 @@ func (c *Core) Start() error {
 	}
 	c.listener = lis
 
-	// Crear servidor gRPC
+	// Crear servidor gRPC con KeepAlive (i1 - RFC-003 sección 7)
+	kaParams := keepalive.ServerParameters{
+		Time:    c.config.KeepAliveTime,    // default: 60s
+		Timeout: c.config.KeepAliveTimeout, // default: 20s
+	}
+	kaPolicy := keepalive.EnforcementPolicy{
+		MinTime:             c.config.KeepAliveMinTime, // default: 10s
+		PermitWithoutStream: false,                     // no pings sin stream activo
+	}
+
 	c.grpcServer = grpc.NewServer(
-	// TODO i1: agregar interceptors de telemetría
+		grpc.KeepaliveParams(kaParams),
+		grpc.KeepaliveEnforcementPolicy(kaPolicy),
+		// TODO i2: agregar interceptors de telemetría
 	)
 
 	// Registrar servicio
 	pb.RegisterAgentServiceServer(c.grpcServer, c)
 
-	c.telemetry.Info(c.ctx, "gRPC server listening",
+	c.telemetry.Info(c.ctx, "gRPC server listening (i1)",
 		attribute.String("address", addr),
+		attribute.String("keepalive_time", c.config.KeepAliveTime.String()),
+		attribute.String("keepalive_timeout", c.config.KeepAliveTimeout.String()),
+		attribute.String("keepalive_min_time", c.config.KeepAliveMinTime.String()),
 	)
 
 	// Arrancar servidor gRPC en goroutine
@@ -240,11 +273,11 @@ func (c *Core) Start() error {
 		return fmt.Errorf("failed to start router: %w", err)
 	}
 
-	// Arrancar dedupe cleanup
+	// Arrancar dedupe cleanup persistente (i1)
 	c.wg.Add(1)
 	go c.dedupeCleanupLoop()
 
-	c.telemetry.Info(c.ctx, "Core started successfully")
+	c.telemetry.Info(c.ctx, "Core started successfully (i1)")
 
 	return nil
 }
@@ -378,7 +411,7 @@ func (c *Core) GetAgents() []*AgentConnection {
 	return agents
 }
 
-// dedupeCleanupLoop limpia entries antiguos del dedupe store.
+// dedupeCleanupLoop limpia entries antiguos del dedupe store (persistente i1).
 func (c *Core) dedupeCleanupLoop() {
 	defer c.wg.Done()
 
@@ -388,9 +421,17 @@ func (c *Core) dedupeCleanupLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			removed := c.dedupe.Cleanup()
+			// Usar DedupeService que llama a la función SQL cleanup_dedupe_ttl()
+			removed, err := c.dedupeService.Cleanup(c.ctx)
+			if err != nil {
+				c.telemetry.Error(c.ctx, "Dedupe cleanup failed", err,
+					attribute.String("error", err.Error()),
+				)
+				continue
+			}
+
 			if removed > 0 {
-				c.telemetry.Debug(c.ctx, "Dedupe cleanup completed",
+				c.telemetry.Info(c.ctx, "Dedupe cleanup completed (i1)",
 					attribute.Int("removed_entries", removed),
 				)
 			}
@@ -401,7 +442,7 @@ func (c *Core) dedupeCleanupLoop() {
 	}
 }
 
-// Shutdown detiene el Core gracefully.
+// Shutdown detiene el Core gracefully (i1).
 func (c *Core) Shutdown() error {
 	c.mu.Lock()
 	if c.closed {
@@ -411,7 +452,7 @@ func (c *Core) Shutdown() error {
 	c.closed = true
 	c.mu.Unlock()
 
-	c.telemetry.Info(c.ctx, "Core shutting down...")
+	c.telemetry.Info(c.ctx, "Core shutting down (i1)...")
 
 	// Detener contexto
 	c.cancel()
@@ -436,6 +477,15 @@ func (c *Core) Shutdown() error {
 	// Esperar goroutines
 	c.wg.Wait()
 
+	// Cerrar conexión PostgreSQL (i1)
+	if c.db != nil {
+		if err := c.db.Close(); err != nil {
+			c.telemetry.Error(c.ctx, "Failed to close PostgreSQL connection", err)
+		} else {
+			c.telemetry.Info(c.ctx, "PostgreSQL connection closed")
+		}
+	}
+
 	// Shutdown telemetría
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -443,7 +493,7 @@ func (c *Core) Shutdown() error {
 		return fmt.Errorf("failed to shutdown telemetry: %w", err)
 	}
 
-	c.telemetry.Info(c.ctx, "Core stopped successfully")
+	c.telemetry.Info(c.ctx, "Core stopped successfully (i1)")
 
 	return nil
 }

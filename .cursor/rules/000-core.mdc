@@ -1,0 +1,54 @@
+---
+title: "001-core-principios-ingenieria"
+description: "Regla ALWAYS: robustez, modularidad, escalabilidad, clean code y principios SOLID aplican a todo el proyecto."
+alwaysApply: true
+---
+
+# 🧭 Core Rule — Principios de Ingeniería
+
+## 🎯 Objetivo
+Establecer los **principios fundacionales** de todo desarrollo en este proyecto:  
+**robustez, modularidad, escalabilidad, clean code, SOLID, testing y seguridad**.
+
+---
+
+## 🟩 Principios Obligatorios (ALWAYS)
+- **Modularidad:** divide responsabilidades en módulos pequeños, cohesivos y desacoplados.  
+- **Escalabilidad:** diseña para crecer; usa interfaces, límites claros y bajo acoplamiento.  
+- **Clean Code:** legibilidad y mantenibilidad primero; nombres descriptivos, funciones cortas, sin duplicación.  
+- **SOLID:** respeta los 5 principios (SRP, OCP, LSP, ISP, DIP).  
+- **Testing:** acompaña todo código con pruebas mínimas (unitarias o de integración).  
+- **Errores:** nunca ignores errores; manéjalos o propágalos explícitamente.  
+- **Seguridad:** valida inputs externos y nunca hardcodees secretos.  
+
+---
+
+## 🚫 Anti-Patrones PROHIBIDOS
+- Funciones/clases monolíticas con múltiples responsabilidades.  
+- Dependencias circulares o alto acoplamiento.  
+- Ignorar errores o atraparlos sin acción.  
+- Código sin tests o con comentarios redundantes.  
+- Reglas vagas tipo “escribe buen código”.  
+
+---
+
+## ✅ Checklist de Pull Request
+- [ ] Código modular y desacoplado.  
+- [ ] Cumple SOLID.  
+- [ ] Funciones/métodos cortos y descriptivos.  
+- [ ] Errores manejados explícitamente.  
+- [ ] Pruebas unitarias o de integración presentes.  
+- [ ] Sin duplicaciones ni anti-patrones.  
+
+---
+
+## 🔗 Referencias
+- @050-observability-telemetry.mdc
+
+---
+
+## 🧪 Ciclo de Vida de las Reglas
+1. **Nacimiento:** surge de bugs, PRs o decisiones de arquitectura.  
+2. **Prueba:** publícala como Manual/Agent antes de Always.  
+3. **Escalada:** promuévela a Always si es crítica.  
+4. **Mantenimiento:** revisa por release; subdivide o retira si queda obsoleta.  

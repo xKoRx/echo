@@ -406,13 +406,39 @@ service AgentService {
  - Named Pipes (modo prueba): opción de `FlushFileBuffers` configurable sólo para escenarios de benchmark/control, desactivado por defecto en producción para evitar bloqueos
 
 ### Iteración 2 (2-3 días)
+- Registrar TP y SL
+- Dedupe cleanup debe ser al close de la operación
+- Corregir status de trades en postgres, cuando cierre la operación debe actualizar el estado.
 - SL catastrófico opcional
 - Filtros: max_spread, max_age_ms, max_slippage
 - Logging de motivos de rechazo
 
+- Routing selectivo Core→Agent por cuenta
+  - Registrar ownership `account_id → agent_id` (el Agent anuncia sus cuentas al conectar)
+  - Enrutar `ExecuteOrder`/`CloseOrder` sólo al Agent propietario (eliminar broadcast a todos)
+
+- Normalización de `error_code` persistido
+  - `NO_ERROR` en éxito; `ERR_*` en error; alinear mapeos en SDK y defaults de BD
+  - Documentar contrato único para logs/BD/proto
+
+- Alineación `execution_id` vs `command_id`
+  - Definir convención única en esquema/contratos o documentar mapping estable
+
+- Separación `MasterAccountID` vs `ClientID`
+  - Incorporar `account_id` real en `TradeIntent` y `Trade` (queries por cuenta)
+  - Mantener `SourceMasterID` para identificar al EA
+
+- Cleanup para dedupe de `command_id`
+  - Limpiar al close
+
+- Identidad estable para Agents
+  - `agent_id` persistente/configurable para ownership y diagnósticos
+
 ### Iteración 3 (2 días)
 - Mapeo símbolos (canonical ⇄ broker)
 - Specs de broker (min_lot, stop_level, etc.)
+- Reconexión automátiva ea-agent y agent-core. las eas una vez que pierden la coenxión no se vuelven a comunicar nunca más con el agente. validar esto mismo con core-agent
+- limpiar los buffers de operaciones luego de que cierre una operación en EA, agent y core
 
 ### Iteración 4 (1-2 días)
 - **Sizing con riesgo fijo** (lo definido en sección 6)

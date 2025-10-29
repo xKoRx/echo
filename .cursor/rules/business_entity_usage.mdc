@@ -1,0 +1,29 @@
+---
+description: Business Entity Usage
+globs: ["**/*.go"]
+alwaysApply: true
+---
+# Business Entity Usage
+
+## Core Principle
+- All business entities MUST be defined in the `echo/sdk` package
+- NEVER create business entities directly in symphony project
+
+## Implementation Guidelines
+- Always import entity definitions from the appropriate `echo/sdk` package
+- Use the SDK entity contracts for all business logic implementations
+- ALWAYS ask for the exact entity name from the SDK before implementing
+- If you're unsure about which entity to use, ask for clarification
+
+## When Entity Is Missing
+- If a required entity is not available in the SDK:
+  1. Document the missing entity and its required fields
+  2. DO NOT create temporary entities or implementations in the hubs project
+  3. Add clear TODO comments indicating the pending SDK dependency
+  4. Consult with the team to determine the appropriate approach
+  5. The only alternative is to use existing SDK entities unless explicitly specified in the context of the request
+
+## Entity Extension
+- DO NOT propose extending entities
+- The only alternative is to use existing SDK entities as they are
+- If the context of the request explicitly specifies extending entities, confirm this approach before proceeding

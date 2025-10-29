@@ -47,57 +47,27 @@ type Agent struct {
 	closed bool
 }
 
-// Config configuración del Agent.
-type Config struct {
-	// Core
-	CoreAddress string // ej: "localhost:50051"
-
-	// Pipes
-	PipePrefix string // ej: "echo_" → echo_master_12345, echo_slave_67890
-
-	// Accounts IDs de cuentas a monitorear
-	// TODO i0: hardcoded, i1: desde config/etcd
-	MasterAccounts []string // ej: ["12345"]
-	SlaveAccounts  []string // ej: ["67890"]
-
-	// Telemetría
-	ServiceName    string // ej: "echo-agent"
-	ServiceVersion string // ej: "0.1.0"
-	Environment    string // ej: "dev"
-	OTLPEndpoint   string // ej: "localhost:4317" (opcional en i0)
-}
-
-// DefaultConfig retorna configuración por defecto para i0.
-func DefaultConfig() *Config {
-	return &Config{
-		CoreAddress:    "192.168.31.211:50051", // i0: IP del Core hardcodeada
-		PipePrefix:     "echo_",
-		MasterAccounts: []string{"2089126182", "2089126187"}, // i0: hardcoded
-		SlaveAccounts:  []string{"2089126183", "2089126186"}, // i0: hardcoded
-		ServiceName:    "echo-agent",
-		ServiceVersion: "0.1.0",
-		Environment:    "dev",
-		OTLPEndpoint:   "192.168.31.60:4317", // i0: IP del servidor de métricas
-	}
-}
-
-// New crea una nueva instancia de Agent.
+// New crea una nueva instancia de Agent (i1).
+//
+// Config se carga desde ETCD automáticamente.
 //
 // Example:
 //
-//	config := internal.DefaultConfig()
-//	agent, err := internal.New(ctx, config)
+//	agent, err := internal.New(ctx)
 //	if err != nil {
 //	    return err
 //	}
 //	defer agent.Shutdown()
-func New(ctx context.Context, config *Config) (*Agent, error) {
-	if config == nil {
-		config = DefaultConfig()
-	}
-
+func New(ctx context.Context) (*Agent, error) {
 	// Crear contexto cancelable
 	agentCtx, cancel := context.WithCancel(ctx)
+
+	// i1: Cargar configuración desde ETCD
+	config, err := LoadConfig(agentCtx)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to load config from ETCD: %w", err)
+	}
 
 	// Inicializar telemetría
 	telClient, err := initTelemetry(agentCtx, config)
@@ -116,7 +86,7 @@ func New(ctx context.Context, config *Config) (*Agent, error) {
 
 	agent := &Agent{
 		config:       config,
-		sendToCoreCh: make(chan *pb.AgentMessage, 100),
+		sendToCoreCh: make(chan *pb.AgentMessage, config.SendQueueSize),
 		telemetry:    telClient,
 		echoMetrics:  echoMetrics,
 		ctx:          agentCtx,

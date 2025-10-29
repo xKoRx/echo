@@ -1,0 +1,138 @@
+---
+title: "Creación de nuevos módulos — scaffolding estándar"
+description: "Guía Agent-Requested para crear un módulo **independiente** que solo dependa de di y sdk. Entrega árbol, plantillas y checklist para PR listo."
+alwaysApply: false
+---
+
+# 🚀 Nuevo módulo: pasos y plantillas
+
+## 1) Árbol base
+```
+<module>/
+  core/
+    capabilities/
+      foo.go
+    config/
+      options.go
+    instrumentation/
+      tracing.go
+    contextx/
+      attrs.go
+    planner/
+      runner.go        # opcional
+  adapters/
+    foo/local/
+      source.go
+      sink.go
+  cmd/<module-bin>/
+    main.go
+  examples/
+    quickstart.md
+  go.mod
+```
+
+## 2) Capabilities (puertos)
+```go
+// core/capabilities/foo.go
+package capabilities
+
+import "context"
+
+type FooSource interface {
+  List(ctx context.Context) ([]Item, error)
+}
+
+type FooSink interface {
+  Put(ctx context.Context, it Item) error
+}
+```
+
+## 3) Config funcional (carga única desde ETCD)
+```go
+// core/config/options.go
+package config
+
+import "time"
+
+type Options struct {
+  PollInterval time.Duration
+}
+
+type Option func(*Options)
+
+func New(opts ...Option) Options {
+  o := Options{ PollInterval: 5 * time.Second }
+  for _, fn := range opts { fn(&o) }
+  return o
+}
+
+func WithPollInterval(d time.Duration) Option { return func(o *Options){ o.PollInterval = d } }
+```
+
+## 4) Instrumentación mínima
+```go
+// core/instrumentation/tracing.go
+package instrumentation
+
+import (
+  "context"
+  "github.com/xKoRx/echo/sdk/telemetry"
+  "go.opentelemetry.io/otel/attribute"
+)
+
+func Start(ctx context.Context, op string) (context.Context, func()) {
+  ctx, span := telemetry.StartSpan(ctx, "module."+op)
+  return ctx, func(){ span.End() }
+}
+
+func Info(ctx context.Context, msg string, kv ...attribute.KeyValue) {
+  telemetry.Info(ctx, msg, kv...)
+}
+```
+
+## 5) Main con DI + carga de ETCD (única)
+```go
+// cmd/<module-bin>/main.go
+package main
+
+import (
+  "context"
+  "log"
+
+  "github.com/xKoRx/symphony/internal/di"
+  etcdconfig "github.com/xKoRx/echo/sdk/etcd"
+)
+
+func main() {
+  ctx := context.Background()
+
+  cfg, err := etcdconfig.New(ctx,
+    etcdconfig.WithPrefix("symphony/development"),
+  )
+  if err != nil { log.Fatal(err) }
+
+  c := di.New()                  // contenedor DI transversal
+  // c.Bind(...) adapters locales, usando cfg
+
+  if err := run(ctx, c); err != nil { log.Fatal(err) }
+}
+```
+
+## 6) Reglas de importación (pegar en README del módulo)
+- ✅ `github.com/xKoRx/symphony/internal/di`
+- ✅ `github.com/xKoRx/sdk/...`
+- ❌ `github.com/xKoRx/<otro-módulo>/...`
+
+## 7) Quick QA (antes del PR)
+- [ ] Árbol base creado tal cual.
+- [ ] `capabilities` solo interfaces; `adapters` desacoplados.
+- [ ] ETCD cargado una vez; sin env/YAML.
+- [ ] Spans + métricas + logs listos.
+- [ ] `go test ./...` y `staticcheck ./...` verdes.
+- [ ] Sin cross-module imports.
+
+## 8) Anti-patrones (rechazar PR)
+- `context.WithValue` fuera de `core/contextx` ❌
+- Lógica de dominio en `cmd/*` ❌
+- Config mutable en runtime ❌
+- Dependencias internas a otros módulos ❌

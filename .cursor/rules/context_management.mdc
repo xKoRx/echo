@@ -1,0 +1,43 @@
+---
+description: Context Management
+globs: ["**/*.go"]
+alwaysApply: true
+---
+ ## Context Management
+- ALL context data insertion and extraction MUST be done through dedicated functions defined in `context.go`
+- NEVER use direct context value manipulation with `context.WithValue` or `context.Value`
+- For inserting values into context:
+  ```go
+  // Define a setter function in pkg/domain
+  func SetOfferID(ctx context.Context, offerID int64) context.Context {
+      return context.WithValue(ctx, offerIDKey, offerID)
+  }
+  
+  // Use the setter function
+  ctx = pkgDomain.SetOfferID(ctx, 12345)
+  ```
+- For extracting values from context:
+  ```go
+  // Define a getter function in pkg/domain
+  func GetOfferID(ctx context.Context) int64 {
+      value, ok := ctx.Value(offerIDKey).(int64)
+      if !ok {
+          return 0
+      }
+      return value
+  }
+  
+  // Use the getter function
+  offerID := pkgDomain.GetOfferID(ctx)
+  ```
+- Context keys MUST be defined as unexported constants in `sdk/domain`:
+  ```go
+  type contextKey string
+  
+  const (
+      offerIDKey contextKey = "offer_id"
+  )
+  ```
+- NEVER use generic functions like `GetValue` or `SetValue` for context manipulation
+- Each context value MUST have its own dedicated getter and setter functions
+- Document all context keys and their purpose in the codebase

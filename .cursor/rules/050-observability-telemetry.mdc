@@ -1,0 +1,238 @@
+---
+title: "Core Project Rule — Observabilidad con echo/sdk/telemetry (atributos en contexto + bundles)"
+description: "ALWAYS: usar github.com/xKoRx/echo/sdk/telemetry con atributos en contexto para máxima reutilización y bundles de métricas por dominio."
+alwaysApply: true
+globs:
+  - "**/*.go"
+version: "1.0"
+date: "2024"
+---
+
+# Core Rule — Observabilidad con `echo/sdk/telemetry`
+
+## Objetivo
+Uso **exclusivo** de `github.com/xKoRx/echo/sdk/telemetry` para **Logs**, **Métricas** y **Trazas**.  
+Énfasis en **atributos en contexto** para reducir líneas de código y en **bundles** para métricas consistentes por dominio.
+
+---
+
+## Principios no negociables
+- Instrumentar **todo** con `telemetry`. Sin atajos.
+- **Contexto primero**: propaga `context.Context`. No crear `context.Background()` dentro de flujos activos.
+- **Atributos por contexto**: usa `AppendCommonAttrs`, `AppendEventAttrs`, `AppendMetricAttrs`. **No** repitas attrs en cada llamada.
+- **Bundles por dominio**: usa `HTTPMetrics`, `DocumentMetrics`, `CandleMetrics`, `TickMetrics`, `SignalMetrics`, `TradeMetrics`, `SQXMetrics`, etc.
+- Spans siempre cerrados y errores con `telemetry.RecordError`.
+- Una sola inicialización de `telemetry` por proceso. `Shutdown` al salir.
+- Prohibido `fmt.Println`, `log.*`, `zap`, `logrus` fuera de `telemetry`.
+- Métricas sin nombres dinámicos por usuario/ID. Control de cardinalidad con **atributos**.
+
+---
+
+## Atributos en contexto — patrón obligatorio
+
+### Scopes
+- **Common**: aplica a logs, métricas y spans.
+- **Event**: exclusivo para logs y spans.
+- **Metric**: exclusivo para métricas.
+
+### API relevante (archivo `context.go`)
+- Cliente: `SetClient(ctx, *Client)`, `GetClient(ctx) *Client`.
+- Common: `AppendCommonAttrs`, `GetCommonAttrs`.
+- Event: `AppendEventAttrs`, `GetEventAttrs`.
+- Metric: `AppendMetricAttrs`, `GetMetricAttrs`.
+- Atajos: `AppendAttributes` (Event), `GetAttributes` (Event).  
+- **Merge**: Common → Event → Metric, **último gana**.
+
+### Boot global (una vez)
+```go
+func boot() context.Context {
+  ctx := context.Background()
+
+  // 1) Init client y bundles mínimos necesarios
+  client, err := telemetry.Init(ctx, nil, "mi-servicio", "production",
+    telemetry.HTTP, telemetry.Document, // añade otros si aplica
+  )
+  if err != nil { panic(err) }
+
+  // 2) Publica client y atributos transversales
+  ctx = telemetry.SetClient(ctx, client)
+  ctx = telemetry.AppendCommonAttrs(ctx,
+    telemetry.SemConv.Logs.ServiceName.String("mi-servicio"),
+    telemetry.SemConv.Logs.Environment.String("production"),
+    attribute.String("app.version", "1.2.3"),
+    attribute.String("host.name", hostname()),
+  )
+
+  return ctx
+}
+```
+
+### Uso en handlers y servicios
+```go
+// 1) Atributos del evento (se ponen una vez por request/operación)
+ctx = telemetry.AppendEventAttrs(ctx,
+  telemetry.SemConv.Logs.Feature.String("Orders"),
+  telemetry.SemConv.Logs.Event.String("create"),
+)
+
+// 2) Logs SIN repetir attrs
+client.Info(ctx, "Inicio de operación")
+// ... lógica ...
+client.Info(ctx, "Fin de operación")
+
+// 3) En caso de error
+if err != nil {
+  telemetry.RecordError(ctx, err)
+  client.Error(ctx, "Fallo", err)
+}
+```
+
+### Uso en métricas sin repetir attrs
+```go
+// 1) Atributos de métricas (se setean una vez)
+ctx = telemetry.AppendMetricAttrs(ctx,
+  telemetry.SemConv.HTTP.Method.String("POST"),
+  telemetry.SemConv.HTTP.Path.String("/api/orders"),
+)
+
+// 2) Bundles consumen attrs del contexto.
+// Si una API no los extrae, pasa GetMetricAttrs(ctx)... explícitamente.
+httpM := client.HTTPMetrics()
+stop := httpM.StartDurationTimer(ctx /*, GetMetricAttrs(ctx)...*/)
+defer stop()
+
+httpM.RecordRequests(ctx, 1 /*, GetMetricAttrs(ctx)...*/)
+```
+
+> Regla: **Configura attrs al inicio** y llama a `Info/Error/Record*/StartDurationTimer` **sin** repetir los mismos atributos. Solo agrega lo diferencial.
+
+---
+
+## Bundles — definición y uso
+
+### Selección de bundles en `Init`
+- **API HTTP**: `telemetry.HTTP`, `telemetry.Document`.
+- **Workers SQX**: `telemetry.SQX`, `telemetry.Document`.
+- **Ingesta financiera**: `telemetry.Candle`, `telemetry.Tick`, `telemetry.Signal`, `telemetry.Trade`.
+- **Persistencia**: `telemetry.Postgres`, `telemetry.Minio` (si existen).
+
+```go
+client, err := telemetry.Init(ctx, etcdClient, "order-api", "production",
+  telemetry.HTTP, telemetry.Document,
+)
+```
+
+### Convención de nombres (métrica)
+`<namespace>.<entity>.<metric>`  
+Ejemplos: `trading.http.requests`, `trading.http.duration`, `trading.sqx.workflows`.
+
+### Patrón de duración + resultado
+```go
+httpM := client.HTTPMetrics()
+stop := httpM.StartDurationTimer(ctx)  // usa MetricAttrs del contexto
+defer stop()
+
+// ... lógica ...
+httpM.RecordRequests(ctx, 1)           // idem
+```
+
+### Métricas financieras
+```go
+tickM := client.TickMetrics()
+tickM.RecordResult(ctx) // attrs comunes + métricos en el contexto
+```
+
+> Si alguna función bundle no lee del contexto, **pasa** `telemetry.GetMetricAttrs(ctx)...`.
+
+---
+
+## Trazas distribuidas
+```go
+ctx, span := client.StartSpan(ctx, "orders.create")
+defer span.End()
+
+// No repetir attrs: el logger y los bundles tomarán los del contexto
+client.Info(ctx, "validando")
+// subtarea
+ctx, child := client.StartSpan(ctx, "orders.validate")
+child.End()
+```
+
+---
+
+## Middleware HTTP (Gin / net/http)
+- Usa `telemetry.GinTelemetryMiddleware(client)` o `telemetry.HTTPTelemetryMiddleware(...)`.
+- Al entrar al request agrega **una vez**:
+  - `AppendEventAttrs` con `Feature/Event`.
+  - `AppendMetricAttrs` con `HTTP.Method/Path`.
+- No repitas esos atributos en cada llamada de log o métrica.
+
+---
+
+## Convenciones semánticas mínimas
+- **Logs/Event**: `Feature`, `Event`, `ServiceName`, `Environment`.
+- **HTTP**: `Method`, `Path`, `URL`, `StatusCode`, `UserAgent`, `ClientIP`.
+- **Métricas**: `Status`, `Result`, `Action`, `Service`, `Component` + negocio (`Exchange`, `Symbol`, `Strategy`, etc.).
+- **SQX/Document**: usar keys específicas del dominio.
+
+---
+
+## Anti‑patrones
+- Repetir los mismos atributos en cada llamada en lugar de usar contexto.
+- Crear spans sin `defer span.End()`.
+- Métricas con nombres por usuario/ID.
+- Re‑inicializar `telemetry`.
+- Perder contexto con `context.Background()` en medio del flujo.
+- Omitir `RecordError`.
+
+---
+
+## Checklist de PR
+- [ ] `telemetry.Init` **una vez**; `Shutdown` en `defer`.
+- [ ] Bundles correctos para el binario.
+- [ ] Middleware activo en HTTP.
+- [ ] Atributos transversales cargados en **Common** al boot.
+- [ ] `AppendEventAttrs` al inicio de cada operación.
+- [ ] `AppendMetricAttrs` al inicio de cada operación con métricas.
+- [ ] Llamadas a logs/métricas **sin** repetir attrs ya puestos en contexto.
+- [ ] Spans cerrados y errores con `RecordError`.
+- [ ] Sin loggers/metrics ad‑hoc.
+
+---
+
+## Ejemplo condensado
+```go
+func CreateOrderHandler(client *telemetry.Client) gin.HandlerFunc {
+  return func(c *gin.Context) {
+    ctx := c.Request.Context()
+    ctx = telemetry.AppendEventAttrs(ctx,
+      telemetry.SemConv.Logs.Feature.String("Orders"),
+      telemetry.SemConv.Logs.Event.String("create"),
+    )
+    ctx = telemetry.AppendMetricAttrs(ctx,
+      telemetry.SemConv.HTTP.Method.String("POST"),
+      telemetry.SemConv.HTTP.Path.String(c.FullPath()),
+    )
+
+    ctx, span := client.StartSpan(ctx, "HTTP POST "+c.FullPath())
+    defer span.End()
+
+    httpM := client.HTTPMetrics()
+    stop := httpM.StartDurationTimer(ctx)
+    defer stop()
+
+    // lógica...
+    client.Info(ctx, "creada")
+    httpM.RecordRequests(ctx, 1)
+    c.Status(201)
+  }
+}
+```
+
+---
+
+**Meta**
+- **Versión:** 1.0
+- **Fecha:** 2024
+- **Ámbito:** Go (`**/*.go`)
+- **Aplicación:** AlwaysApply=true

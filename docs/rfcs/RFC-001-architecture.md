@@ -437,8 +437,11 @@ service AgentService {
 ### Iteración 3 (2 días)
 - Mapeo símbolos (canonical ⇄ broker)
 - Specs de broker (min_lot, stop_level, etc.)
-- Reconexión automátiva ea-agent y agent-core. las eas una vez que pierden la coenxión no se vuelven a comunicar nunca más con el agente. validar esto mismo con core-agent
-- limpiar los buffers de operaciones luego de que cierre una operación en EA, agent y core
+- Las EAs deben informar las especificaciones de símbolos del broker al cual están conectados para un posterior sizing correcto
+- Reporting de precios cada 250ms: Slaves reportan Bid/Ask actual cada 250ms (coalesced) para que Core calcule sizing óptimo y timing de entrada por cuenta
+- Reconexión automática ea-agent y agent-core. Las EAs una vez que pierden la conexión no se vuelven a comunicar nunca más con el agente. Validar esto mismo con core-agent
+- Limpiar los buffers de operaciones luego de que cierre una operación en EA, agent y core
+- Validación de StopLevel en Core: Validar que SL/TP cumplen stop_level antes de enviar, ajustar o usar ModifyOrder post-fill si no cumple
 
 ### Iteración 4 (1-2 días)
 - **Sizing con riesgo fijo** (lo definido en sección 6)

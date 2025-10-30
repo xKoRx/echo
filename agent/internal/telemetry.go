@@ -13,6 +13,7 @@ import (
 func initTelemetry(ctx context.Context, config *Config) (*telemetry.Client, error) {
 	opts := []telemetry.Option{
 		telemetry.WithVersion(config.ServiceVersion),
+		telemetry.WithLogLevel(config.LogLevel),
 	}
 
 	// i1: Endpoints desde ETCD

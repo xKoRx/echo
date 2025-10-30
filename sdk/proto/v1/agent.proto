@@ -28,6 +28,8 @@ message AgentMessage {
     ExecutionResult execution_result = 14;
     StateSnapshot state_snapshot = 15;
     AgentHeartbeat heartbeat = 16;
+    AccountConnected account_connected = 17;      // NEW i2
+    AccountDisconnected account_disconnected = 18; // NEW i2
   }
 }
 
@@ -50,8 +52,32 @@ message AgentHello {
   string version = 2;
   string hostname = 3;
   string os = 4;
-  repeated string connected_clients = 5;
-  map<string, SymbolInfo> symbols = 6;
+  // connected_clients deprecated i2, será eliminado i3+
+  repeated string connected_clients = 5 [deprecated = true];
+  // owned_accounts deprecated i2 (ya no se usa, reemplazado por AccountConnected/Disconnected)
+  repeated string owned_accounts = 6 [deprecated = true];
+  map<string, SymbolInfo> symbols = 7;
+}
+
+// AccountConnected notifica al Core que una cuenta se conectó al Agent (i2).
+//
+// El Agent envía este mensaje cuando un Slave EA abre el Named Pipe.
+// El Core registra la cuenta como disponible para routing selectivo.
+message AccountConnected {
+  string account_id = 1;             // Account ID del slave (extraído del pipe name)
+  int64 connected_at_ms = 2;         // Timestamp de conexión
+  optional string client_type = 3;   // "slave" | "master" (para diagnóstico)
+  optional string broker = 4;        // Broker del EA (opcional i3+)
+}
+
+// AccountDisconnected notifica al Core que una cuenta se desconectó del Agent (i2).
+//
+// El Agent envía este mensaje cuando un Slave EA cierra el Named Pipe.
+// El Core desregistra la cuenta y deja de enrutar órdenes al Agent.
+message AccountDisconnected {
+  string account_id = 1;             // Account ID del slave
+  int64 disconnected_at_ms = 2;      // Timestamp de desconexión
+  optional string reason = 3;        // Razón de desconexión (opcional)
 }
 
 // StateSnapshot snapshot de estado de cuentas/posiciones

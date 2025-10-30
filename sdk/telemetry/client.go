@@ -88,9 +88,24 @@ func New(ctx context.Context, serviceName, environment string, opts ...Option) (
 }
 
 func (c *Client) initLogs() {
+	// Parsear nivel de log desde config
+	var level slog.Level
+	switch c.config.LogLevel {
+	case "DEBUG":
+		level = slog.LevelDebug
+	case "INFO":
+		level = slog.LevelInfo
+	case "WARN":
+		level = slog.LevelWarn
+	case "ERROR":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo // Default
+	}
+	
 	// Usar slog estándar con JSON handler
 	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: level,
 	})
 	c.logger = slog.New(handler)
 }

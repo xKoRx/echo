@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xKoRx/echo/sdk/domain"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
@@ -278,52 +279,66 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 		attribute.String("trade_id", tradeID),
 	)
 
-	// 5. Broadcast a todos los Agents
-	// TODO i0: broadcast simple, i1: routing inteligente por config
-	agents := r.core.GetAgents()
-	if len(agents) == 0 {
-		r.core.telemetry.Warn(ctx, "No agents connected, ExecuteOrder not sent")
-		// i1: Actualizar dedupe status a REJECTED
-		_ = r.core.dedupeService.UpdateStatus(ctx, tradeID, domain.OrderStatusRejected)
-		return
-	}
-
+	// 5. Routing selectivo (i2) en lugar de broadcast
 	sentCount := 0
-	for _, agent := range agents {
-		for _, order := range orders {
-			// Issue #M2: Agregar timestamp t3 (Core envía)
-			if order.Timestamps != nil {
-				order.Timestamps.T3CoreSendMs = utils.NowUnixMilli()
-			}
+	broadcastCount := 0
+	selectiveCount := 0
 
-			// Issue #C8: Blocking send con timeout (no usar default que pierde mensajes)
-			msg := &pb.CoreMessage{
-				Payload: &pb.CoreMessage_ExecuteOrder{ExecuteOrder: order},
-			}
+	for _, order := range orders {
+		// Issue #M2: Agregar timestamp t3 (Core envía)
+		if order.Timestamps != nil {
+			order.Timestamps.T3CoreSendMs = utils.NowUnixMilli()
+		}
 
-			select {
-			case agent.SendCh <- msg:
+		msg := &pb.CoreMessage{
+			Payload: &pb.CoreMessage_ExecuteOrder{ExecuteOrder: order},
+		}
+
+		// i2: Lookup owner en registry
+		targetAccountID := order.TargetAccountId
+		ownerAgentID, found := r.core.accountRegistry.GetOwner(targetAccountID)
+
+		// Registrar métrica de lookup
+		if found {
+			r.core.echoMetrics.RecordAccountLookup(ctx, "hit",
+				attribute.String("target_account_id", targetAccountID),
+			)
+		} else {
+			r.core.echoMetrics.RecordAccountLookup(ctx, "miss",
+				attribute.String("target_account_id", targetAccountID),
+			)
+		}
+
+		if found {
+			// Routing selectivo
+			agent, agentExists := r.getAgent(ownerAgentID)
+			if agentExists {
+				if r.sendToAgent(ctx, agent, msg, order) {
+					sentCount++
+					selectiveCount++
+					r.recordRoutingMetric(ctx, "selective", true, order)
+				}
+			} else {
+				// Owner registrado pero desconectado → fallback broadcast
+				r.core.telemetry.Warn(ctx, "Owner agent not connected, falling back to broadcast (i2)",
+					attribute.String("target_account_id", targetAccountID),
+					attribute.String("owner_agent_id", ownerAgentID),
+				)
+				if r.broadcastOrder(ctx, msg, order) > 0 {
+					sentCount++
+					broadcastCount++
+					r.recordRoutingMetric(ctx, "fallback_broadcast", false, order)
+				}
+			}
+		} else {
+			// No hay owner registrado → fallback broadcast
+			r.core.telemetry.Warn(ctx, "No owner registered for account, falling back to broadcast (i2)",
+				attribute.String("target_account_id", targetAccountID),
+			)
+			if r.broadcastOrder(ctx, msg, order) > 0 {
 				sentCount++
-				r.core.telemetry.Info(ctx, "ExecuteOrder sent to Agent",
-					attribute.String("agent_id", agent.AgentID),
-					attribute.String("command_id", order.CommandId),
-					attribute.String("trade_id", order.TradeId),
-					attribute.String("target_account_id", order.TargetAccountId),
-					attribute.String("symbol", order.Symbol),
-					attribute.String("side", order.Side.String()),
-					attribute.Float64("lot_size", order.LotSize),
-				)
-
-			case <-ctx.Done():
-				r.core.telemetry.Error(ctx, "Context cancelled while sending ExecuteOrder", ctx.Err(),
-					attribute.String("agent_id", agent.AgentID),
-					attribute.String("command_id", order.CommandId),
-				)
-				// Continuar intentando con otros agents/orders
-
-				// TODO i1: agregar timeout configurable (2-5 segundos)
-				// case <-time.After(2 * time.Second):
-				//     r.core.telemetry.Error(ctx, "Timeout sending ExecuteOrder", nil, ...)
+				broadcastCount++
+				r.recordRoutingMetric(ctx, "fallback_broadcast", false, order)
 			}
 		}
 	}
@@ -338,11 +353,14 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 		r.core.echoMetrics.RecordOrderSent(ctx,
 			semconv.Echo.TradeID.String(tradeID),
 			attribute.Int("sent_count", sentCount),
+			attribute.Int("selective_count", selectiveCount),
+			attribute.Int("broadcast_count", broadcastCount),
 		)
 
-		r.core.telemetry.Info(ctx, "ExecuteOrders sent to agents",
+		r.core.telemetry.Info(ctx, "ExecuteOrders sent (i2)",
 			attribute.Int("sent_count", sentCount),
-			attribute.Int("total_agents", len(agents)),
+			attribute.Int("selective_count", selectiveCount),
+			attribute.Int("broadcast_count", broadcastCount),
 		)
 	}
 }
@@ -574,7 +592,6 @@ func (r *Router) handleTradeClose(ctx context.Context, agentID string, close *pb
 	)
 
 	// Issue #C3: Crear CloseOrder por cada slave configurado (i1 con ticket exacto)
-	agents := r.core.GetAgents()
 	totalSent := 0
 
 	for _, slaveAccountID := range r.core.config.SlaveAccounts {
@@ -613,40 +630,55 @@ func (r *Router) handleTradeClose(ctx context.Context, agentID string, close *pb
 			closeOrder.Timestamps.T3CoreSendMs = utils.NowUnixMilli()
 		}
 
-		// Broadcast a todos los Agents
-		sentCount := 0
-		for _, agent := range agents {
-			select {
-			case agent.SendCh <- &pb.CoreMessage{
-				Payload: &pb.CoreMessage_CloseOrder{CloseOrder: closeOrder},
-			}:
-				sentCount++
-
-			case <-ctx.Done():
-				r.core.telemetry.Error(ctx, "Context cancelled while sending CloseOrder", nil,
-					attribute.String("close_order_id", closeOrderID),
-					attribute.String("target_account_id", slaveAccountID),
-				)
-				return
-
-				// TODO i1: agregar timeout configurable (2-5 segundos)
-				// case <-time.After(2 * time.Second):
-				//     r.core.telemetry.Error(ctx, "Timeout sending CloseOrder", nil, ...)
-			}
+		// i2: Routing selectivo para CloseOrder
+		msg := &pb.CoreMessage{
+			Payload: &pb.CoreMessage_CloseOrder{CloseOrder: closeOrder},
 		}
 
-		totalSent += sentCount
+		ownerAgentID, found := r.core.accountRegistry.GetOwner(slaveAccountID)
 
-		r.core.telemetry.Info(ctx, "CloseOrder sent to agents",
-			attribute.String("close_order_id", closeOrderID),
-			attribute.String("target_account_id", slaveAccountID),
-			attribute.String("symbol", close.Symbol),
-			attribute.Int64("magic_number", close.MagicNumber),
-			attribute.Int("sent_count", sentCount),
-		)
+		if found {
+			// Routing selectivo
+			agent, agentExists := r.getAgent(ownerAgentID)
+			if agentExists {
+				select {
+				case agent.SendCh <- msg:
+					totalSent++
+					r.core.telemetry.Info(ctx, "CloseOrder sent to Agent (selective i2)",
+						attribute.String("close_order_id", closeOrderID),
+						attribute.String("agent_id", ownerAgentID),
+						attribute.String("target_account_id", slaveAccountID),
+						attribute.String("symbol", close.Symbol),
+						attribute.Int64("magic_number", close.MagicNumber),
+					)
+
+				case <-ctx.Done():
+					r.core.telemetry.Error(ctx, "Context cancelled while sending CloseOrder", ctx.Err(),
+						attribute.String("close_order_id", closeOrderID),
+						attribute.String("target_account_id", slaveAccountID),
+					)
+					return
+				}
+			} else {
+				// Owner registrado pero desconectado → fallback broadcast
+				r.core.telemetry.Warn(ctx, "Owner agent not connected for CloseOrder, falling back to broadcast (i2)",
+					attribute.String("target_account_id", slaveAccountID),
+					attribute.String("owner_agent_id", ownerAgentID),
+				)
+				r.broadcastCloseOrder(ctx, msg, closeOrder, slaveAccountID)
+				totalSent++
+			}
+		} else {
+			// No hay owner registrado → fallback broadcast
+			r.core.telemetry.Warn(ctx, "No owner registered for account in CloseOrder, falling back to broadcast (i2)",
+				attribute.String("target_account_id", slaveAccountID),
+			)
+			r.broadcastCloseOrder(ctx, msg, closeOrder, slaveAccountID)
+			totalSent++
+		}
 	}
 
-	r.core.telemetry.Info(ctx, "All CloseOrders broadcasted",
+	r.core.telemetry.Info(ctx, "All CloseOrders sent (i2)",
 		attribute.String("trade_id", tradeID),
 		attribute.Int("total_slaves", len(r.core.config.SlaveAccounts)),
 		attribute.Int("total_sent", totalSent),
@@ -859,5 +891,167 @@ func orderSideToDomain(side pb.OrderSide) domain.OrderSide {
 		return domain.OrderSideSell
 	default:
 		return "" // TODO: mejor manejo de error
+	}
+}
+
+// getAgent retorna un Agent por ID (i2 helper).
+func (r *Router) getAgent(agentID string) (*AgentConnection, bool) {
+	return r.core.GetAgent(agentID)
+}
+
+// sendToAgent envía un mensaje a un Agent específico (i2b helper con timeout).
+//
+// Retorna true si el envío fue exitoso.
+func (r *Router) sendToAgent(ctx context.Context, agent *AgentConnection, msg *pb.CoreMessage, order *pb.ExecuteOrder) bool {
+	// i2b: Timeout de 500ms para evitar bloqueos indefinidos
+	timeout := time.NewTimer(500 * time.Millisecond)
+	defer timeout.Stop()
+
+	select {
+	case agent.SendCh <- msg:
+		// Envío exitoso - logging reducido para hot path
+		r.core.telemetry.Debug(ctx, "ExecuteOrder sent to Agent (selective i2b)",
+			attribute.String("agent_id", agent.AgentID),
+			attribute.String("command_id", order.CommandId),
+			attribute.String("trade_id", order.TradeId),
+			attribute.String("target_account_id", order.TargetAccountId),
+		)
+		return true
+
+	case <-timeout.C:
+		// i2b: Canal lleno o Agent lento - registrar warning y fallar
+		r.core.telemetry.Warn(ctx, "Timeout sending to Agent, channel may be full (i2b)",
+			attribute.String("agent_id", agent.AgentID),
+			attribute.String("command_id", order.CommandId),
+			attribute.String("target_account_id", order.TargetAccountId),
+		)
+		return false
+
+	case <-ctx.Done():
+		r.core.telemetry.Error(ctx, "Context cancelled while sending ExecuteOrder", ctx.Err(),
+			attribute.String("agent_id", agent.AgentID),
+			attribute.String("command_id", order.CommandId),
+		)
+		return false
+	}
+}
+
+// broadcastOrder envía una orden a todos los Agents (i2b fallback con timeout).
+//
+// Retorna el número de Agents que recibieron el mensaje.
+func (r *Router) broadcastOrder(ctx context.Context, msg *pb.CoreMessage, order *pb.ExecuteOrder) int {
+	agents := r.core.GetAgents()
+	if len(agents) == 0 {
+		r.core.telemetry.Warn(ctx, "No agents connected, broadcast failed (i2b)")
+		return 0
+	}
+
+	sentCount := 0
+	timeoutCount := 0
+
+	for _, agent := range agents {
+		// i2b: Timeout de 500ms por Agent para evitar bloqueos acumulados
+		timeout := time.NewTimer(500 * time.Millisecond)
+
+		select {
+		case agent.SendCh <- msg:
+			sentCount++
+			timeout.Stop()
+			// i2b: Logging reducido - solo debug level en hot path
+
+		case <-timeout.C:
+			// i2b: Timeout en este Agent - continuar con los demás
+			timeoutCount++
+			r.core.telemetry.Warn(ctx, "Timeout broadcasting to Agent (i2b)",
+				attribute.String("agent_id", agent.AgentID),
+				attribute.String("command_id", order.CommandId),
+			)
+
+		case <-ctx.Done():
+			timeout.Stop()
+			r.core.telemetry.Error(ctx, "Context cancelled during broadcast", ctx.Err(),
+				attribute.String("agent_id", agent.AgentID),
+			)
+			// Continuar con otros agents
+		}
+	}
+
+	// i2b: Log consolidado después del broadcast (reducir logging en hot path)
+	if sentCount > 0 || timeoutCount > 0 {
+		r.core.telemetry.Info(ctx, "Broadcast completed (fallback i2b)",
+			attribute.String("command_id", order.CommandId),
+			attribute.String("trade_id", order.TradeId),
+			attribute.String("target_account_id", order.TargetAccountId),
+			attribute.Int("sent_count", sentCount),
+			attribute.Int("timeout_count", timeoutCount),
+		)
+	}
+
+	return sentCount
+}
+
+// recordRoutingMetric registra métrica de routing (i2).
+//
+// mode: "selective" | "broadcast" | "fallback_broadcast"
+// result: true para "hit", false para "miss"
+func (r *Router) recordRoutingMetric(ctx context.Context, mode string, result bool, order *pb.ExecuteOrder) {
+	resultStr := "miss"
+	if result {
+		resultStr = "hit"
+	}
+
+	r.core.echoMetrics.RecordRoutingMode(ctx, mode, resultStr,
+		attribute.String("target_account_id", order.TargetAccountId),
+		attribute.String("trade_id", order.TradeId),
+	)
+}
+
+// broadcastCloseOrder envía un CloseOrder a todos los Agents (i2b fallback con timeout).
+func (r *Router) broadcastCloseOrder(ctx context.Context, msg *pb.CoreMessage, order *pb.CloseOrder, slaveAccountID string) {
+	agents := r.core.GetAgents()
+	if len(agents) == 0 {
+		r.core.telemetry.Warn(ctx, "No agents connected, CloseOrder broadcast failed (i2b)")
+		return
+	}
+
+	sentCount := 0
+	timeoutCount := 0
+
+	for _, agent := range agents {
+		// i2b: Timeout de 500ms por Agent para evitar bloqueos acumulados
+		timeout := time.NewTimer(500 * time.Millisecond)
+
+		select {
+		case agent.SendCh <- msg:
+			sentCount++
+			timeout.Stop()
+			// i2b: Logging reducido - solo debug level en hot path
+
+		case <-timeout.C:
+			// i2b: Timeout en este Agent - continuar con los demás
+			timeoutCount++
+			r.core.telemetry.Warn(ctx, "Timeout broadcasting CloseOrder to Agent (i2b)",
+				attribute.String("agent_id", agent.AgentID),
+				attribute.String("command_id", order.CommandId),
+			)
+
+		case <-ctx.Done():
+			timeout.Stop()
+			r.core.telemetry.Error(ctx, "Context cancelled during CloseOrder broadcast", ctx.Err(),
+				attribute.String("agent_id", agent.AgentID),
+			)
+			// Continuar con otros agents
+		}
+	}
+
+	// i2b: Log consolidado después del broadcast (reducir logging en hot path)
+	if sentCount > 0 || timeoutCount > 0 {
+		r.core.telemetry.Info(ctx, "CloseOrder broadcast completed (fallback i2b)",
+			attribute.String("command_id", order.CommandId),
+			attribute.String("trade_id", order.TradeId),
+			attribute.String("target_account_id", slaveAccountID),
+			attribute.Int("sent_count", sentCount),
+			attribute.Int("timeout_count", timeoutCount),
+		)
 	}
 }

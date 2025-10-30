@@ -135,7 +135,7 @@ func (a *Agent) Start() error {
 	a.pipeManager = pipeManager
 
 	// 4. Iniciar gestión de pipes (bloquea hasta ctx.Done)
-	if err := a.pipeManager.Start(a.sendToCoreCh); err != nil {
+	if err := a.pipeManager.Start(a.sendToCoreCh, a.config.AgentID); err != nil {
 		return fmt.Errorf("pipe manager failed: %w", err)
 	}
 

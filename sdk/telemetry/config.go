@@ -21,6 +21,9 @@ type Config struct {
 	EnableLogs    bool
 	EnableMetrics bool
 	EnableTraces  bool
+	
+	// Log Level (INFO, DEBUG, WARN, ERROR)
+	LogLevel string
 }
 
 // DefaultConfig retorna una configuración con valores por defecto
@@ -36,6 +39,7 @@ func DefaultConfig(serviceName, environment string) Config {
 		EnableMetrics:       true,
 		EnableTraces:        true,
 		CommonAttributes:    []attribute.KeyValue{},
+		LogLevel:            "INFO", // Default
 	}
 }
 
@@ -91,5 +95,12 @@ func WithMetricsDisabled() Option {
 func WithTracesDisabled() Option {
 	return func(c *Config) {
 		c.EnableTraces = false
+	}
+}
+
+// WithLogLevel establece el nivel de log (INFO, DEBUG, WARN, ERROR)
+func WithLogLevel(level string) Option {
+	return func(c *Config) {
+		c.LogLevel = level
 	}
 }

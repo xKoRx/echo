@@ -24,7 +24,7 @@ func NewPipeManager(ctx context.Context, config *Config, tel *telemetry.Client, 
 }
 
 // Start retorna error en plataformas no-Windows.
-func (pm *PipeManager) Start(sendToCoreCh chan *pb.AgentMessage) error {
+func (pm *PipeManager) Start(sendToCoreCh chan *pb.AgentMessage, agentID string) error {
 	return fmt.Errorf("Named Pipes are only supported on Windows")
 }
 

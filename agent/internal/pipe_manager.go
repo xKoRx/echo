@@ -36,6 +36,7 @@ func preview(b []byte, max int) string {
 //   - Esperar conexiones de EAs
 //   - Leer mensajes JSON de EAs y transformar a proto
 //   - Escribir mensajes proto transformados a JSON para EAs
+//   - i2: Detectar conexión/desconexión y notificar al Core
 type PipeManager struct {
 	config      *Config
 	telemetry   *telemetry.Client
@@ -52,6 +53,9 @@ type PipeManager struct {
 
 	// Canal para enviar mensajes al Core
 	sendToCoreCh chan *pb.AgentMessage
+
+	// i2: Agent ID para notificaciones AccountConnected/AccountDisconnected
+	agentID string
 }
 
 // NewPipeManager crea un nuevo PipeManager.
@@ -73,8 +77,9 @@ func NewPipeManager(ctx context.Context, config *Config, tel *telemetry.Client, 
 // Start inicia la gestión de pipes.
 //
 // Crea pipes para masters y slaves y espera conexiones.
-func (pm *PipeManager) Start(sendToCoreCh chan *pb.AgentMessage) error {
+func (pm *PipeManager) Start(sendToCoreCh chan *pb.AgentMessage, agentID string) error {
 	pm.sendToCoreCh = sendToCoreCh
+	pm.agentID = agentID // i2: Guardar agentID
 
 	pm.logInfo("PipeManager starting", map[string]interface{}{
 		"master_accounts": len(pm.config.MasterAccounts),
@@ -129,6 +134,7 @@ func (pm *PipeManager) createPipe(name, role, accountID string) error {
 		telemetry:    pm.telemetry,
 		echoMetrics:  pm.echoMetrics,
 		sendToCoreCh: pm.sendToCoreCh,
+		agentID:      pm.agentID, // i2: Pasar agentID al handler
 		ctx:          pm.ctx,
 	}
 
@@ -206,6 +212,9 @@ type PipeHandler struct {
 	// Canal para enviar al Core
 	sendToCoreCh chan *pb.AgentMessage
 
+	// i2: Agent ID para notificaciones AccountConnected/AccountDisconnected
+	agentID string
+
 	// Lifecycle
 	ctx    context.Context
 	closed bool
@@ -231,6 +240,11 @@ func (h *PipeHandler) Run() error {
 		"role":      h.role,
 	})
 
+	// NEW i2: Notificar al Core que la cuenta se conectó
+	if h.role == "slave" || h.role == "master" {
+		h.notifyAccountConnected()
+	}
+
 	// Usaremos un LineReader nuevo por iteración para evitar estados internos
 	// de scanner atascados después de timeouts. Esto es liviano y simple para i0.
 	// Modo debug: log de línea cruda antes de parsear (temporal)
@@ -251,7 +265,7 @@ func (h *PipeHandler) Run() error {
 		line, err := lr.ReadLine()
 		if err == nil {
 			if len(line) > 0 {
-				h.logInfo("Raw line received", map[string]interface{}{
+				h.logDebug("Raw line received", map[string]interface{}{
 					"pipe_name": h.name,
 					"bytes":     len(line),
 					"preview":   preview(line, 160),
@@ -268,9 +282,20 @@ func (h *PipeHandler) Run() error {
 			msgMap, err = ipc.ParseJSONLine(line)
 		}
 		if err != nil {
-			// No llegó línea en este ciclo: continuar bucle
 			errStr := err.Error()
-			if errStr == "i/o timeout" || errStr == "EOF" {
+
+			// i2b: EOF significa desconexión del cliente - salir del loop
+			if errStr == "EOF" {
+				h.logInfo("Client disconnected (EOF detected)", map[string]interface{}{
+					"pipe_name": h.name,
+					"role":      h.role,
+				})
+				// Salir del loop para ejecutar notifyAccountDisconnected en defer
+				break
+			}
+
+			// Timeout es NORMAL cuando EA no envía nada - continuar esperando
+			if errStr == "i/o timeout" {
 				select {
 				case <-h.ctx.Done():
 					return nil
@@ -278,17 +303,13 @@ func (h *PipeHandler) Run() error {
 				}
 				continue
 			}
-		}
-		if err != nil {
-			// Timeout es NORMAL cuando EA no envía nada - no es error
-			// Solo loggear si es un error real (no timeout/EOF)
-			errStr := err.Error()
-			if errStr != "i/o timeout" && errStr != "EOF" {
-				h.logError("Failed to read message", err, map[string]interface{}{
-					"pipe_name": h.name,
-				})
-			}
-			// Si no hay datos, dormir 100ms antes de reintentar (evitar CPU spinning)
+
+			// Otros errores: loggear y continuar (pueden ser transitorios)
+			h.logError("Failed to read message", err, map[string]interface{}{
+				"pipe_name": h.name,
+			})
+
+			// Dormir 100ms antes de reintentar (evitar CPU spinning)
 			select {
 			case <-h.ctx.Done():
 				return nil
@@ -308,6 +329,14 @@ func (h *PipeHandler) Run() error {
 			}
 		}
 	}
+
+	// NEW i2: Si salimos del loop por error de conexión, notificar desconexión
+	// (esto ocurre cuando el cliente se desconecta o hay un error fatal)
+	if h.role == "slave" || h.role == "master" {
+		h.notifyAccountDisconnected("client_disconnected")
+	}
+
+	return nil
 }
 
 // handleMasterMessage procesa mensajes del Master EA.
@@ -324,6 +353,9 @@ func (h *PipeHandler) handleMasterMessage(msgMap map[string]interface{}) error {
 		})
 		// TODO i0: nada más que loggear, i1+: registrar cliente
 		return nil
+
+	case "ping":
+		return h.handlePing(msgMap)
 
 	case "trade_intent":
 		return h.handleTradeIntent(msgMap)
@@ -440,6 +472,9 @@ func (h *PipeHandler) handleSlaveMessage(msgMap map[string]interface{}) error {
 		})
 		return nil
 
+	case "ping":
+		return h.handlePing(msgMap)
+
 	case "execution_result":
 		return h.handleExecutionResult(msgMap)
 
@@ -517,6 +552,46 @@ func (h *PipeHandler) handleCloseResult(msgMap map[string]interface{}) error {
 	case <-h.ctx.Done():
 		return h.ctx.Err()
 	}
+
+	return nil
+}
+
+// handlePing procesa un ping del EA y responde con pong.
+//
+// i2b: Implementación de ping/pong para liveness checking.
+func (h *PipeHandler) handlePing(msgMap map[string]interface{}) error {
+	pingID := utils.ExtractString(msgMap, "id")
+	echoMs := utils.ExtractInt64(msgMap, "timestamp_ms")
+
+	if pingID == "" {
+		h.logWarn("Ping without id", map[string]interface{}{
+			"pipe_name": h.name,
+		})
+		return nil
+	}
+
+	// Construir pong response
+	pongMsg := map[string]interface{}{
+		"type":         "pong",
+		"id":           pingID,
+		"timestamp_ms": utils.NowUnixMilli(),
+		"echo_ms":      echoMs,
+	}
+
+	// Escribir pong directamente
+	writer := ipc.NewJSONWriter(h.server)
+	if err := writer.WriteMessage(pongMsg); err != nil {
+		h.logError("Failed to send pong", err, map[string]interface{}{
+			"ping_id": pingID,
+		})
+		return err
+	}
+
+	h.logDebug("Pong sent", map[string]interface{}{
+		"ping_id":  pingID,
+		"echo_ms":  echoMs,
+		"rtt_calc": utils.NowUnixMilli() - echoMs,
+	})
 
 	return nil
 }
@@ -606,4 +681,79 @@ func (h *PipeHandler) logError(message string, err error, fields map[string]inte
 	fields["pipe_name"] = h.name
 	attrs := mapToAttrs(fields)
 	h.telemetry.Error(h.ctx, message, err, attrs...)
+}
+
+// logDebug loggea un mensaje DEBUG.
+func (h *PipeHandler) logDebug(message string, fields map[string]interface{}) {
+	if fields == nil {
+		fields = make(map[string]interface{})
+	}
+	fields["component"] = "pipe_handler"
+	fields["pipe_name"] = h.name
+	attrs := mapToAttrs(fields)
+	h.telemetry.Debug(h.ctx, message, attrs...)
+}
+
+// NEW i2: notifyAccountConnected notifica al Core que una cuenta se conectó.
+func (h *PipeHandler) notifyAccountConnected() {
+	if h.agentID == "" || h.accountID == "" {
+		h.logWarn("Cannot notify AccountConnected: missing agentID or accountID", map[string]interface{}{
+			"agent_id":   h.agentID,
+			"account_id": h.accountID,
+		})
+		return
+	}
+
+	clientType := h.role // "slave" o "master"
+
+	msg := &pb.AgentMessage{
+		AgentId:     h.agentID,
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.AgentMessage_AccountConnected{
+			AccountConnected: &pb.AccountConnected{
+				AccountId:     h.accountID,
+				ConnectedAtMs: utils.NowUnixMilli(),
+				ClientType:    &clientType,
+			},
+		},
+	}
+
+	select {
+	case h.sendToCoreCh <- msg:
+		h.logInfo("AccountConnected sent to Core (i2)", map[string]interface{}{
+			"account_id":  h.accountID,
+			"client_type": clientType,
+		})
+	case <-h.ctx.Done():
+		h.logWarn("Context done, cannot send AccountConnected (i2)", nil)
+	}
+}
+
+// NEW i2: notifyAccountDisconnected notifica al Core que una cuenta se desconectó.
+func (h *PipeHandler) notifyAccountDisconnected(reason string) {
+	if h.agentID == "" || h.accountID == "" {
+		return // Silencioso si no hay datos
+	}
+
+	msg := &pb.AgentMessage{
+		AgentId:     h.agentID,
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.AgentMessage_AccountDisconnected{
+			AccountDisconnected: &pb.AccountDisconnected{
+				AccountId:        h.accountID,
+				DisconnectedAtMs: utils.NowUnixMilli(),
+				Reason:           &reason,
+			},
+		},
+	}
+
+	select {
+	case h.sendToCoreCh <- msg:
+		h.logInfo("AccountDisconnected sent to Core (i2)", map[string]interface{}{
+			"account_id": h.accountID,
+			"reason":     reason,
+		})
+	case <-h.ctx.Done():
+		h.logWarn("Context done, cannot send AccountDisconnected (i2)", nil)
+	}
 }

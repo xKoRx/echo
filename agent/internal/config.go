@@ -43,6 +43,7 @@ type Config struct {
 	Environment     string // telemetry/environment
 	OTLPEndpoint    string // endpoints/otel/otlp_endpoint
 	MetricsEndpoint string // endpoints/otel/metrics_endpoint
+	LogLevel        string // agent/log_level (INFO, DEBUG, WARN, ERROR)
 }
 
 // LoadConfig carga configuración desde ETCD.
@@ -99,6 +100,7 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		ServiceName:         "echo-agent",
 		ServiceVersion:      "1.0.0-i1",
 		Environment:         env,
+		LogLevel:            "INFO", // Default
 	}
 
 	// Cargar endpoints
@@ -185,6 +187,11 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	}
 	if val, err := etcdClient.GetVarWithDefault(ctx, "telemetry/environment", ""); err == nil && val != "" {
 		cfg.Environment = val
+	}
+	
+	// Cargar Log Level desde agent/log_level
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/log_level", ""); err == nil && val != "" {
+		cfg.LogLevel = val
 	}
 
 	// Validar configuración mínima requerida

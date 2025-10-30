@@ -3,6 +3,7 @@ package internal
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry/semconv"
@@ -37,7 +38,12 @@ func (a *Agent) connectToCore() error {
 		"agent_id": a.config.AgentID,
 	})
 
-	a.logInfo("Connected to Core (i1)", nil)
+	// NEW i2: Enviar AgentHello SOLO con metadata (sin owned_accounts)
+	if err := a.sendAgentHello(); err != nil {
+		return fmt.Errorf("failed to send AgentHello: %w", err)
+	}
+
+	a.logInfo("Connected to Core (i2)", nil)
 	return nil
 }
 
@@ -271,4 +277,33 @@ func generateAgentID() (string, error) {
 	// Conserva el hostname para trazabilidad
 	suffix := utils.GenerateUUIDv7()
 	return fmt.Sprintf("agent_%s-%s", hostname, suffix), nil
+}
+
+// NEW i2: sendAgentHello envía el handshake inicial (solo metadata).
+func (a *Agent) sendAgentHello() error {
+	hostname, _ := os.Hostname() // Excepción permitida por reglas
+
+	hello := &pb.AgentHello{
+		AgentId:  a.config.AgentID,
+		Version:  a.config.ServiceVersion,
+		Hostname: hostname,
+		Os:       runtime.GOOS,
+		Symbols:  make(map[string]*pb.SymbolInfo), // TODO i3: reportar símbolos
+		// NO incluye owned_accounts ni connected_clients (deprecated i2)
+	}
+
+	msg := &pb.AgentMessage{
+		AgentId:     a.config.AgentID,
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.AgentMessage_Hello{
+			Hello: hello,
+		},
+	}
+
+	if err := a.coreStream.Send(msg); err != nil {
+		return fmt.Errorf("failed to send AgentHello: %w", err)
+	}
+
+	a.logInfo("AgentHello sent to Core (i2)", nil)
+	return nil
 }

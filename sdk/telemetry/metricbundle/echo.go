@@ -67,6 +67,10 @@ type EchoMetrics struct {
 	LatencyCoreToAgent   metric.Float64Histogram
 	LatencyAgentToSlave  metric.Float64Histogram
 	LatencySlaveExecution metric.Float64Histogram
+
+	// i2: Routing metrics
+	RoutingMode     metric.Int64Counter
+	AccountLookup   metric.Int64Counter
 }
 
 // NewEchoMetrics crea un nuevo bundle de métricas Echo.
@@ -181,6 +185,25 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	// i2: Routing metrics
+	routingMode, err := meter.Int64Counter(
+		"echo.routing.mode",
+		metric.WithDescription("Modo de routing usado (selective, broadcast, fallback_broadcast)"),
+		metric.WithUnit("{routing}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	accountLookup, err := meter.Int64Counter(
+		"echo.routing.account_lookup",
+		metric.WithDescription("Resultado de lookup en AccountRegistry (hit, miss)"),
+		metric.WithUnit("{lookup}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &EchoMetrics{
 		IntentReceived:       intentReceived,
 		IntentForwarded:      intentForwarded,
@@ -194,6 +217,8 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		LatencyCoreToAgent:   latencyCoreToAgent,
 		LatencyAgentToSlave:  latencyAgentToSlave,
 		LatencySlaveExecution: latencySlaveExecution,
+		RoutingMode:          routingMode,    // i2
+		AccountLookup:        accountLookup,  // i2
 	}, nil
 }
 
@@ -257,5 +282,31 @@ func (m *EchoMetrics) RecordLatencyAgentToSlave(ctx context.Context, latencyMs f
 // RecordLatencySlaveExecution registra latencia ejecución en Slave (ms).
 func (m *EchoMetrics) RecordLatencySlaveExecution(ctx context.Context, latencyMs float64, attrs ...attribute.KeyValue) {
 	m.LatencySlaveExecution.Record(ctx, latencyMs, metric.WithAttributes(attrs...))
+}
+
+// RecordRoutingMode registra el modo de routing usado (i2).
+//
+// mode: "selective" | "broadcast" | "fallback_broadcast"
+// result: "hit" | "miss"
+func (m *EchoMetrics) RecordRoutingMode(ctx context.Context, mode string, result string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("routing.mode", mode),
+		attribute.String("routing.result", result),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+
+	m.RoutingMode.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordAccountLookup registra lookups al AccountRegistry (i2).
+//
+// result: "hit" | "miss"
+func (m *EchoMetrics) RecordAccountLookup(ctx context.Context, result string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("lookup.result", result),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+
+	m.AccountLookup.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
 }
 

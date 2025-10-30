@@ -51,6 +51,9 @@ type Core struct {
 	agents   map[string]*AgentConnection // key: agent_id
 	agentsMu sync.RWMutex
 
+	// i2: Registry de ownership de cuentas (estado operacional en memoria)
+	accountRegistry *AccountRegistry
+
 	// PostgreSQL
 	db *sql.DB
 
@@ -193,6 +196,7 @@ func New(ctx context.Context) (*Core, error) {
 		correlationSvc: correlationSvc,
 		dedupeService:  dedupeService,
 		agents:         make(map[string]*AgentConnection),
+		accountRegistry: NewAccountRegistry(telClient), // NEW i2
 		telemetry:      telClient,
 		echoMetrics:    echoMetrics,
 		ctx:            coreCtx,
@@ -317,6 +321,7 @@ func (c *Core) StreamBidi(stream pb.AgentService_StreamBidiServer) error {
 	c.registerAgent(agentID, conn)
 	defer func() {
 		c.unregisterAgent(agentID)
+		c.accountRegistry.UnregisterAgent(agentID) // NEW i2: limpiar registry
 		agentCancel()
 		close(conn.SendCh)
 	}()
@@ -337,6 +342,24 @@ func (c *Core) StreamBidi(stream pb.AgentService_StreamBidiServer) error {
 				attribute.String("error", err.Error()),
 			)
 			return err
+		}
+
+		// NEW i2: Procesar AgentHello para logging (sin ownership)
+		if hello := msg.GetHello(); hello != nil {
+			c.handleAgentHello(agentID, hello)
+			continue // No enviar al router
+		}
+
+		// NEW i2: Procesar AccountConnected
+		if accountConn := msg.GetAccountConnected(); accountConn != nil {
+			c.handleAccountConnected(agentID, accountConn)
+			continue
+		}
+
+		// NEW i2: Procesar AccountDisconnected
+		if accountDisconn := msg.GetAccountDisconnected(); accountDisconn != nil {
+			c.handleAccountDisconnected(agentID, accountDisconn)
+			continue
 		}
 
 		// Enviar al router para procesamiento
@@ -409,6 +432,15 @@ func (c *Core) GetAgents() []*AgentConnection {
 		agents = append(agents, conn)
 	}
 	return agents
+}
+
+// GetAgent retorna un Agent específico por ID (i2 helper).
+func (c *Core) GetAgent(agentID string) (*AgentConnection, bool) {
+	c.agentsMu.RLock()
+	defer c.agentsMu.RUnlock()
+
+	conn, exists := c.agents[agentID]
+	return conn, exists
 }
 
 // dedupeCleanupLoop limpia entries antiguos del dedupe store (persistente i1).
@@ -518,4 +550,85 @@ func extractAgentIDFromMetadata(ctx context.Context) (string, error) {
 	}
 
 	return agentID, nil
+}
+
+// NEW i2: handleAgentHello procesa el handshake inicial del Agent (solo metadata).
+func (c *Core) handleAgentHello(agentID string, hello *pb.AgentHello) {
+	c.telemetry.Info(c.ctx, "AgentHello received (i2)",
+		attribute.String("agent_id", agentID),
+		attribute.String("version", hello.Version),
+		attribute.String("hostname", hello.Hostname),
+		attribute.String("os", hello.Os),
+	)
+	// No registra cuentas aquí; eso se hace dinámicamente con AccountConnected
+}
+
+// NEW i2: handleAccountConnected procesa la conexión de una cuenta al Agent.
+func (c *Core) handleAccountConnected(agentID string, msg *pb.AccountConnected) {
+	// Validar usando SDK
+	if err := domain.ValidateAccountConnected(msg); err != nil {
+		c.telemetry.Warn(c.ctx, "Invalid AccountConnected message (i2)",
+			attribute.String("agent_id", agentID),
+			attribute.String("error", err.Error()),
+		)
+		return
+	}
+
+	accountID := msg.AccountId
+
+	clientType := "unknown"
+	if msg.ClientType != nil {
+		clientType = *msg.ClientType
+	}
+
+	c.telemetry.Info(c.ctx, "AccountConnected received (i2)",
+		attribute.String("agent_id", agentID),
+		attribute.String("account_id", accountID),
+		attribute.String("client_type", clientType),
+	)
+
+	// Registrar cuenta en registry
+	c.accountRegistry.RegisterAccount(agentID, accountID)
+
+	// Métrica: número de cuentas registradas
+	totalAccounts, totalAgents := c.accountRegistry.GetStats()
+	c.telemetry.Info(c.ctx, "Account registry updated (i2)",
+		attribute.Int("total_accounts", totalAccounts),
+		attribute.Int("total_agents", totalAgents),
+	)
+}
+
+// NEW i2: handleAccountDisconnected procesa la desconexión de una cuenta del Agent.
+func (c *Core) handleAccountDisconnected(agentID string, msg *pb.AccountDisconnected) {
+	// Validar usando SDK
+	if err := domain.ValidateAccountDisconnected(msg); err != nil {
+		c.telemetry.Warn(c.ctx, "Invalid AccountDisconnected message (i2)",
+			attribute.String("agent_id", agentID),
+			attribute.String("error", err.Error()),
+		)
+		return
+	}
+
+	accountID := msg.AccountId
+
+	reason := "unknown"
+	if msg.Reason != nil {
+		reason = *msg.Reason
+	}
+
+	c.telemetry.Info(c.ctx, "AccountDisconnected received (i2)",
+		attribute.String("agent_id", agentID),
+		attribute.String("account_id", accountID),
+		attribute.String("reason", reason),
+	)
+
+	// Desregistrar cuenta del registry
+	c.accountRegistry.UnregisterAccount(accountID)
+
+	// Métrica: número de cuentas registradas
+	totalAccounts, totalAgents := c.accountRegistry.GetStats()
+	c.telemetry.Info(c.ctx, "Account registry updated (i2)",
+		attribute.Int("total_accounts", totalAccounts),
+		attribute.Int("total_agents", totalAgents),
+	)
 }

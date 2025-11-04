@@ -66,11 +66,14 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		// Slave Accounts (i0: cuentas demo reales)
 		"core/slave_accounts": "2089126183,2089126186",
 
+		"core/canonical_symbols":      "XAUUSD,DAX", // XAUUSD,DAX,EURUSD,GBPUSD,USDCHF,USDJPY
+		"core/symbols/unknown_action": "reject",     // reject, warn, error
+
 		// PostgreSQL
 		"postgres/host":           "192.168.31.220",
 		"postgres/port":           "5432",
 		"postgres/database":       "echo",
-		"postgres/user":           "postgres",
+		"postgres/user":           "echo_user",
 		"postgres/password":       "cascada123",
 		"postgres/schema":         "echo",
 		"postgres/pool_max_conns": "10",

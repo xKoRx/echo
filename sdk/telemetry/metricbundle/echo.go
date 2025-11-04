@@ -71,6 +71,12 @@ type EchoMetrics struct {
 	// i2: Routing metrics
 	RoutingMode     metric.Int64Counter
 	AccountLookup   metric.Int64Counter
+
+	// i3: Symbol metrics
+	SymbolsLookup   metric.Int64Counter // echo.symbols.lookup (hit/miss)
+	SymbolsReported metric.Int64Counter // echo.symbols.reported
+	SymbolsValidate metric.Int64Counter // echo.symbols.validate (ok/reject)
+	SymbolsLoaded   metric.Int64Counter // echo.symbols.loaded (source=etcd/postgres/agent_report)
 }
 
 // NewEchoMetrics crea un nuevo bundle de métricas Echo.
@@ -204,6 +210,43 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	// i3: Symbol metrics
+	symbolsLookup, err := meter.Int64Counter(
+		"echo.symbols.lookup",
+		metric.WithDescription("Resultado de lookup de símbolo por cuenta (hit, miss)"),
+		metric.WithUnit("{lookup}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	symbolsReported, err := meter.Int64Counter(
+		"echo.symbols.reported",
+		metric.WithDescription("Reportes de símbolos recibidos por cuenta"),
+		metric.WithUnit("{report}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	symbolsValidate, err := meter.Int64Counter(
+		"echo.symbols.validate",
+		metric.WithDescription("Validaciones de símbolos canónicos (ok, reject)"),
+		metric.WithUnit("{validation}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	symbolsLoaded, err := meter.Int64Counter(
+		"echo.symbols.loaded",
+		metric.WithDescription("Símbolos cargados desde fuente (etcd, postgres, agent_report)"),
+		metric.WithUnit("{symbol}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &EchoMetrics{
 		IntentReceived:       intentReceived,
 		IntentForwarded:      intentForwarded,
@@ -217,8 +260,12 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		LatencyCoreToAgent:   latencyCoreToAgent,
 		LatencyAgentToSlave:  latencyAgentToSlave,
 		LatencySlaveExecution: latencySlaveExecution,
-		RoutingMode:          routingMode,    // i2
-		AccountLookup:        accountLookup,  // i2
+		RoutingMode:          routingMode,     // i2
+		AccountLookup:        accountLookup,   // i2
+		SymbolsLookup:        symbolsLookup,   // i3
+		SymbolsReported:      symbolsReported, // i3
+		SymbolsValidate:      symbolsValidate, // i3
+		SymbolsLoaded:        symbolsLoaded,   // i3
 	}, nil
 }
 
@@ -308,5 +355,52 @@ func (m *EchoMetrics) RecordAccountLookup(ctx context.Context, result string, at
 	baseAttrs = append(baseAttrs, attrs...)
 
 	m.AccountLookup.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordSymbolLookup registra lookup de símbolo por cuenta (i3).
+//
+// result: "hit" | "miss"
+func (m *EchoMetrics) RecordSymbolLookup(ctx context.Context, result string, accountID, canonical string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("lookup.result", result),
+		attribute.String("account_id", accountID),
+		attribute.String("canonical_symbol", canonical),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.SymbolsLookup.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordSymbolsReported registra reporte de símbolos por cuenta (i3).
+func (m *EchoMetrics) RecordSymbolsReported(ctx context.Context, accountID string, count int, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("account_id", accountID),
+		attribute.Int("symbols_count", count),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.SymbolsReported.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordSymbolValidate registra validación de símbolo canónico (i3).
+//
+// result: "ok" | "reject"
+func (m *EchoMetrics) RecordSymbolValidate(ctx context.Context, result string, symbol string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("validation.result", result),
+		attribute.String("symbol", symbol),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.SymbolsValidate.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordSymbolsLoaded registra carga de símbolos desde fuente (i3).
+//
+// source: "etcd" | "postgres" | "agent_report"
+func (m *EchoMetrics) RecordSymbolsLoaded(ctx context.Context, source string, count int, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("source", source),
+		attribute.Int("symbols_count", count),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.SymbolsLoaded.Add(ctx, int64(count), metric.WithAttributes(baseAttrs...))
 }
 

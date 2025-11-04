@@ -3,6 +3,8 @@ package domain
 
 import (
 	"time"
+
+	pb "github.com/xKoRx/echo/sdk/pb/v1"
 )
 
 // OrderStatus representa el estado de una orden en el sistema.
@@ -28,10 +30,10 @@ const (
 // Corresponde a la tabla `echo.trades` en PostgreSQL.
 type Trade struct {
 	// Identidad
-	TradeID         string      `json:"trade_id" db:"trade_id"`                   // UUIDv7 único
-	SourceMasterID  string      `json:"source_master_id" db:"source_master_id"`   // ID del Master EA
-	MasterAccountID string      `json:"master_account_id" db:"master_account_id"` // Account ID del master
-	MasterTicket    int32       `json:"master_ticket" db:"master_ticket"`         // Ticket del master
+	TradeID         string `json:"trade_id" db:"trade_id"`                   // UUIDv7 único
+	SourceMasterID  string `json:"source_master_id" db:"source_master_id"`   // ID del Master EA
+	MasterAccountID string `json:"master_account_id" db:"master_account_id"` // Account ID del master
+	MasterTicket    int32  `json:"master_ticket" db:"master_ticket"`         // Ticket del master
 
 	// Detalles del trade
 	MagicNumber int64     `json:"magic_number" db:"magic_number"` // MagicNumber MT4/MT5
@@ -67,11 +69,11 @@ type Execution struct {
 	AgentID        string `json:"agent_id" db:"agent_id"`                 // ID del agent que ejecutó
 
 	// Resultado de ejecución
-	SlaveTicket    int32    `json:"slave_ticket" db:"slave_ticket"`         // Ticket generado en slave (0 si fallo)
-	ExecutedPrice  *float64 `json:"executed_price,omitempty" db:"executed_price"` // Precio ejecutado (NULL si fallo)
-	Success        bool     `json:"success" db:"success"`                   // true = fill, false = reject
-	ErrorCode      string   `json:"error_code" db:"error_code"`             // Código de error
-	ErrorMessage   string   `json:"error_message" db:"error_message"`       // Mensaje de error
+	SlaveTicket   int32    `json:"slave_ticket" db:"slave_ticket"`               // Ticket generado en slave (0 si fallo)
+	ExecutedPrice *float64 `json:"executed_price,omitempty" db:"executed_price"` // Precio ejecutado (NULL si fallo)
+	Success       bool     `json:"success" db:"success"`                         // true = fill, false = reject
+	ErrorCode     string   `json:"error_code" db:"error_code"`                   // Código de error
+	ErrorMessage  string   `json:"error_message" db:"error_message"`             // Mensaje de error
 
 	// Latencia E2E (timestamps t0..t7)
 	TimestampsMs map[string]int64 `json:"timestamps_ms" db:"timestamps_ms"` // JSONB con t0..t7
@@ -83,8 +85,8 @@ type Execution struct {
 // DedupeEntry representa una entrada de deduplicación.
 // Corresponde a la tabla `echo.dedupe` en PostgreSQL.
 type DedupeEntry struct {
-	TradeID   string      `json:"trade_id" db:"trade_id"`   // UUIDv7 del trade
-	Status    OrderStatus `json:"status" db:"status"`       // Estado actual
+	TradeID   string      `json:"trade_id" db:"trade_id"`     // UUIDv7 del trade
+	Status    OrderStatus `json:"status" db:"status"`         // Estado actual
 	CreatedAt time.Time   `json:"created_at" db:"created_at"` // Timestamp de creación
 	UpdatedAt time.Time   `json:"updated_at" db:"updated_at"` // Timestamp de última actualización
 }
@@ -196,3 +198,122 @@ func (s OrderSide) String() string {
 	return string(s)
 }
 
+// SymbolMapping representa un mapeo de símbolo canónico a símbolo del broker (i3).
+//
+// Corresponde al mensaje proto SymbolMapping y a la tabla `echo.account_symbol_spec`.
+// TODO i3: rename to SymbolSpec
+type SymbolMapping struct {
+	CanonicalSymbol string   `json:"canonical_symbol" db:"canonical_symbol"`
+	BrokerSymbol    string   `json:"broker_symbol" db:"broker_symbol"`
+	Digits          int32    `json:"digits" db:"digits"`
+	Point           float64  `json:"point" db:"point"`
+	TickSize        float64  `json:"tick_size" db:"tick_size"`
+	MinLot          float64  `json:"min_lot" db:"min_lot"`
+	MaxLot          float64  `json:"max_lot" db:"max_lot"`
+	LotStep         float64  `json:"lot_step" db:"lot_step"`
+	StopLevel       int32    `json:"stop_level" db:"stop_level"`
+	ContractSize    *float64 `json:"contract_size,omitempty" db:"contract_size"`
+}
+
+// AccountSymbolInfo representa información completa de un símbolo por cuenta (i3).
+//
+// Utilizado en caché del AccountSymbolResolver.
+// Diferente de domain.SymbolInfo que envuelve pb.SymbolInfo.
+type AccountSymbolInfo struct {
+	BrokerSymbol    string
+	CanonicalSymbol string
+	Digits          int32
+	Point           float64
+	TickSize        float64
+	MinLot          float64
+	MaxLot          float64
+	LotStep         float64
+	StopLevel       int32
+	ContractSize    *float64
+}
+
+// ToAccountSymbolInfo convierte un SymbolMapping a AccountSymbolInfo.
+func (m *SymbolMapping) ToAccountSymbolInfo() *AccountSymbolInfo {
+	return &AccountSymbolInfo{
+		BrokerSymbol:    m.BrokerSymbol,
+		CanonicalSymbol: m.CanonicalSymbol,
+		Digits:          m.Digits,
+		Point:           m.Point,
+		TickSize:        m.TickSize,
+		MinLot:          m.MinLot,
+		MaxLot:          m.MaxLot,
+		LotStep:         m.LotStep,
+		StopLevel:       m.StopLevel,
+		ContractSize:    m.ContractSize,
+	}
+}
+
+// SymbolSpecReport representa el reporte completo de especificaciones.
+type SymbolSpecReport struct {
+	*pb.SymbolSpecReport
+}
+
+// NewSymbolSpecReport crea un envoltorio de dominio desde proto.
+func NewSymbolSpecReport(proto *pb.SymbolSpecReport) *SymbolSpecReport {
+	return &SymbolSpecReport{SymbolSpecReport: proto}
+}
+
+// SymbolSpecificationExt envuelve pb.SymbolSpecification con helpers de dominio.
+type SymbolSpecificationExt struct {
+	*pb.SymbolSpecification
+}
+
+// NewSymbolSpecification crea un SymbolSpecificationExt.
+func NewSymbolSpecification(proto *pb.SymbolSpecification) *SymbolSpecificationExt {
+	return &SymbolSpecificationExt{SymbolSpecification: proto}
+}
+
+// SymbolGeneralExt envuelve pb.SymbolGeneral para exponer helpers.
+type SymbolGeneralExt struct {
+	*pb.SymbolGeneral
+}
+
+// NewSymbolGeneral crea un SymbolGeneralExt.
+func NewSymbolGeneral(proto *pb.SymbolGeneral) *SymbolGeneralExt {
+	return &SymbolGeneralExt{SymbolGeneral: proto}
+}
+
+// VolumeSpecExt envuelve pb.VolumeSpec.
+type VolumeSpecExt struct {
+	*pb.VolumeSpec
+}
+
+// NewVolumeSpec crea un VolumeSpecExt.
+func NewVolumeSpec(proto *pb.VolumeSpec) *VolumeSpecExt {
+	return &VolumeSpecExt{VolumeSpec: proto}
+}
+
+// SwapSpecExt envuelve pb.SwapSpec.
+type SwapSpecExt struct {
+	*pb.SwapSpec
+}
+
+// NewSwapSpec crea un SwapSpecExt.
+func NewSwapSpec(proto *pb.SwapSpec) *SwapSpecExt {
+	return &SwapSpecExt{SwapSpec: proto}
+}
+
+// SessionWindowExt envuelve pb.SessionWindow.
+type SessionWindowExt struct {
+	*pb.SessionWindow
+}
+
+// NewSessionWindow crea un SessionWindowExt.
+func NewSessionWindow(proto *pb.SessionWindow) *SessionWindowExt {
+	return &SessionWindowExt{SessionWindow: proto}
+}
+
+// SymbolQuoteSnapshotExt envuelve pb.SymbolQuoteSnapshot con helpers de dominio.
+type SymbolQuoteSnapshotExt struct {
+	*pb.SymbolQuoteSnapshot
+}
+
+// NewSymbolQuoteSnapshot crea un SymbolQuoteSnapshotExt.
+func NewSymbolQuoteSnapshot(proto *pb.SymbolQuoteSnapshot) *SymbolQuoteSnapshotExt {
+	return &SymbolQuoteSnapshotExt{SymbolQuoteSnapshot: proto}
+}

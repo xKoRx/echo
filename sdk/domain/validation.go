@@ -548,3 +548,445 @@ func ValidateTradeClose(close *pb.TradeClose) error {
 
 	return nil
 }
+
+// NormalizeCanonical normaliza un símbolo a su forma canónica (i3).
+//
+// Reglas de normalización:
+//  1. Uppercase y trim
+//  2. Remover sufijos de broker conocidos: .m, .i, .raw, .ecn, .pro, .c (case-insensitive)
+//  3. Permitir solo A-Z, 0-9, '/', '-', '_'
+//  4. Longitud post-normalización: 3-20 caracteres
+//
+// Ejemplos:
+//
+//	"xauusd.m" → "XAUUSD"
+//	"EUR/USD" → "EUR/USD"
+//	"btc-usd" → "BTC-USD"
+//	" Gold.ECN " → "GOLD"
+//	"SP500.c" → "SP500"
+func NormalizeCanonical(symbol string) (string, error) {
+	if symbol == "" {
+		return "", NewValidationError("symbol", symbol, "symbol cannot be empty")
+	}
+
+	// 1. Uppercase y trim
+	normalized := strings.ToUpper(strings.TrimSpace(symbol))
+
+	// 2. Remover sufijos de broker conocidos (case-insensitive)
+	suffixes := []string{".m", ".i", ".raw", ".ecn", ".pro", ".c", ".M", ".I", ".RAW", ".ECN", ".PRO", ".C"}
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(normalized, suffix) {
+			normalized = normalized[:len(normalized)-len(suffix)]
+		}
+	}
+
+	// 3. Filtrar caracteres permitidos: A-Z, 0-9, '/', '-', '_'
+	var builder strings.Builder
+	for _, r := range normalized {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '/' || r == '-' || r == '_' {
+			builder.WriteRune(r)
+		}
+	}
+	normalized = builder.String()
+
+	// 4. Validar longitud post-normalización: 3-20
+	if len(normalized) < 3 {
+		return "", NewValidationError("symbol", symbol, fmt.Sprintf("normalized symbol too short (after normalization: %s, min length: 3)", normalized))
+	}
+	if len(normalized) > 20 {
+		return "", NewValidationError("symbol", symbol, fmt.Sprintf("normalized symbol too long (after normalization: %s, max length: 20)", normalized))
+	}
+
+	if normalized == "" {
+		return "", NewValidationError("symbol", symbol, "symbol normalized to empty string")
+	}
+
+	return normalized, nil
+}
+
+// ValidateCanonicalSymbol valida que un símbolo canónico esté en la whitelist (i3).
+//
+// Primero normaliza el símbolo usando NormalizeCanonical, luego verifica que esté en la lista.
+func ValidateCanonicalSymbol(symbol string, whitelist []string) error {
+	if symbol == "" {
+		return NewValidationError("symbol", symbol, "symbol cannot be empty")
+	}
+
+	// Normalizar primero
+	normalized, err := NormalizeCanonical(symbol)
+	if err != nil {
+		return err
+	}
+
+	// Verificar whitelist
+	for _, allowed := range whitelist {
+		allowedNormalized, err := NormalizeCanonical(allowed)
+		if err != nil {
+			continue // Skip invalid entries in whitelist
+		}
+		if allowedNormalized == normalized {
+			return nil
+		}
+	}
+
+	return NewValidationError("symbol", symbol, fmt.Sprintf("canonical symbol not in whitelist (normalized: %s)", normalized))
+}
+
+// ValidateSymbolMapping valida un SymbolMapping completo (i3).
+//
+// Reglas:
+//   - Requeridos: broker_symbol y canonical_symbol
+//   - Canonical en whitelist tras normalización
+//   - Volúmenes: min_lot>0, max_lot>0, min_lot<=max_lot, lot_step>0
+//   - Precio: digits>=0, point>0, tick_size>0
+//   - Stop level: >=0 (0 = sin restricción)
+//   - contract_size (opcional): si presente, >0
+func ValidateSymbolMapping(mapping *pb.SymbolMapping, allowedCanonicals []string) error {
+	if mapping == nil {
+		return NewError(ErrMissingRequiredField, "SymbolMapping is nil")
+	}
+
+	// Validar campos requeridos
+	if mapping.BrokerSymbol == "" {
+		return NewValidationError("broker_symbol", "", "broker_symbol is required")
+	}
+
+	if mapping.CanonicalSymbol == "" {
+		return NewValidationError("canonical_symbol", "", "canonical_symbol is required")
+	}
+
+	// Validar canonical en whitelist
+	if err := ValidateCanonicalSymbol(mapping.CanonicalSymbol, allowedCanonicals); err != nil {
+		normalized, _ := NormalizeCanonical(mapping.CanonicalSymbol)
+		return fmt.Errorf("canonical_symbol %s not in whitelist (normalized: %s): %w", mapping.CanonicalSymbol, normalized, err)
+	}
+
+	// Validar volúmenes
+	if mapping.MinLot <= 0 {
+		return NewValidationError("min_lot", mapping.MinLot, "min_lot must be > 0")
+	}
+
+	if mapping.MaxLot <= 0 {
+		return NewValidationError("max_lot", mapping.MaxLot, "max_lot must be > 0")
+	}
+
+	if mapping.MinLot > mapping.MaxLot {
+		return NewValidationError("min_lot", mapping.MinLot, fmt.Sprintf("min_lot (%.2f) > max_lot (%.2f)", mapping.MinLot, mapping.MaxLot))
+	}
+
+	if mapping.LotStep <= 0 {
+		return NewValidationError("lot_step", mapping.LotStep, "lot_step must be > 0")
+	}
+
+	// Validar precio
+	if mapping.Digits < 0 {
+		return NewValidationError("digits", mapping.Digits, "digits must be >= 0")
+	}
+
+	if mapping.Point <= 0 {
+		return NewValidationError("point", mapping.Point, "point must be > 0")
+	}
+
+	if mapping.TickSize <= 0 {
+		return NewValidationError("tick_size", mapping.TickSize, "tick_size must be > 0")
+	}
+
+	// Validar stop level
+	if mapping.StopLevel < 0 {
+		return NewValidationError("stop_level", mapping.StopLevel, "stop_level must be >= 0")
+	}
+
+	// Validar contract_size (opcional)
+	if mapping.ContractSize != nil && *mapping.ContractSize <= 0 {
+		return NewValidationError("contract_size", *mapping.ContractSize, "contract_size must be > 0")
+	}
+
+	return nil
+}
+
+// ValidateAccountSymbolsReport valida un AccountSymbolsReport completo (i3).
+func ValidateAccountSymbolsReport(report *pb.AccountSymbolsReport, allowedCanonicals []string) error {
+	if report == nil {
+		return NewError(ErrMissingRequiredField, "AccountSymbolsReport is nil")
+	}
+
+	if err := ValidateAccountID(report.AccountId); err != nil {
+		return fmt.Errorf("invalid account_id: %w", err)
+	}
+
+	if report.ReportedAtMs <= 0 {
+		return NewValidationError("reported_at_ms", report.ReportedAtMs, "reported_at_ms must be positive")
+	}
+
+	// Validar cada mapping
+	for i, mapping := range report.Symbols {
+		if err := ValidateSymbolMapping(mapping, allowedCanonicals); err != nil {
+			return fmt.Errorf("invalid symbol mapping at index %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+// ValidateSymbolSpecReport valida un SymbolSpecReport completo.
+func ValidateSymbolSpecReport(report *pb.SymbolSpecReport, allowedCanonicals []string) error {
+	if report == nil {
+		return NewError(ErrMissingRequiredField, "SymbolSpecReport is nil")
+	}
+
+	if err := ValidateAccountID(report.AccountId); err != nil {
+		return fmt.Errorf("invalid account_id: %w", err)
+	}
+
+	if report.ReportedAtMs <= 0 {
+		return NewValidationError("reported_at_ms", report.ReportedAtMs, "reported_at_ms must be positive")
+	}
+
+	if len(report.Symbols) == 0 {
+		return NewValidationError("symbols", 0, "symbols list cannot be empty")
+	}
+
+	for i, spec := range report.Symbols {
+		if err := ValidateSymbolSpecification(spec, allowedCanonicals); err != nil {
+			return fmt.Errorf("invalid symbol specification at index %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+// ValidateSymbolSpecification valida las especificaciones completas de un símbolo.
+func ValidateSymbolSpecification(spec *pb.SymbolSpecification, allowedCanonicals []string) error {
+	if spec == nil {
+		return NewError(ErrMissingRequiredField, "SymbolSpecification is nil")
+	}
+
+	if spec.BrokerSymbol == "" {
+		return NewValidationError("broker_symbol", "", "broker_symbol is required")
+	}
+
+	if spec.CanonicalSymbol == "" {
+		return NewValidationError("canonical_symbol", "", "canonical_symbol is required")
+	}
+
+	if err := ValidateCanonicalSymbol(spec.CanonicalSymbol, allowedCanonicals); err != nil {
+		return fmt.Errorf("canonical_symbol validation failed: %w", err)
+	}
+
+	if spec.General == nil {
+		return NewValidationError("general", nil, "general specification is required")
+	}
+
+	if err := validateSymbolGeneral(spec.General); err != nil {
+		return err
+	}
+
+	if spec.Volume == nil {
+		return NewValidationError("volume", nil, "volume specification is required")
+	}
+
+	if err := validateVolumeSpec(spec.Volume); err != nil {
+		return err
+	}
+
+	if spec.Swap == nil {
+		return NewValidationError("swap", nil, "swap specification is required")
+	}
+
+	if err := validateSwapSpec(spec.Swap); err != nil {
+		return err
+	}
+
+	for i, session := range spec.Sessions {
+		if err := validateSessionWindow(session); err != nil {
+			return fmt.Errorf("invalid session window at index %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+func validateSymbolGeneral(general *pb.SymbolGeneral) error {
+	if general == nil {
+		return NewValidationError("general", nil, "general specification is required")
+	}
+
+	if general.SpreadType == pb.SpreadType_SPREAD_TYPE_UNSPECIFIED {
+		return NewValidationError("spread_type", general.SpreadType, "spread_type cannot be unspecified")
+	}
+
+	if general.SpreadType == pb.SpreadType_SPREAD_TYPE_FIXED && general.FixedSpreadPoints <= 0 {
+		return NewValidationError("fixed_spread_points", general.FixedSpreadPoints, "fixed_spread_points must be > 0 for fixed spread")
+	}
+
+	if general.Digits < 0 {
+		return NewValidationError("digits", general.Digits, "digits must be >= 0")
+	}
+
+	if general.StopsLevel < 0 {
+		return NewValidationError("stops_level", general.StopsLevel, "stops_level must be >= 0")
+	}
+
+	if general.ContractSize <= 0 {
+		return NewValidationError("contract_size", general.ContractSize, "contract_size must be > 0")
+	}
+
+	if general.MarginCurrency == "" {
+		return NewValidationError("margin_currency", "", "margin_currency is required")
+	}
+
+	if general.ProfitCalculationMode == pb.ProfitCalculationMode_PROFIT_CALCULATION_MODE_UNSPECIFIED {
+		return NewValidationError("profit_calculation_mode", general.ProfitCalculationMode, "profit_calculation_mode cannot be unspecified")
+	}
+
+	if general.MarginCalculationMode == pb.MarginCalculationMode_MARGIN_CALCULATION_MODE_UNSPECIFIED {
+		return NewValidationError("margin_calculation_mode", general.MarginCalculationMode, "margin_calculation_mode cannot be unspecified")
+	}
+
+	if general.MarginHedge < 0 {
+		return NewValidationError("margin_hedge", general.MarginHedge, "margin_hedge must be >= 0")
+	}
+
+	if general.MarginPercentage <= 0 {
+		return NewValidationError("margin_percentage", general.MarginPercentage, "margin_percentage must be > 0")
+	}
+
+	if general.TradePermission == pb.TradePermission_TRADE_PERMISSION_UNSPECIFIED {
+		return NewValidationError("trade_permission", general.TradePermission, "trade_permission cannot be unspecified")
+	}
+
+	if general.ExecutionMode == pb.ExecutionMode_EXECUTION_MODE_UNSPECIFIED {
+		return NewValidationError("execution_mode", general.ExecutionMode, "execution_mode cannot be unspecified")
+	}
+
+	if general.GtcMode == pb.GTCMode_GTC_MODE_UNSPECIFIED {
+		return NewValidationError("gtc_mode", general.GtcMode, "gtc_mode cannot be unspecified")
+	}
+
+	return nil
+}
+
+func validateVolumeSpec(volume *pb.VolumeSpec) error {
+	if volume == nil {
+		return NewValidationError("volume", nil, "volume specification is required")
+	}
+
+	if volume.MinVolume <= 0 {
+		return NewValidationError("min_volume", volume.MinVolume, "min_volume must be > 0")
+	}
+
+	if volume.MaxVolume <= 0 {
+		return NewValidationError("max_volume", volume.MaxVolume, "max_volume must be > 0")
+	}
+
+	if volume.MinVolume > volume.MaxVolume {
+		return NewValidationError("min_volume", volume.MinVolume, fmt.Sprintf("min_volume (%.4f) > max_volume (%.4f)", volume.MinVolume, volume.MaxVolume))
+	}
+
+	if volume.VolumeStep <= 0 {
+		return NewValidationError("volume_step", volume.VolumeStep, "volume_step must be > 0")
+	}
+
+	return nil
+}
+
+func validateSwapSpec(swap *pb.SwapSpec) error {
+	if swap == nil {
+		return NewValidationError("swap", nil, "swap specification is required")
+	}
+
+	if swap.SwapType == pb.SwapType_SWAP_TYPE_UNSPECIFIED {
+		return NewValidationError("swap_type", swap.SwapType, "swap_type cannot be unspecified")
+	}
+
+	if swap.TripleSwapDay != pb.Weekday_WEEKDAY_UNSPECIFIED && (swap.TripleSwapDay < pb.Weekday_WEEKDAY_SUNDAY || swap.TripleSwapDay > pb.Weekday_WEEKDAY_SATURDAY) {
+		return NewValidationError("triple_swap_day", swap.TripleSwapDay, "triple_swap_day must be a valid weekday")
+	}
+
+	return nil
+}
+
+func validateSessionWindow(window *pb.SessionWindow) error {
+	if window == nil {
+		return NewValidationError("sessions", nil, "session window is required")
+	}
+
+	if window.Day == pb.Weekday_WEEKDAY_UNSPECIFIED {
+		return NewValidationError("day", window.Day, "session day cannot be unspecified")
+	}
+
+	for i, rng := range window.QuoteSessions {
+		if err := validateSessionRange("quote_sessions", i, rng); err != nil {
+			return err
+		}
+	}
+
+	for i, rng := range window.TradeSessions {
+		if err := validateSessionRange("trade_sessions", i, rng); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateSessionRange(field string, index int, rng *pb.SessionRange) error {
+	if rng == nil {
+		return NewValidationError(field, nil, fmt.Sprintf("session range at index %d is nil", index))
+	}
+
+	if rng.StartMinute >= 1440 || rng.EndMinute > 1440 {
+		return NewValidationError(field, fmt.Sprintf("%d-%d", rng.StartMinute, rng.EndMinute), fmt.Sprintf("session range at index %d exceeds 24h", index))
+	}
+
+	if rng.StartMinute >= rng.EndMinute {
+		return NewValidationError(field, fmt.Sprintf("%d-%d", rng.StartMinute, rng.EndMinute), fmt.Sprintf("session range at index %d must have start < end", index))
+	}
+
+	return nil
+}
+
+// ValidateSymbolQuoteSnapshot valida un SymbolQuoteSnapshot.
+func ValidateSymbolQuoteSnapshot(snapshot *pb.SymbolQuoteSnapshot, allowedCanonicals []string) error {
+	if snapshot == nil {
+		return NewError(ErrMissingRequiredField, "SymbolQuoteSnapshot is nil")
+	}
+
+	if err := ValidateAccountID(snapshot.AccountId); err != nil {
+		return fmt.Errorf("invalid account_id: %w", err)
+	}
+
+	if snapshot.CanonicalSymbol == "" {
+		return NewValidationError("canonical_symbol", "", "canonical_symbol is required")
+	}
+
+	if err := ValidateCanonicalSymbol(snapshot.CanonicalSymbol, allowedCanonicals); err != nil {
+		return fmt.Errorf("canonical_symbol validation failed: %w", err)
+	}
+
+	if snapshot.BrokerSymbol == "" {
+		return NewValidationError("broker_symbol", "", "broker_symbol is required")
+	}
+
+	if snapshot.Bid <= 0 {
+		return NewValidationError("bid", snapshot.Bid, "bid must be > 0")
+	}
+
+	if snapshot.Ask <= 0 {
+		return NewValidationError("ask", snapshot.Ask, "ask must be > 0")
+	}
+
+	if snapshot.Ask < snapshot.Bid {
+		return NewValidationError("ask", snapshot.Ask, "ask must be >= bid")
+	}
+
+	if snapshot.SpreadPoints < 0 {
+		return NewValidationError("spread_points", snapshot.SpreadPoints, "spread_points must be >= 0")
+	}
+
+	if snapshot.TimestampMs <= 0 {
+		return NewValidationError("timestamp_ms", snapshot.TimestampMs, "timestamp_ms must be positive")
+	}
+
+	return nil
+}

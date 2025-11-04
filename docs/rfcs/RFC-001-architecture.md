@@ -437,15 +437,19 @@ service AgentService {
 ### Iteración 3 (2 días)
 - Mapeo símbolos (canonical ⇄ broker)
 - Specs de broker (min_lot, stop_level, etc.)
-- Las EAs deben informar las especificaciones de símbolos del broker al cual están conectados para un posterior sizing correcto
+- Las EAs deben informar las especificaciones de símbolos del broker al cual están conectados (handshake con symbols[])
 - Reporting de precios cada 250ms: Slaves reportan Bid/Ask actual cada 250ms (coalesced) para que Core calcule sizing óptimo y timing de entrada por cuenta
 - Reconexión automática ea-agent y agent-core. Las EAs una vez que pierden la conexión no se vuelven a comunicar nunca más con el agente. Validar esto mismo con core-agent
 - Limpiar los buffers de operaciones luego de que cierre una operación en EA, agent y core
-- Validación de StopLevel en Core: Validar que SL/TP cumplen stop_level antes de enviar, ajustar o usar ModifyOrder post-fill si no cumple
+- Core: validación de símbolos contra ETCD, traducción canonical→broker antes de enviar órdenes, persistencia en PostgreSQL
+- Criterios de salida: 0 errores por símbolo desconocido; mapeo persistido y trazable
 
 ### Iteración 4 (1-2 días)
 - **Sizing con riesgo fijo** (lo definido en sección 6)
 - Guardas: min/max lot, lot_step
+- Versionamiento del protocolo handshake: `protocol_version` para evolución de esquema (ej: 4.0)
+- Feedback loop activo: Core→Agent→EA con `SymbolRegistrationResult` para notificar símbolos rechazados
+- Validación de StopLevel en Core: Validar que SL/TP cumplen stop_level antes de enviar, ajustar o usar ModifyOrder post-fill si no cumple
 
 ### Iteración 5 (2 días)
 - Multi-slave (1 master → N slaves)
@@ -458,8 +462,9 @@ service AgentService {
 
 ### Iteración 7 (2 días)
 - CLI, empaquetado
-- Panel Grafana
+- Panel Grafana con modo degradado visible (estado de configuración por cuenta)
 - Manual
+- Monitoreo avanzado: hash de configuración EA para detección de cambios, alertas operativas
 
 ---
 

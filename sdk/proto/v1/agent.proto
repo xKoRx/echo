@@ -30,6 +30,9 @@ message AgentMessage {
     AgentHeartbeat heartbeat = 16;
     AccountConnected account_connected = 17;      // NEW i2
     AccountDisconnected account_disconnected = 18; // NEW i2
+    AccountSymbolsReport account_symbols_report = 19; // NEW i3
+    SymbolSpecReport symbol_spec_report = 20;         // NEW i3+ specs
+    SymbolQuoteSnapshot symbol_quote_snapshot = 21;   // NEW i3+ quotes
   }
 }
 
@@ -56,7 +59,8 @@ message AgentHello {
   repeated string connected_clients = 5 [deprecated = true];
   // owned_accounts deprecated i2 (ya no se usa, reemplazado por AccountConnected/Disconnected)
   repeated string owned_accounts = 6 [deprecated = true];
-  map<string, SymbolInfo> symbols = 7;
+  // symbols deprecated i3 (reservado, no se usa en i3; reporte per-account via AccountSymbolsReport)
+  map<string, SymbolInfo> symbols = 7 [deprecated = true];
 }
 
 // AccountConnected notifica al Core que una cuenta se conectó al Agent (i2).
@@ -78,6 +82,177 @@ message AccountDisconnected {
   string account_id = 1;             // Account ID del slave
   int64 disconnected_at_ms = 2;      // Timestamp de desconexión
   optional string reason = 3;        // Razón de desconexión (opcional)
+}
+
+// SpreadType representa el tipo de spread del símbolo.
+enum SpreadType {
+  SPREAD_TYPE_UNSPECIFIED = 0;
+  SPREAD_TYPE_FLOATING = 1;
+  SPREAD_TYPE_FIXED = 2;
+}
+
+// ProfitCalculationMode describe cómo se calcula la ganancia.
+enum ProfitCalculationMode {
+  PROFIT_CALCULATION_MODE_UNSPECIFIED = 0;
+  PROFIT_CALCULATION_MODE_FOREX = 1;
+  PROFIT_CALCULATION_MODE_CFD = 2;
+  PROFIT_CALCULATION_MODE_FUTURES = 3;
+  PROFIT_CALCULATION_MODE_EXCHANGE = 4;
+}
+
+// MarginCalculationMode describe cómo se calcula el margen requerido.
+enum MarginCalculationMode {
+  MARGIN_CALCULATION_MODE_UNSPECIFIED = 0;
+  MARGIN_CALCULATION_MODE_FOREX = 1;
+  MARGIN_CALCULATION_MODE_CFD = 2;
+  MARGIN_CALCULATION_MODE_CFD_LEVERAGE = 3;
+  MARGIN_CALCULATION_MODE_EXCHANGE = 4;
+}
+
+// TradePermission describe el nivel de acceso de trading para el símbolo.
+enum TradePermission {
+  TRADE_PERMISSION_UNSPECIFIED = 0;
+  TRADE_PERMISSION_DISABLED = 1;
+  TRADE_PERMISSION_CLOSE_ONLY = 2;
+  TRADE_PERMISSION_FULL = 3;
+}
+
+// ExecutionMode indica el modelo de ejecución configurado en el broker.
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_REQUEST = 1;
+  EXECUTION_MODE_INSTANT = 2;
+  EXECUTION_MODE_MARKET = 3;
+  EXECUTION_MODE_EXCHANGE = 4;
+}
+
+// GTCMode define la política Good-Till-Cancel para órdenes pendientes.
+enum GTCMode {
+  GTC_MODE_UNSPECIFIED = 0;
+  GTC_MODE_GTC = 1;        // Good till cancel
+  GTC_MODE_DAY = 2;        // Good till day/end of session
+  GTC_MODE_GTC_AND_DAY = 3; // Diferenciado por tipo de orden
+}
+
+// SwapType define la unidad usada para los swaps.
+enum SwapType {
+  SWAP_TYPE_UNSPECIFIED = 0;
+  SWAP_TYPE_POINTS = 1;
+  SWAP_TYPE_CURRENCY = 2;
+  SWAP_TYPE_CURRENCY_SYMBOL = 3;
+  SWAP_TYPE_INTEREST_CURRENT = 4;
+}
+
+// Weekday representa los días de la semana.
+enum Weekday {
+  WEEKDAY_UNSPECIFIED = 0;
+  WEEKDAY_SUNDAY = 1;
+  WEEKDAY_MONDAY = 2;
+  WEEKDAY_TUESDAY = 3;
+  WEEKDAY_WEDNESDAY = 4;
+  WEEKDAY_THURSDAY = 5;
+  WEEKDAY_FRIDAY = 6;
+  WEEKDAY_SATURDAY = 7;
+}
+
+// SymbolSpecReport reporte enriquecido de especificaciones del broker por símbolo.
+message SymbolSpecReport {
+  string account_id = 1;
+  repeated SymbolSpecification symbols = 2;
+  int64 reported_at_ms = 3;
+}
+
+// SymbolSpecification describe todas las propiedades estáticas relevantes del símbolo.
+message SymbolSpecification {
+  string canonical_symbol = 1;
+  string broker_symbol = 2;
+  SymbolGeneral general = 3;
+  VolumeSpec volume = 4;
+  SwapSpec swap = 5;
+  repeated SessionWindow sessions = 6;
+}
+
+// SymbolGeneral agrupa los datos generales del símbolo.
+message SymbolGeneral {
+  SpreadType spread_type = 1;
+  double fixed_spread_points = 2; // Sólo aplica si spread_type = FIXED
+  int32 digits = 3;
+  int32 stops_level = 4;
+  double contract_size = 5;
+  string margin_currency = 6;
+  ProfitCalculationMode profit_calculation_mode = 7;
+  MarginCalculationMode margin_calculation_mode = 8;
+  double margin_hedge = 9;
+  double margin_percentage = 10;
+  TradePermission trade_permission = 11;
+  ExecutionMode execution_mode = 12;
+  GTCMode gtc_mode = 13;
+}
+
+// VolumeSpec contiene los límites de volumen permitidos.
+message VolumeSpec {
+  double min_volume = 1;
+  double max_volume = 2;
+  double volume_step = 3;
+}
+
+// SwapSpec describe la configuración de swaps del símbolo.
+message SwapSpec {
+  SwapType swap_type = 1;
+  double swap_long = 2;
+  double swap_short = 3;
+  Weekday triple_swap_day = 4;
+}
+
+// SessionWindow agrupa horarios de quotes y trades para un día específico.
+message SessionWindow {
+  Weekday day = 1;
+  repeated SessionRange quote_sessions = 2;
+  repeated SessionRange trade_sessions = 3;
+}
+
+// SessionRange representa un intervalo [start, end) en minutos desde medianoche.
+message SessionRange {
+  uint32 start_minute = 1; // minutos desde 00:00 (0-1440)
+  uint32 end_minute = 2;   // minutos desde 00:00 (0-1440)
+}
+
+// SymbolQuoteSnapshot captura bid/ask actual para validar pricing.
+message SymbolQuoteSnapshot {
+  string account_id = 1;
+  string canonical_symbol = 2;
+  string broker_symbol = 3;
+  double bid = 4;
+  double ask = 5;
+  double spread_points = 6;
+  int64 timestamp_ms = 7;
+}
+
+// SymbolMapping mapeo de símbolo canónico a símbolo del broker (i3).
+//
+// Representa cómo un símbolo canónico se traduce al símbolo específico del broker
+// para una cuenta determinada.
+message SymbolMapping {
+  string canonical_symbol = 1;   // Símbolo canónico normalizado (ej: "XAUUSD")
+  string broker_symbol = 2;      // Símbolo del broker (ej: "XAUUSD.m")
+  int32 digits = 3;              // Decimales del precio
+  double point = 4;              // Tamaño del point
+  double tick_size = 5;           // Tamaño del tick
+  double min_lot = 6;            // Lote mínimo
+  double max_lot = 7;            // Lote máximo
+  double lot_step = 8;           // Paso del lote
+  int32 stop_level = 9;         // Nivel mínimo de stop en points
+  optional double contract_size = 10; // Tamaño del contrato (opcional)
+}
+
+// AccountSymbolsReport reporte de símbolos por cuenta (i3).
+//
+// El Agent envía este mensaje cuando un EA reporta sus símbolos disponibles.
+// Cada reporte representa la LISTA COMPLETA de símbolos de la cuenta (reemplaza la anterior).
+message AccountSymbolsReport {
+  string account_id = 1;                       // Cuenta del EA (master o slave)
+  repeated SymbolMapping symbols = 2;          // Lista explícita de mapeos
+  int64 reported_at_ms = 3;                    // Timestamp para detectar actualizaciones (idempotencia)
 }
 
 // StateSnapshot snapshot de estado de cuentas/posiciones

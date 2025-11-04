@@ -129,6 +129,19 @@ func (s *WindowsPipeServer) Write(p []byte) (n int, err error) {
 	return s.currentConn.Write(p)
 }
 
+// DisconnectClient cierra solo la conexión actual sin cerrar el listener.
+//
+// Esto permite que el servidor continúe aceptando nuevas conexiones después
+// de que un cliente se desconecte. Útil para reconexión automática.
+func (s *WindowsPipeServer) DisconnectClient() error {
+	if s.currentConn != nil {
+		err := s.currentConn.Close()
+		s.currentConn = nil
+		return err
+	}
+	return nil
+}
+
 // Close cierra el servidor y la conexión activa.
 func (s *WindowsPipeServer) Close() error {
 	var err error

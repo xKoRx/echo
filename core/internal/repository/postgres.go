@@ -9,6 +9,8 @@ import (
 
 	_ "github.com/lib/pq" // Driver PostgreSQL
 	"github.com/xKoRx/echo/sdk/domain"
+	pb "github.com/xKoRx/echo/sdk/pb/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // PostgresFactory implementa domain.RepositoryFactory para PostgreSQL.
@@ -16,11 +18,14 @@ type PostgresFactory struct {
 	db *sql.DB
 
 	// Repositorios inicializados lazy
-	tradeRepo      domain.TradeRepository
-	executionRepo  domain.ExecutionRepository
-	dedupeRepo     domain.DedupeRepository
-	closeRepo      domain.CloseRepository
-	correlationSvc domain.CorrelationService
+	tradeRepo       domain.TradeRepository
+	executionRepo   domain.ExecutionRepository
+	dedupeRepo      domain.DedupeRepository
+	closeRepo       domain.CloseRepository
+	correlationSvc  domain.CorrelationService
+	symbolRepo      domain.SymbolRepository // NEW i3
+	symbolSpecRepo  domain.SymbolSpecRepository
+	symbolQuoteRepo domain.SymbolQuoteRepository
 }
 
 // NewPostgresFactory crea un factory de repositorios PostgreSQL.
@@ -78,6 +83,30 @@ func (f *PostgresFactory) CorrelationService() domain.CorrelationService {
 		)
 	}
 	return f.correlationSvc
+}
+
+// SymbolRepository retorna el repositorio de símbolos (i3).
+func (f *PostgresFactory) SymbolRepository() domain.SymbolRepository {
+	if f.symbolRepo == nil {
+		f.symbolRepo = &postgresSymbolRepo{db: f.db}
+	}
+	return f.symbolRepo
+}
+
+// SymbolSpecRepository retorna el repositorio de especificaciones de símbolos.
+func (f *PostgresFactory) SymbolSpecRepository() domain.SymbolSpecRepository {
+	if f.symbolSpecRepo == nil {
+		f.symbolSpecRepo = &postgresSymbolSpecRepo{db: f.db}
+	}
+	return f.symbolSpecRepo
+}
+
+// SymbolQuoteRepository retorna el repositorio de snapshots de precios.
+func (f *PostgresFactory) SymbolQuoteRepository() domain.SymbolQuoteRepository {
+	if f.symbolQuoteRepo == nil {
+		f.symbolQuoteRepo = &postgresSymbolQuoteRepo{db: f.db}
+	}
+	return f.symbolQuoteRepo
 }
 
 // ===========================================================================
@@ -710,4 +739,300 @@ func (r *postgresCloseRepo) queryCloses(ctx context.Context, query string, args 
 	}
 
 	return closes, nil
+}
+
+// ===========================================================================
+// postgresSymbolRepo (i3)
+// ===========================================================================
+
+type postgresSymbolRepo struct {
+	db *sql.DB
+}
+
+func (r *postgresSymbolRepo) UpsertAccountMapping(ctx context.Context, accountID string, mappings []*domain.SymbolMapping, reportedAtMs int64) error {
+	// Usar transacción para asegurar atomicidad del reemplazo completo
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Upsert cada mapping con idempotencia temporal
+	for _, m := range mappings {
+		query := `
+			INSERT INTO echo.account_symbol_map (
+				account_id, canonical_symbol, broker_symbol,
+				digits, point, tick_size, min_lot, max_lot, lot_step, stop_level,
+				contract_size, reported_at_ms, updated_at
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+			ON CONFLICT (account_id, canonical_symbol)
+			DO UPDATE SET
+				broker_symbol = EXCLUDED.broker_symbol,
+				digits = EXCLUDED.digits,
+				point = EXCLUDED.point,
+				tick_size = EXCLUDED.tick_size,
+				min_lot = EXCLUDED.min_lot,
+				max_lot = EXCLUDED.max_lot,
+				lot_step = EXCLUDED.lot_step,
+				stop_level = EXCLUDED.stop_level,
+				contract_size = EXCLUDED.contract_size,
+				reported_at_ms = EXCLUDED.reported_at_ms,
+				updated_at = NOW()
+			WHERE EXCLUDED.reported_at_ms >= echo.account_symbol_map.reported_at_ms
+		`
+		_, err := tx.ExecContext(ctx, query,
+			accountID,
+			m.CanonicalSymbol,
+			m.BrokerSymbol,
+			m.Digits,
+			m.Point,
+			m.TickSize,
+			m.MinLot,
+			m.MaxLot,
+			m.LotStep,
+			m.StopLevel,
+			m.ContractSize,
+			reportedAtMs,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to upsert symbol mapping: %w", err)
+		}
+	}
+
+	// Commit transacción
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// ==========================================================================
+// postgresSymbolSpecRepo
+// ==========================================================================
+
+type postgresSymbolSpecRepo struct {
+	db *sql.DB
+}
+
+func (r *postgresSymbolSpecRepo) UpsertSpecifications(ctx context.Context, accountID string, specs []*pb.SymbolSpecification, reportedAtMs int64) error {
+	if len(specs) == 0 {
+		return nil
+	}
+
+	query := `
+		INSERT INTO echo.account_symbol_spec (
+			account_id, canonical_symbol, broker_symbol, payload, reported_at_ms, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, NOW()
+		)
+		ON CONFLICT (account_id, canonical_symbol)
+		DO UPDATE SET
+			broker_symbol   = EXCLUDED.broker_symbol,
+			payload         = EXCLUDED.payload,
+			reported_at_ms  = EXCLUDED.reported_at_ms,
+			updated_at      = NOW()
+		WHERE EXCLUDED.reported_at_ms >= echo.account_symbol_spec.reported_at_ms;
+	`
+
+	for _, spec := range specs {
+		if spec == nil {
+			continue
+		}
+
+		payload, err := protojson.Marshal(spec)
+		if err != nil {
+			return fmt.Errorf("failed to marshal symbol specification: %w", err)
+		}
+
+		if _, err := r.db.ExecContext(ctx, query, accountID, spec.CanonicalSymbol, spec.BrokerSymbol, payload, reportedAtMs); err != nil {
+			return fmt.Errorf("failed to upsert symbol specification (canonical=%s): %w", spec.CanonicalSymbol, err)
+		}
+	}
+
+	return nil
+}
+
+func (r *postgresSymbolSpecRepo) GetSpecifications(ctx context.Context, accountID string) (map[string]*pb.SymbolSpecification, error) {
+	query := `
+		SELECT canonical_symbol, payload
+		FROM echo.account_symbol_spec
+		WHERE account_id = $1
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query symbol specifications: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]*pb.SymbolSpecification)
+	for rows.Next() {
+		var canonical string
+		var payload []byte
+		if err := rows.Scan(&canonical, &payload); err != nil {
+			return nil, fmt.Errorf("failed to scan symbol specification: %w", err)
+		}
+
+		var spec pb.SymbolSpecification
+		if err := protojson.Unmarshal(payload, &spec); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal symbol specification: %w", err)
+		}
+
+		result[canonical] = &spec
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error while reading symbol specifications: %w", err)
+	}
+
+	return result, nil
+}
+
+// ==========================================================================
+// postgresSymbolQuoteRepo
+// ==========================================================================
+
+type postgresSymbolQuoteRepo struct {
+	db *sql.DB
+}
+
+func (r *postgresSymbolQuoteRepo) InsertSnapshot(ctx context.Context, snapshot *pb.SymbolQuoteSnapshot) error {
+	if snapshot == nil {
+		return fmt.Errorf("snapshot is nil")
+	}
+
+	query := `
+		INSERT INTO echo.symbol_quote_latest (
+			account_id, canonical_symbol, broker_symbol,
+			bid, ask, spread_points, timestamp_ms, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, NOW()
+		)
+		ON CONFLICT (account_id, canonical_symbol)
+		DO UPDATE SET
+			broker_symbol  = EXCLUDED.broker_symbol,
+			bid            = EXCLUDED.bid,
+			ask            = EXCLUDED.ask,
+			spread_points  = EXCLUDED.spread_points,
+			timestamp_ms   = EXCLUDED.timestamp_ms,
+			updated_at     = NOW()
+		WHERE EXCLUDED.timestamp_ms >= echo.symbol_quote_latest.timestamp_ms;
+	`
+
+	if _, err := r.db.ExecContext(ctx, query,
+		snapshot.AccountId,
+		snapshot.CanonicalSymbol,
+		snapshot.BrokerSymbol,
+		snapshot.Bid,
+		snapshot.Ask,
+		snapshot.SpreadPoints,
+		snapshot.TimestampMs,
+	); err != nil {
+		return fmt.Errorf("failed to upsert symbol quote snapshot: %w", err)
+	}
+
+	return nil
+}
+
+func (r *postgresSymbolQuoteRepo) GetLatestSnapshot(ctx context.Context, accountID, canonicalSymbol string) (*pb.SymbolQuoteSnapshot, error) {
+	query := `
+		SELECT broker_symbol, bid, ask, spread_points, timestamp_ms
+		FROM echo.symbol_quote_latest
+		WHERE account_id = $1 AND canonical_symbol = $2
+	`
+
+	var snapshot pb.SymbolQuoteSnapshot
+	var broker string
+	var bid, ask, spread float64
+	var timestamp int64
+	row := r.db.QueryRowContext(ctx, query, accountID, canonicalSymbol)
+	if err := row.Scan(&broker, &bid, &ask, &spread, &timestamp); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get latest snapshot: %w", err)
+	}
+
+	snapshot.AccountId = accountID
+	snapshot.CanonicalSymbol = canonicalSymbol
+	snapshot.BrokerSymbol = broker
+	snapshot.Bid = bid
+	snapshot.Ask = ask
+	snapshot.SpreadPoints = spread
+	snapshot.TimestampMs = timestamp
+
+	return &snapshot, nil
+}
+
+func (r *postgresSymbolRepo) GetAccountMapping(ctx context.Context, accountID string) (map[string]*domain.AccountSymbolInfo, error) {
+	query := `
+		SELECT canonical_symbol, broker_symbol,
+		       digits, point, tick_size, min_lot, max_lot, lot_step, stop_level, contract_size
+		FROM echo.account_symbol_map
+		WHERE account_id = $1
+	`
+	rows, err := r.db.QueryContext(ctx, query, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query account mapping: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]*domain.AccountSymbolInfo)
+	for rows.Next() {
+		var canonical, broker string
+		var digits, stopLevel int32
+		var point, tickSize, minLot, maxLot, lotStep float64
+		var contractSize sql.NullFloat64
+
+		err := rows.Scan(
+			&canonical,
+			&broker,
+			&digits,
+			&point,
+			&tickSize,
+			&minLot,
+			&maxLot,
+			&lotStep,
+			&stopLevel,
+			&contractSize,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan symbol mapping: %w", err)
+		}
+
+		var contractSizePtr *float64
+		if contractSize.Valid {
+			contractSizePtr = &contractSize.Float64
+		}
+
+		result[canonical] = &domain.AccountSymbolInfo{
+			BrokerSymbol:    broker,
+			CanonicalSymbol: canonical,
+			Digits:          digits,
+			Point:           point,
+			TickSize:        tickSize,
+			MinLot:          minLot,
+			MaxLot:          maxLot,
+			LotStep:         lotStep,
+			StopLevel:       stopLevel,
+			ContractSize:    contractSizePtr,
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return result, nil
+}
+
+func (r *postgresSymbolRepo) InvalidateAccount(ctx context.Context, accountID string) error {
+	query := `DELETE FROM echo.account_symbol_map WHERE account_id = $1`
+	_, err := r.db.ExecContext(ctx, query, accountID)
+	if err != nil {
+		return fmt.Errorf("failed to invalidate account mappings: %w", err)
+	}
+	return nil
 }

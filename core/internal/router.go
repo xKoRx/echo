@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/xKoRx/echo/sdk/telemetry/semconv"
 	"github.com/xKoRx/echo/sdk/utils"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/protobuf/proto"
 )
 
 // Router procesa mensajes de Agents.
@@ -211,12 +213,10 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 		attribute.Int("ticket", int(intent.Ticket)),
 	)
 
-	// 2. Validar símbolo (usando SDK)
-	if err := domain.ValidateSymbol(intent.Symbol, r.core.config.SymbolWhitelist); err != nil {
-		r.core.telemetry.Warn(ctx, "Invalid symbol, TradeIntent rejected",
-			attribute.String("error", err.Error()),
-		)
-		// TODO i1: enviar rechazo al Agent
+	// 2. Validar símbolo canónico (i3)
+	if err := r.core.canonicalValidator.Validate(ctx, intent.Symbol); err != nil {
+		// unknown_action ya se aplicó en Validate (warn/reject)
+		// Si es reject, el error se retorna aquí y se rechaza la orden
 		return
 	}
 
@@ -403,11 +403,64 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 		// Transformar usando SDK (propaga timestamps automáticamente)
 		order := domain.TradeIntentToExecuteOrder(intent, opts)
 
+		// i3: Traducir símbolo canónico a broker_symbol por cuenta
+		canonicalSymbol := intent.Symbol
+		brokerSymbol, info, found := r.core.symbolResolver.ResolveForAccount(ctx, slaveAccountID, canonicalSymbol)
+		if !found {
+			// No hay mapeo - aplicar política unknown_action
+			if r.core.canonicalValidator.UnknownAction() == UnknownActionReject {
+				r.core.telemetry.Warn(ctx, "Symbol mapping missing, order rejected (i3)",
+					attribute.String("account_id", slaveAccountID),
+					attribute.String("canonical_symbol", canonicalSymbol),
+				)
+				continue // Omitir esta orden
+			}
+			// unknown_action=warn: continuar con símbolo original (compatibilidad)
+			r.core.telemetry.Warn(ctx, "Symbol mapping missing, using canonical symbol (i3)",
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("canonical_symbol", canonicalSymbol),
+			)
+			// order.Symbol ya tiene el canonical desde TradeIntentToExecuteOrder
+		} else {
+			// Traducir a broker_symbol
+			order.Symbol = brokerSymbol
+			r.core.telemetry.Debug(ctx, "Symbol mapping applied (i3)",
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("canonical", canonicalSymbol),
+				attribute.String("broker", brokerSymbol),
+			)
+		}
+
+		// Ajustar SL/TP usando especificaciones y cotizaciones recientes
+		var spec *pb.SymbolSpecification
+		if r.core.symbolSpecService != nil {
+			if s, ok := r.core.symbolSpecService.GetSpecification(slaveAccountID, canonicalSymbol); ok {
+				spec = s
+			}
+		}
+
+		var quote *pb.SymbolQuoteSnapshot
+		if r.core.symbolQuoteService != nil {
+			if q, ok := r.core.symbolQuoteService.Get(slaveAccountID, canonicalSymbol); ok {
+				quote = q
+			}
+		}
+
+		if quote != nil {
+			r.adjustStopsAndTargets(ctx, order, intent, quote, info, spec, slaveAccountID)
+		} else {
+			r.core.telemetry.Debug(ctx, "No quote snapshot available for stop adjustment",
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("canonical_symbol", canonicalSymbol),
+			)
+		}
+
 		r.core.telemetry.Debug(ctx, "ExecuteOrder created",
 			attribute.String("command_id", commandID),
 			attribute.String("trade_id", tradeID),
 			attribute.String("target_client_id", order.TargetClientId),
 			attribute.String("target_account_id", order.TargetAccountId),
+			attribute.String("symbol", order.Symbol),
 			attribute.Float64("lot_size", order.LotSize),
 		)
 
@@ -415,6 +468,145 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 	}
 
 	return orders
+}
+
+func (r *Router) adjustStopsAndTargets(ctx context.Context, order *pb.ExecuteOrder, intent *pb.TradeIntent, quote *pb.SymbolQuoteSnapshot, info *domain.AccountSymbolInfo, spec *pb.SymbolSpecification, accountID string) {
+	if intent == nil || order == nil {
+		return
+	}
+
+	// Fallback para mantener los valores originales si el ajuste no aplica
+	if order.StopLoss == nil && intent.StopLoss != nil {
+		origSL := intent.GetStopLoss()
+		order.StopLoss = proto.Float64(origSL)
+	}
+	if order.TakeProfit == nil && intent.TakeProfit != nil {
+		origTP := intent.GetTakeProfit()
+		order.TakeProfit = proto.Float64(origTP)
+	}
+
+	if quote == nil {
+		r.core.telemetry.Debug(ctx, "No quote snapshot available for stop adjustment",
+			attribute.String("account_id", accountID),
+			attribute.String("canonical_symbol", intent.Symbol),
+		)
+		return
+	}
+
+	entryPrice := quote.Ask
+	if intent.Side == pb.OrderSide_ORDER_SIDE_SELL {
+		entryPrice = quote.Bid
+	}
+
+	digits := 5
+	if info != nil && info.Digits > 0 {
+		digits = int(info.Digits)
+	} else if spec != nil && spec.General != nil && spec.General.Digits > 0 {
+		digits = int(spec.General.Digits)
+	}
+
+	point := 0.0
+	if info != nil {
+		point = info.Point
+	}
+
+	minDistance := computeMinDistance(point, spec)
+
+	if intent.StopLoss != nil && *intent.StopLoss != 0 {
+		distance := computeStopDistance(intent.Side, intent.Price, *intent.StopLoss)
+		if distance <= 0 {
+			// Si distance no es válida, mantener SL original
+			if order.StopLoss == nil {
+				origSL := intent.GetStopLoss()
+				order.StopLoss = proto.Float64(origSL)
+			}
+			goto adjustTP
+		}
+
+		newSL := computeStopPrice(intent.Side, entryPrice, distance)
+		if minDistance > 0 && math.Abs(entryPrice-newSL) < minDistance {
+			if intent.Side == pb.OrderSide_ORDER_SIDE_BUY {
+				newSL = entryPrice - minDistance
+			} else {
+				newSL = entryPrice + minDistance
+			}
+			r.core.telemetry.Debug(ctx, "StopLoss adjusted to satisfy stop level",
+				attribute.String("account_id", accountID),
+				attribute.Float64("min_distance", minDistance),
+			)
+		}
+
+		rounded := roundToDigits(newSL, digits)
+		order.StopLoss = proto.Float64(rounded)
+	}
+
+adjustTP:
+	if intent.TakeProfit != nil && *intent.TakeProfit != 0 {
+		distance := computeTakeProfitDistance(intent.Side, intent.Price, *intent.TakeProfit)
+		if distance <= 0 {
+			if order.TakeProfit == nil {
+				origTP := intent.GetTakeProfit()
+				order.TakeProfit = proto.Float64(origTP)
+			}
+			return
+		}
+
+		newTP := computeTakeProfitPrice(intent.Side, entryPrice, distance)
+		rounded := roundToDigits(newTP, digits)
+		order.TakeProfit = proto.Float64(rounded)
+	}
+}
+
+func computeStopDistance(side pb.OrderSide, price, stop float64) float64 {
+	if price <= 0 || stop <= 0 {
+		return 0
+	}
+	if side == pb.OrderSide_ORDER_SIDE_BUY {
+		return price - stop
+	}
+	return stop - price
+}
+
+func computeTakeProfitDistance(side pb.OrderSide, price, tp float64) float64 {
+	if price <= 0 || tp <= 0 {
+		return 0
+	}
+	if side == pb.OrderSide_ORDER_SIDE_BUY {
+		return tp - price
+	}
+	return price - tp
+}
+
+func computeStopPrice(side pb.OrderSide, entry float64, distance float64) float64 {
+	if side == pb.OrderSide_ORDER_SIDE_BUY {
+		return entry - distance
+	}
+	return entry + distance
+}
+
+func computeTakeProfitPrice(side pb.OrderSide, entry float64, distance float64) float64 {
+	if side == pb.OrderSide_ORDER_SIDE_BUY {
+		return entry + distance
+	}
+	return entry - distance
+}
+
+func computeMinDistance(point float64, spec *pb.SymbolSpecification) float64 {
+	if spec == nil || spec.General == nil {
+		return 0
+	}
+	if spec.General.StopsLevel <= 0 || point <= 0 {
+		return 0
+	}
+	return float64(spec.General.StopsLevel) * point
+}
+
+func roundToDigits(value float64, digits int) float64 {
+	if digits < 0 {
+		digits = 0
+	}
+	factor := math.Pow10(digits)
+	return math.Round(value*factor) / factor
 }
 
 // handleExecutionResult procesa un ExecutionResult del Slave (i1).
@@ -610,6 +802,25 @@ func (r *Router) handleTradeClose(ctx context.Context, agentID string, close *pb
 			// Continuar con ticket=0 (fallback a búsqueda por magic+symbol en slave)
 		}
 
+		// i3: Traducir símbolo canónico a broker_symbol por cuenta
+		canonicalSymbol := close.Symbol
+		brokerSymbol, _, found := r.core.symbolResolver.ResolveForAccount(ctx, slaveAccountID, canonicalSymbol)
+		symbolToUse := canonicalSymbol // Fallback a canonical si no hay mapeo
+		if found {
+			symbolToUse = brokerSymbol
+			r.core.telemetry.Debug(ctx, "Symbol mapping applied for CloseOrder (i3)",
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("canonical", canonicalSymbol),
+				attribute.String("broker", brokerSymbol),
+			)
+		} else {
+			// No hay mapeo - aplicar política (pero no rechazar cierre, solo warn)
+			r.core.telemetry.Warn(ctx, "Symbol mapping missing for CloseOrder, using canonical (i3)",
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("canonical_symbol", canonicalSymbol),
+			)
+		}
+
 		closeOrder := &pb.CloseOrder{
 			CommandId:   closeOrderID,
 			TradeId:     tradeID,
@@ -619,7 +830,7 @@ func (r *Router) handleTradeClose(ctx context.Context, agentID string, close *pb
 			// Issue #C3: Llenar campos target_* con datos del TradeClose
 			TargetClientId:  fmt.Sprintf("slave_%s", slaveAccountID),
 			TargetAccountId: slaveAccountID,
-			Symbol:          close.Symbol,
+			Symbol:          symbolToUse, // i3: Traducido a broker_symbol si existe mapeo
 			MagicNumber:     close.MagicNumber,
 			// Inicializar timestamps para permitir que el Agent agregue t4
 			Timestamps: &pb.TimestampMetadata{},

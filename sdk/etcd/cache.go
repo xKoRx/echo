@@ -1,4 +1,3 @@
-// etcd/cache.go
 package etcd
 
 import (

@@ -64,6 +64,12 @@ type Core struct {
 	// Deduplicación persistente (i1)
 	dedupeService *DedupeService
 
+	// i3: Validación y resolución de símbolos
+	canonicalValidator *CanonicalValidator
+	symbolResolver     *AccountSymbolResolver
+	symbolSpecService  *SymbolSpecService
+	symbolQuoteService *SymbolQuoteService
+
 	// Router/Processor
 	router *Router
 
@@ -155,6 +161,9 @@ func New(ctx context.Context) (*Core, error) {
 	telOpts := []telemetry.Option{
 		telemetry.WithVersion(config.ServiceVersion),
 	}
+	if config.LogLevel != "" {
+		telOpts = append(telOpts, telemetry.WithLogLevel(config.LogLevel))
+	}
 	if config.OTLPEndpoint != "" {
 		telOpts = append(telOpts, telemetry.WithOTLPEndpoint(config.OTLPEndpoint))
 	}
@@ -188,31 +197,54 @@ func New(ctx context.Context) (*Core, error) {
 		semconv.Echo.Component.String(semconv.ComponentValues.Core),
 	)
 
-	// 6. Crear Core
+	// 6. Crear validadores y resolvers de símbolos (i3)
+	unknownAction := UnknownActionWarn
+	if config.UnknownAction == "reject" {
+		unknownAction = UnknownActionReject
+	}
+	canonicalValidator := NewCanonicalValidator(config.CanonicalSymbols, unknownAction, telClient, echoMetrics)
+	symbolResolver := NewAccountSymbolResolver(coreCtx, repoFactory.SymbolRepository(), telClient, echoMetrics, 1000)
+	symbolResolver.Start() // Iniciar worker de persistencia async
+	symbolSpecService := NewSymbolSpecService(repoFactory.SymbolSpecRepository(), telClient, echoMetrics, config.CanonicalSymbols)
+	symbolQuoteService := NewSymbolQuoteService(repoFactory.SymbolQuoteRepository(), telClient)
+
+	// Registrar carga inicial de símbolos canónicos desde ETCD
+	echoMetrics.RecordSymbolsLoaded(coreCtx, "etcd", len(config.CanonicalSymbols),
+		attribute.StringSlice("canonical_symbols", config.CanonicalSymbols),
+	)
+
+	// 7. Crear Core
 	core := &Core{
-		config:         config,
-		db:             db,
-		repoFactory:    repoFactory,
-		correlationSvc: correlationSvc,
-		dedupeService:  dedupeService,
-		agents:         make(map[string]*AgentConnection),
-		accountRegistry: NewAccountRegistry(telClient), // NEW i2
-		telemetry:      telClient,
-		echoMetrics:    echoMetrics,
-		ctx:            coreCtx,
-		cancel:         cancel,
+		config:             config,
+		db:                 db,
+		repoFactory:        repoFactory,
+		correlationSvc:     correlationSvc,
+		dedupeService:      dedupeService,
+		canonicalValidator: canonicalValidator, // NEW i3
+		symbolResolver:     symbolResolver,     // NEW i3
+		symbolSpecService:  symbolSpecService,
+		symbolQuoteService: symbolQuoteService,
+		agents:             make(map[string]*AgentConnection),
+		accountRegistry:    NewAccountRegistry(telClient), // NEW i2
+		telemetry:          telClient,
+		echoMetrics:        echoMetrics,
+		ctx:                coreCtx,
+		cancel:             cancel,
 	}
 
-	// 7. Crear router
+	// 8. Crear router
 	core.router = NewRouter(core)
 
 	// Log de inicio
-	telClient.Info(coreCtx, "Core initialized (i1)",
+	telClient.Info(coreCtx, "Core initialized (i3)",
 		attribute.Int("grpc_port", config.GRPCPort),
-		attribute.StringSlice("symbol_whitelist", config.SymbolWhitelist),
+		attribute.StringSlice("canonical_symbols", config.CanonicalSymbols),
+		attribute.StringSlice("symbol_whitelist", config.SymbolWhitelist), // Deprecated pero mantenido
+		attribute.String("unknown_action", config.UnknownAction),
 		attribute.Float64("default_lot_size", config.DefaultLotSize),
 		attribute.String("postgres_host", config.PostgresHost),
 		attribute.String("postgres_database", config.PostgresDatabase),
+		attribute.String("log_level", config.LogLevel),
 	)
 
 	return core, nil
@@ -362,6 +394,24 @@ func (c *Core) StreamBidi(stream pb.AgentService_StreamBidiServer) error {
 			continue
 		}
 
+		// NEW i3: Procesar AccountSymbolsReport
+		if symbolsReport := msg.GetAccountSymbolsReport(); symbolsReport != nil {
+			c.handleAccountSymbolsReport(agentCtx, agentID, symbolsReport)
+			continue
+		}
+
+		// NEW i3+: Procesar reportes de especificaciones
+		if specReport := msg.GetSymbolSpecReport(); specReport != nil {
+			c.handleSymbolSpecReport(agentCtx, agentID, specReport)
+			continue
+		}
+
+		// NEW i3+: Procesar snapshots de precios
+		if quoteSnapshot := msg.GetSymbolQuoteSnapshot(); quoteSnapshot != nil {
+			c.handleSymbolQuoteSnapshot(agentCtx, agentID, quoteSnapshot)
+			continue
+		}
+
 		// Enviar al router para procesamiento
 		c.router.HandleAgentMessage(agentCtx, agentID, msg)
 	}
@@ -492,6 +542,11 @@ func (c *Core) Shutdown() error {
 	// Detener router
 	if c.router != nil {
 		c.router.Stop()
+	}
+
+	// i3: Detener symbol resolver
+	if c.symbolResolver != nil {
+		c.symbolResolver.Stop()
 	}
 
 	// Cerrar conexiones de agents
@@ -625,10 +680,160 @@ func (c *Core) handleAccountDisconnected(agentID string, msg *pb.AccountDisconne
 	// Desregistrar cuenta del registry
 	c.accountRegistry.UnregisterAccount(accountID)
 
+	// i3: Invalidar caché de símbolos por cuenta
+	if err := c.symbolResolver.InvalidateAccount(c.ctx, accountID); err != nil {
+		c.telemetry.Warn(c.ctx, "Failed to invalidate symbol cache for account (i3)",
+			attribute.String("account_id", accountID),
+			attribute.String("error", err.Error()),
+		)
+	}
+
+	// Limpiar especificaciones y quotes en caché
+	if c.symbolSpecService != nil {
+		c.symbolSpecService.Invalidate(accountID)
+	}
+	if c.symbolQuoteService != nil {
+		c.symbolQuoteService.Invalidate(accountID)
+	}
+
 	// Métrica: número de cuentas registradas
 	totalAccounts, totalAgents := c.accountRegistry.GetStats()
 	c.telemetry.Info(c.ctx, "Account registry updated (i2)",
 		attribute.Int("total_accounts", totalAccounts),
 		attribute.Int("total_agents", totalAgents),
+	)
+}
+
+// NEW i3: handleAccountSymbolsReport procesa el reporte de símbolos por cuenta.
+func (c *Core) handleAccountSymbolsReport(ctx context.Context, agentID string, report *pb.AccountSymbolsReport) {
+	// Validar usando SDK
+	if err := domain.ValidateAccountSymbolsReport(report, c.config.CanonicalSymbols); err != nil {
+		c.telemetry.Warn(ctx, "Invalid AccountSymbolsReport (i3)",
+			attribute.String("agent_id", agentID),
+			attribute.String("account_id", report.AccountId),
+			attribute.String("error", err.Error()),
+		)
+		return
+	}
+
+	accountID := report.AccountId
+
+	// Configurar contexto con atributos del evento
+	ctx = telemetry.AppendEventAttrs(ctx,
+		semconv.Echo.AccountID.String(accountID),
+		attribute.String("source", "agent_report"),
+	)
+
+	ctx, span := c.telemetry.StartSpan(ctx, "core.handle_account_symbols_report")
+	defer span.End()
+
+	// Convertir proto mappings a domain mappings
+	mappings := make([]*domain.SymbolMapping, 0, len(report.Symbols))
+	for _, protoMapping := range report.Symbols {
+		mapping := &domain.SymbolMapping{
+			CanonicalSymbol: protoMapping.CanonicalSymbol,
+			BrokerSymbol:    protoMapping.BrokerSymbol,
+			Digits:          protoMapping.Digits,
+			Point:           protoMapping.Point,
+			TickSize:        protoMapping.TickSize,
+			MinLot:          protoMapping.MinLot,
+			MaxLot:          protoMapping.MaxLot,
+			LotStep:         protoMapping.LotStep,
+			StopLevel:       protoMapping.StopLevel,
+		}
+		if protoMapping.ContractSize != nil {
+			mapping.ContractSize = protoMapping.ContractSize
+		}
+		mappings = append(mappings, mapping)
+	}
+
+	// Upsert mappings en resolver (actualiza caché y encola persistencia async)
+	if err := c.symbolResolver.UpsertMappings(ctx, accountID, mappings, report.ReportedAtMs); err != nil {
+		c.telemetry.RecordError(ctx, err)
+		c.telemetry.Error(ctx, "Failed to upsert symbol mappings (i3)", err,
+			attribute.String("account_id", accountID),
+			attribute.Int("mappings_count", len(mappings)),
+		)
+		return
+	}
+
+	c.telemetry.Info(ctx, "AccountSymbolsReport processed successfully (i3)",
+		attribute.String("account_id", accountID),
+		attribute.Int("mappings_count", len(mappings)),
+		attribute.Int64("reported_at_ms", report.ReportedAtMs),
+	)
+}
+
+// handleSymbolSpecReport procesa el reporte de especificaciones de un Agent.
+func (c *Core) handleSymbolSpecReport(ctx context.Context, agentID string, report *pb.SymbolSpecReport) {
+	accountID := report.GetAccountId()
+	ctx = telemetry.AppendEventAttrs(ctx,
+		semconv.Echo.AccountID.String(accountID),
+	)
+
+	c.telemetry.Debug(ctx, "SymbolSpecReport received",
+		attribute.String("agent_id", agentID),
+		attribute.String("account_id", accountID),
+		attribute.Int("symbols_count", len(report.Symbols)),
+		attribute.Int64("reported_at_ms", report.ReportedAtMs),
+	)
+
+	ctx, span := c.telemetry.StartSpan(ctx, "core.handle_symbol_spec_report")
+	defer span.End()
+
+	if err := c.symbolSpecService.Upsert(ctx, report); err != nil {
+		c.telemetry.RecordError(ctx, err)
+		c.telemetry.Error(ctx, "Failed to process SymbolSpecReport", err,
+			attribute.String("agent_id", agentID),
+			attribute.String("account_id", accountID),
+			attribute.String("error", err.Error()),
+		)
+		return
+	}
+
+	c.telemetry.Info(ctx, "SymbolSpecReport processed",
+		attribute.String("agent_id", agentID),
+		attribute.String("account_id", accountID),
+		attribute.Int("symbols_count", len(report.Symbols)),
+		attribute.Int64("reported_at_ms", report.ReportedAtMs),
+	)
+}
+
+// handleSymbolQuoteSnapshot procesa snapshots de precios bid/ask recientes.
+func (c *Core) handleSymbolQuoteSnapshot(ctx context.Context, agentID string, snapshot *pb.SymbolQuoteSnapshot) {
+	if err := domain.ValidateSymbolQuoteSnapshot(snapshot, c.config.CanonicalSymbols); err != nil {
+		c.telemetry.Warn(ctx, "Invalid SymbolQuoteSnapshot",
+			attribute.String("agent_id", agentID),
+			attribute.String("account_id", snapshot.GetAccountId()),
+			attribute.String("canonical_symbol", snapshot.GetCanonicalSymbol()),
+			attribute.String("error", err.Error()),
+		)
+		return
+	}
+
+	ctx = telemetry.AppendEventAttrs(ctx,
+		semconv.Echo.AccountID.String(snapshot.AccountId),
+		semconv.Echo.Symbol.String(snapshot.CanonicalSymbol),
+	)
+
+	ctx, span := c.telemetry.StartSpan(ctx, "core.handle_symbol_quote_snapshot")
+	defer span.End()
+
+	if err := c.symbolQuoteService.Record(ctx, snapshot); err != nil {
+		c.telemetry.RecordError(ctx, err)
+		c.telemetry.Error(ctx, "Failed to record symbol quote snapshot", err,
+			attribute.String("agent_id", agentID),
+			attribute.String("account_id", snapshot.AccountId),
+			attribute.String("canonical_symbol", snapshot.CanonicalSymbol),
+			attribute.String("error", err.Error()),
+		)
+		return
+	}
+
+	c.echoMetrics.RecordSymbolLookup(ctx, "quote_received", snapshot.AccountId, snapshot.CanonicalSymbol)
+	c.telemetry.Debug(ctx, "Symbol quote snapshot processed",
+		attribute.String("agent_id", agentID),
+		attribute.Float64("bid", snapshot.Bid),
+		attribute.Float64("ask", snapshot.Ask),
 	)
 }

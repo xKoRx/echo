@@ -48,6 +48,17 @@ extern "C" __declspec(dllexport) INT_PTR __stdcall ConnectPipe(const wchar_t* pi
         return (INT_PTR)INVALID_HANDLE_VALUE;
     }
 
+    // i2b FIX: Esperar a que el pipe esté disponible antes de conectar
+    // Esto evita ERROR_PIPE_BUSY si el servidor no ha llamado a Accept() aún
+    // Timeout de 2 segundos (2000ms)
+    if (!WaitNamedPipeW(pipeName, 2000)) {
+        // Pipe no disponible después del timeout
+        // Códigos comunes:
+        // - ERROR_FILE_NOT_FOUND (2): El pipe no existe
+        // - ERROR_SEM_TIMEOUT (121): Timeout esperando
+        return (INT_PTR)INVALID_HANDLE_VALUE;
+    }
+
     HANDLE hPipe = CreateFileW(
         pipeName,                     // Nombre del pipe
         GENERIC_READ | GENERIC_WRITE, // Acceso lectura/escritura
@@ -258,7 +269,38 @@ extern "C" __declspec(dllexport) void __stdcall ClosePipe(INT_PTR handle)
     }
 
     HANDLE hPipe = (HANDLE)handle;
+    
+    // i2b FIX: Cancelar I/O pendiente antes de cerrar
+    // Esto evita que el handle quede en estado inconsistente
+    CancelIoEx(hPipe, NULL);
+    
     CloseHandle(hPipe);
+}
+
+// ============================================================================
+// FUNCIÓN 6: GetPipeLastError (i2b - Debugging)
+// ============================================================================
+// Retorna el último error de Win32 de las operaciones de pipe
+// 
+// Retorna:
+//   - Código de error Win32 (DWORD)
+// 
+// Códigos comunes:
+//   - 0: ERROR_SUCCESS (sin error)
+//   - 2: ERROR_FILE_NOT_FOUND (pipe no existe)
+//   - 5: ERROR_ACCESS_DENIED (permisos)
+//   - 109: ERROR_BROKEN_PIPE (pipe cerrado por el otro lado)
+//   - 121: ERROR_SEM_TIMEOUT (WaitNamedPipe timeout)
+//   - 231: ERROR_PIPE_BUSY (servidor no aceptando conexiones)
+//   - 233: ERROR_NO_PROCESS_ON_OTHER_END (servidor cerrado)
+// 
+// Uso en MQL4:
+//   int err = GetPipeLastError();
+//   Log("ERROR", "Pipe error", "code=" + IntegerToString(err));
+// 
+extern "C" __declspec(dllexport) DWORD __stdcall GetPipeLastError()
+{
+    return GetLastError();
 }
 
 // ============================================================================

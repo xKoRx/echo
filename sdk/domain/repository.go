@@ -3,6 +3,8 @@ package domain
 
 import (
 	"context"
+
+	pb "github.com/xKoRx/echo/sdk/pb/v1"
 )
 
 // TradeRepository define operaciones de persistencia para Trade.
@@ -134,6 +136,33 @@ type CorrelationService interface {
 	RecordClose(ctx context.Context, close *Close) error
 }
 
+// SymbolRepository define operaciones de persistencia para mapeos de símbolos (i3).
+type SymbolRepository interface {
+	// UpsertAccountMapping inserta o actualiza mapeos de símbolos para una cuenta.
+	// reportedAtMs se usa para idempotencia temporal (solo actualiza si es más reciente).
+	UpsertAccountMapping(ctx context.Context, accountID string, mappings []*SymbolMapping, reportedAtMs int64) error
+
+	// GetAccountMapping obtiene todos los mapeos de una cuenta.
+	// Retorna un mapa canonical_symbol → AccountSymbolInfo.
+	GetAccountMapping(ctx context.Context, accountID string) (map[string]*AccountSymbolInfo, error)
+
+	// InvalidateAccount elimina todos los mapeos de una cuenta.
+	// Se llama cuando una cuenta se desconecta.
+	InvalidateAccount(ctx context.Context, accountID string) error
+}
+
+// SymbolSpecRepository define operaciones para persistir especificaciones de símbolos.
+type SymbolSpecRepository interface {
+	UpsertSpecifications(ctx context.Context, accountID string, specs []*pb.SymbolSpecification, reportedAtMs int64) error
+	GetSpecifications(ctx context.Context, accountID string) (map[string]*pb.SymbolSpecification, error)
+}
+
+// SymbolQuoteRepository define operaciones para snapshots de precios.
+type SymbolQuoteRepository interface {
+	InsertSnapshot(ctx context.Context, snapshot *pb.SymbolQuoteSnapshot) error
+	GetLatestSnapshot(ctx context.Context, accountID, canonicalSymbol string) (*pb.SymbolQuoteSnapshot, error)
+}
+
 // RepositoryFactory crea instancias de repositorios.
 //
 // Uso:
@@ -147,5 +176,7 @@ type RepositoryFactory interface {
 	DedupeRepository() DedupeRepository
 	CloseRepository() CloseRepository
 	CorrelationService() CorrelationService
+	SymbolRepository() SymbolRepository // NEW i3
+	SymbolSpecRepository() SymbolSpecRepository
+	SymbolQuoteRepository() SymbolQuoteRepository
 }
-

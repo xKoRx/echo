@@ -17,9 +17,9 @@ import (
 // Cargada desde ETCD en namespace echo/{environment}.
 type Config struct {
 	// Endpoints
-	CoreAddr         string // endpoints/core_addr
-	OTLPEndpoint     string // endpoints/otel/otlp_endpoint
-	MetricsEndpoint  string // endpoints/otel/metrics_endpoint
+	CoreAddr        string // endpoints/core_addr
+	OTLPEndpoint    string // endpoints/otel/otlp_endpoint
+	MetricsEndpoint string // endpoints/otel/metrics_endpoint
 
 	// gRPC
 	GRPCPort int // core/grpc_port
@@ -30,10 +30,12 @@ type Config struct {
 	KeepAliveMinTime time.Duration // grpc/keepalive/min_time_s
 
 	// Core
-	DefaultLotSize      float64       // core/default_lot_size (i0 hardcoded)
-	DedupeTTL           time.Duration // core/dedupe_ttl_minutes
-	SymbolWhitelist     []string      // core/symbol_whitelist (comma separated)
-	SlaveAccounts       []string      // core/slave_accounts (comma separated)
+	DefaultLotSize   float64       // core/default_lot_size (i0 hardcoded)
+	DedupeTTL        time.Duration // core/dedupe_ttl_minutes
+	SymbolWhitelist  []string      // core/symbol_whitelist (comma separated) - deprecated i3, usar CanonicalSymbols
+	CanonicalSymbols []string      // core/canonical_symbols (comma separated) - NEW i3
+	UnknownAction    string        // core/symbols/unknown_action ("warn"|"reject") - NEW i3
+	SlaveAccounts    []string      // core/slave_accounts (comma separated)
 
 	// PostgreSQL
 	PostgresHost        string // postgres/host
@@ -49,6 +51,7 @@ type Config struct {
 	ServiceName    string // telemetry/service_name
 	ServiceVersion string // telemetry/service_version
 	Environment    string // telemetry/environment
+	LogLevel       string // core/log_level (DEBUG|INFO|WARN|ERROR)
 }
 
 // LoadConfig carga configuración desde ETCD.
@@ -87,7 +90,9 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		KeepAliveMinTime:    10 * time.Second,
 		DefaultLotSize:      0.10,
 		DedupeTTL:           60 * time.Minute,
-		SymbolWhitelist:     []string{"XAUUSD"},
+		SymbolWhitelist:     []string{"XAUUSD"}, // Deprecated i3, mantener para compatibilidad
+		CanonicalSymbols:    []string{"XAUUSD"}, // NEW i3
+		UnknownAction:       "warn",             // NEW i3 (default: warn para rollout seguro)
 		PostgresPort:        5432,
 		PostgresSchema:      "echo",
 		PostgresPoolMaxConn: 10,
@@ -95,6 +100,7 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		ServiceName:         "echo-core",
 		ServiceVersion:      "1.0.0-i1",
 		Environment:         env,
+		LogLevel:            "INFO",
 	}
 
 	// Cargar endpoints
@@ -143,13 +149,42 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 			cfg.DedupeTTL = time.Duration(minutes) * time.Minute
 		}
 	}
-	if val, err := etcdClient.GetVarWithDefault(ctx, "core/symbol_whitelist", ""); err == nil && val != "" {
-		cfg.SymbolWhitelist = strings.Split(val, ",")
+	// i3: Leer canonical_symbols (prioridad) con fallback a symbol_whitelist (compatibilidad)
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/canonical_symbols", ""); err == nil && val != "" {
+		cfg.CanonicalSymbols = strings.Split(val, ",")
 		// Trim spaces
-		for i := range cfg.SymbolWhitelist {
-			cfg.SymbolWhitelist[i] = strings.TrimSpace(cfg.SymbolWhitelist[i])
+		for i := range cfg.CanonicalSymbols {
+			cfg.CanonicalSymbols[i] = strings.TrimSpace(cfg.CanonicalSymbols[i])
+		}
+	} else if val, err := etcdClient.GetVarWithDefault(ctx, "core/symbol_whitelist", ""); err == nil && val != "" {
+		// Fallback a symbol_whitelist (compatibilidad i3)
+		cfg.CanonicalSymbols = strings.Split(val, ",")
+		for i := range cfg.CanonicalSymbols {
+			cfg.CanonicalSymbols[i] = strings.TrimSpace(cfg.CanonicalSymbols[i])
+		}
+		// Mantener también en SymbolWhitelist para compatibilidad
+		cfg.SymbolWhitelist = cfg.CanonicalSymbols
+	}
+
+	// Mantener lectura de symbol_whitelist para compatibilidad (si no se lee canonical_symbols)
+	if len(cfg.CanonicalSymbols) == 0 {
+		if val, err := etcdClient.GetVarWithDefault(ctx, "core/symbol_whitelist", ""); err == nil && val != "" {
+			cfg.SymbolWhitelist = strings.Split(val, ",")
+			for i := range cfg.SymbolWhitelist {
+				cfg.SymbolWhitelist[i] = strings.TrimSpace(cfg.SymbolWhitelist[i])
+			}
+			// Usar también como canonical para compatibilidad
+			cfg.CanonicalSymbols = cfg.SymbolWhitelist
 		}
 	}
+
+	// i3: Leer unknown_action
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/symbols/unknown_action", ""); err == nil && val != "" {
+		if val == "warn" || val == "reject" {
+			cfg.UnknownAction = val
+		}
+	}
+
 	if val, err := etcdClient.GetVarWithDefault(ctx, "core/slave_accounts", ""); err == nil && val != "" {
 		cfg.SlaveAccounts = strings.Split(val, ",")
 		// Trim spaces
@@ -202,6 +237,14 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		cfg.Environment = val
 	}
 
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/log_level", ""); err == nil && val != "" {
+		level := strings.ToUpper(strings.TrimSpace(val))
+		switch level {
+		case "DEBUG", "INFO", "WARN", "ERROR":
+			cfg.LogLevel = level
+		}
+	}
+
 	// Validar configuración mínima requerida
 	if cfg.PostgresHost == "" {
 		return nil, fmt.Errorf("postgres/host not configured in ETCD")
@@ -237,4 +280,3 @@ func (c *Config) PostgresConnStr() string {
 		c.PostgresDatabase,
 	)
 }
-

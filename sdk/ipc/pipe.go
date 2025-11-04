@@ -96,6 +96,12 @@ type PipeServer interface {
 	// Bloquea hasta que un cliente se conecta o el contexto se cancela.
 	WaitForConnection(ctx context.Context) error
 
+	// DisconnectClient cierra solo la conexión actual sin cerrar el listener.
+	//
+	// Permite que el servidor continúe aceptando nuevas conexiones después
+	// de que un cliente se desconecte. Útil para reconexión automática.
+	DisconnectClient() error
+
 	// Name retorna el nombre del pipe.
 	Name() string
 }

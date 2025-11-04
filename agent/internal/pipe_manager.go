@@ -6,6 +6,8 @@ package internal
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -223,35 +225,15 @@ type PipeHandler struct {
 
 // Run ejecuta el loop principal del handler.
 //
-// Espera conexión del EA y procesa mensajes.
+// i2b FIX: Loop externo para reconexión automática.
+// Cuando el EA se desconecta (EOF), cierra solo la conexión actual (NO el listener)
+// y vuelve a esperar una nueva conexión.
 func (h *PipeHandler) Run() error {
-	h.logInfo("Waiting for EA connection", map[string]interface{}{
-		"pipe_name": h.name,
-		"role":      h.role,
-	})
+	// Backoff para WaitForConnection en caso de errores repetidos
+	reconnectDelay := 100 * time.Millisecond
+	maxReconnectDelay := 5 * time.Second
 
-	// Esperar conexión del EA
-	if err := h.server.WaitForConnection(h.ctx); err != nil {
-		return fmt.Errorf("failed to wait for connection: %w", err)
-	}
-
-	h.logInfo("EA connected", map[string]interface{}{
-		"pipe_name": h.name,
-		"role":      h.role,
-	})
-
-	// NEW i2: Notificar al Core que la cuenta se conectó
-	if h.role == "slave" || h.role == "master" {
-		h.notifyAccountConnected()
-	}
-
-	// Usaremos un LineReader nuevo por iteración para evitar estados internos
-	// de scanner atascados después de timeouts. Esto es liviano y simple para i0.
-	// Modo debug: log de línea cruda antes de parsear (temporal)
-	// reader.SetTimeout no expone, usamos el default del reader. Para depurar
-	// añadimos una lectura de Peek en cada iteración.
-
-	// Loop de lectura
+	// Loop externo: aceptar conexiones indefinidamente
 	for {
 		select {
 		case <-h.ctx.Done():
@@ -259,48 +241,140 @@ func (h *PipeHandler) Run() error {
 		default:
 		}
 
-		// Leer una línea (no bloqueante >1s) y loguear crudo para debug
+		h.logInfo("Waiting for EA connection", map[string]interface{}{
+			"pipe_name": h.name,
+			"role":      h.role,
+		})
+
+		// Esperar conexión del EA
+		err := h.server.WaitForConnection(h.ctx)
+		if err != nil {
+			if h.ctx.Err() != nil {
+				// Contexto cancelado - salir limpiamente
+				return nil
+			}
+
+			// Error al aceptar conexión - backoff y reintentar
+			h.logError("Failed to wait for connection", err, map[string]interface{}{
+				"pipe_name":       h.name,
+				"reconnect_delay": reconnectDelay.String(),
+			})
+
+			// Backoff exponencial con jitter
+			select {
+			case <-h.ctx.Done():
+				return nil
+			case <-time.After(reconnectDelay):
+			}
+
+			// Incrementar delay con jitter
+			reconnectDelay = reconnectDelay * 2
+			if reconnectDelay > maxReconnectDelay {
+				reconnectDelay = maxReconnectDelay
+			}
+			// Agregar jitter (±25%)
+			jitter := time.Duration(float64(reconnectDelay) * 0.25 * (2*rand.Float64() - 1))
+			reconnectDelay += jitter
+
+			continue
+		}
+
+		// Reset backoff tras conexión exitosa
+		reconnectDelay = 100 * time.Millisecond
+
+		h.logInfo("EA connected", map[string]interface{}{
+			"pipe_name": h.name,
+			"role":      h.role,
+		})
+
+		// NEW i2: Notificar al Core que la cuenta se conectó
+		if h.role == "slave" || h.role == "master" {
+			h.notifyAccountConnected()
+		}
+
+		// Procesar sesión (loop interno de lectura)
+		sessionErr := h.handleSession()
+
+		// Sesión terminada (EOF o error fatal)
+		h.logInfo("Session ended", map[string]interface{}{
+			"pipe_name": h.name,
+			"role":      h.role,
+			"reason":    sessionErr,
+		})
+
+		// NEW i2: Notificar desconexión
+		if h.role == "slave" || h.role == "master" {
+			reason := "client_disconnected"
+			if sessionErr != nil && sessionErr.Error() != "EOF" {
+				reason = "session_error"
+			}
+			h.notifyAccountDisconnected(reason)
+		}
+
+		// i2b FIX CRÍTICO: Cerrar SOLO la conexión actual, NO el listener
+		if err := h.server.DisconnectClient(); err != nil {
+			h.logError("Failed to disconnect client", err, map[string]interface{}{
+				"pipe_name": h.name,
+			})
+		}
+
+		h.logInfo("Client disconnected, listener still open", map[string]interface{}{
+			"pipe_name": h.name,
+			"role":      h.role,
+		})
+
+		// Volver al inicio del loop externo para aceptar nueva conexión
+	}
+}
+
+// handleSession procesa la sesión de lectura con el EA conectado.
+//
+// Retorna cuando:
+// - EOF (cliente se desconecta)
+// - Error fatal de lectura
+// - Contexto cancelado
+func (h *PipeHandler) handleSession() error {
+	// Loop de lectura
+	for {
+		select {
+		case <-h.ctx.Done():
+			return h.ctx.Err()
+		default:
+		}
+
+		// Leer una línea (timeout de 1s para no bloquear indefinidamente)
 		lr := ipc.NewLineReader(h.server)
 		lr.SetTimeout(1 * time.Second)
 		line, err := lr.ReadLine()
-		if err == nil {
-			if len(line) > 0 {
-				h.logDebug("Raw line received", map[string]interface{}{
-					"pipe_name": h.name,
-					"bytes":     len(line),
-					"preview":   preview(line, 160),
-				})
-			}
-		} else {
-			// Restaurar comportamiento: si hubo error en ReadLine, tratarlo abajo
+
+		if err == nil && len(line) > 0 {
+			h.logDebug("Raw line received", map[string]interface{}{
+				"pipe_name": h.name,
+				"bytes":     len(line),
+				"preview":   preview(line, 160),
+			})
 		}
 
-		// Si se leyó línea, parsearla; si no, intentar ReadMessage normal
+		// Parsear JSON
 		var msgMap map[string]interface{}
 		if err == nil {
-			// parsear manualmente la línea
 			msgMap, err = ipc.ParseJSONLine(line)
 		}
+
 		if err != nil {
 			errStr := err.Error()
 
-			// i2b: EOF significa desconexión del cliente - salir del loop
+			// i2b: EOF significa desconexión del cliente - salir de la sesión
 			if errStr == "EOF" {
 				h.logInfo("Client disconnected (EOF detected)", map[string]interface{}{
 					"pipe_name": h.name,
 					"role":      h.role,
 				})
-				// Salir del loop para ejecutar notifyAccountDisconnected en defer
-				break
+				return fmt.Errorf("EOF")
 			}
 
 			// Timeout es NORMAL cuando EA no envía nada - continuar esperando
 			if errStr == "i/o timeout" {
-				select {
-				case <-h.ctx.Done():
-					return nil
-				case <-time.After(100 * time.Millisecond):
-				}
 				continue
 			}
 
@@ -310,11 +384,7 @@ func (h *PipeHandler) Run() error {
 			})
 
 			// Dormir 100ms antes de reintentar (evitar CPU spinning)
-			select {
-			case <-h.ctx.Done():
-				return nil
-			case <-time.After(100 * time.Millisecond):
-			}
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
@@ -329,14 +399,6 @@ func (h *PipeHandler) Run() error {
 			}
 		}
 	}
-
-	// NEW i2: Si salimos del loop por error de conexión, notificar desconexión
-	// (esto ocurre cuando el cliente se desconecta o hay un error fatal)
-	if h.role == "slave" || h.role == "master" {
-		h.notifyAccountDisconnected("client_disconnected")
-	}
-
-	return nil
 }
 
 // handleMasterMessage procesa mensajes del Master EA.
@@ -347,12 +409,13 @@ func (h *PipeHandler) handleMasterMessage(msgMap map[string]interface{}) error {
 
 	switch msgType {
 	case "handshake":
-		h.logInfo("Handshake received", map[string]interface{}{
-			"pipe_name": h.name,
-			"role":      h.role,
-		})
-		// TODO i0: nada más que loggear, i1+: registrar cliente
-		return nil
+		return h.handleHandshake(msgMap)
+
+	case "symbol_spec_report":
+		return h.handleSymbolSpecReport(msgMap)
+
+	case "quote_snapshot":
+		return h.handleQuoteSnapshot(msgMap)
 
 	case "ping":
 		return h.handlePing(msgMap)
@@ -466,11 +529,13 @@ func (h *PipeHandler) handleSlaveMessage(msgMap map[string]interface{}) error {
 
 	switch msgType {
 	case "handshake":
-		h.logInfo("Handshake received", map[string]interface{}{
-			"pipe_name": h.name,
-			"role":      h.role,
-		})
-		return nil
+		return h.handleHandshake(msgMap)
+
+	case "symbol_spec_report":
+		return h.handleSymbolSpecReport(msgMap)
+
+	case "quote_snapshot":
+		return h.handleQuoteSnapshot(msgMap)
 
 	case "ping":
 		return h.handlePing(msgMap)
@@ -556,6 +621,455 @@ func (h *PipeHandler) handleCloseResult(msgMap map[string]interface{}) error {
 	return nil
 }
 
+// handleHandshake procesa un handshake del EA (i3).
+//
+// Extrae symbols del handshake y envía AccountSymbolsReport al Core si están presentes.
+func (h *PipeHandler) handleHandshake(msgMap map[string]interface{}) error {
+	h.logInfo("Handshake received", map[string]interface{}{
+		"pipe_name": h.name,
+		"role":      h.role,
+	})
+
+	// i3: Extraer symbols del handshake (opcional)
+	payload, ok := msgMap["payload"].(map[string]interface{})
+	if !ok {
+		// No hay payload o payload inválido - continuar sin símbolos (compatibilidad)
+		return nil
+	}
+
+	symbolsRaw, ok := payload["symbols"].([]interface{})
+	if !ok || len(symbolsRaw) == 0 {
+		// No hay symbols en handshake - continuar sin reporte (compatibilidad i3)
+		h.logInfo("Handshake without symbols (i3 compatibility)", map[string]interface{}{
+			"account_id": h.accountID,
+		})
+		return nil
+	}
+
+	// Convertir symbols de JSON a proto SymbolMapping
+	mappings := make([]*pb.SymbolMapping, 0, len(symbolsRaw))
+	for _, symRaw := range symbolsRaw {
+		symMap, ok := symRaw.(map[string]interface{})
+		if !ok {
+			h.logWarn("Invalid symbol format in handshake", map[string]interface{}{
+				"account_id": h.accountID,
+			})
+			continue
+		}
+
+		mapping := &pb.SymbolMapping{
+			BrokerSymbol:    utils.ExtractString(symMap, "broker_symbol"),
+			CanonicalSymbol: utils.ExtractString(symMap, "canonical_symbol"),
+			Digits:          int32(utils.ExtractInt64(symMap, "digits")),
+			Point:           utils.ExtractFloat64(symMap, "point"),
+			TickSize:        utils.ExtractFloat64(symMap, "tick_size"),
+			MinLot:          utils.ExtractFloat64(symMap, "min_lot"),
+			MaxLot:          utils.ExtractFloat64(symMap, "max_lot"),
+			LotStep:         utils.ExtractFloat64(symMap, "lot_step"),
+			StopLevel:       int32(utils.ExtractInt64(symMap, "stop_level")),
+		}
+
+		// ContractSize es opcional
+		if contractSize, ok := symMap["contract_size"].(float64); ok {
+			mapping.ContractSize = &contractSize
+		}
+
+		mappings = append(mappings, mapping)
+	}
+
+	if len(mappings) == 0 {
+		// No hay mappings válidos
+		return nil
+	}
+
+	// Enviar AccountSymbolsReport al Core
+	report := &pb.AccountSymbolsReport{
+		AccountId:    h.accountID,
+		Symbols:      mappings,
+		ReportedAtMs: utils.NowUnixMilli(),
+	}
+
+	agentMsg := &pb.AgentMessage{
+		AgentId:     h.agentID,
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.AgentMessage_AccountSymbolsReport{
+			AccountSymbolsReport: report,
+		},
+	}
+
+	select {
+	case h.sendToCoreCh <- agentMsg:
+		h.logInfo("AccountSymbolsReport sent to Core (i3)", map[string]interface{}{
+			"account_id":    h.accountID,
+			"symbols_count": len(mappings),
+		})
+	case <-h.ctx.Done():
+		return h.ctx.Err()
+	}
+
+	return nil
+}
+
+// handleSymbolSpecReport procesa un reporte de especificaciones desde el Slave EA.
+func (h *PipeHandler) handleSymbolSpecReport(msgMap map[string]interface{}) error {
+	payload, ok := msgMap["payload"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("symbol_spec_report missing payload")
+	}
+
+	accountID := utils.ExtractString(payload, "account_id")
+	if accountID == "" {
+		accountID = h.accountID
+	}
+
+	reportedAt := utils.ExtractInt64(payload, "reported_at_ms")
+	if reportedAt <= 0 {
+		reportedAt = nowUnixMilli()
+	}
+
+	symbolsRaw, ok := payload["symbols"].([]interface{})
+	if !ok || len(symbolsRaw) == 0 {
+		h.logWarn("SymbolSpecReport without symbols", map[string]interface{}{
+			"account_id": accountID,
+		})
+		return nil
+	}
+
+	specs := make([]*pb.SymbolSpecification, 0, len(symbolsRaw))
+	for _, raw := range symbolsRaw {
+		symMap, ok := raw.(map[string]interface{})
+		if !ok {
+			h.logWarn("Invalid symbol specification format", map[string]interface{}{
+				"account_id": accountID,
+			})
+			continue
+		}
+
+		spec := &pb.SymbolSpecification{
+			CanonicalSymbol: utils.ExtractString(symMap, "canonical_symbol"),
+			BrokerSymbol:    utils.ExtractString(symMap, "broker_symbol"),
+		}
+
+		if generalMap, ok := symMap["general"].(map[string]interface{}); ok {
+			spec.General = parseSymbolGeneral(generalMap)
+		}
+
+		if volumeMap, ok := symMap["volume"].(map[string]interface{}); ok {
+			spec.Volume = parseVolumeSpec(volumeMap)
+		}
+
+		if swapMap, ok := symMap["swap"].(map[string]interface{}); ok {
+			spec.Swap = parseSwapSpec(swapMap)
+		}
+
+		if sessionsRaw, ok := symMap["sessions"].([]interface{}); ok {
+			spec.Sessions = parseSessionWindows(sessionsRaw)
+		}
+
+		specs = append(specs, spec)
+	}
+
+	if len(specs) == 0 {
+		h.logWarn("SymbolSpecReport without valid specs", map[string]interface{}{
+			"account_id": accountID,
+		})
+		return nil
+	}
+
+	report := &pb.SymbolSpecReport{
+		AccountId:    accountID,
+		Symbols:      specs,
+		ReportedAtMs: reportedAt,
+	}
+
+	agentMsg := &pb.AgentMessage{
+		AgentId:     h.agentID,
+		TimestampMs: nowUnixMilli(),
+		Payload: &pb.AgentMessage_SymbolSpecReport{
+			SymbolSpecReport: report,
+		},
+	}
+
+	select {
+	case h.sendToCoreCh <- agentMsg:
+		h.logInfo("SymbolSpecReport forwarded to Core", map[string]interface{}{
+			"account_id":    accountID,
+			"symbols_count": len(specs),
+		})
+	case <-h.ctx.Done():
+		return h.ctx.Err()
+	}
+
+	return nil
+}
+
+// handleQuoteSnapshot procesa un snapshot de precios Bid/Ask desde el Slave EA.
+func (h *PipeHandler) handleQuoteSnapshot(msgMap map[string]interface{}) error {
+	payload, ok := msgMap["payload"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("quote_snapshot missing payload")
+	}
+
+	accountID := utils.ExtractString(payload, "account_id")
+	if accountID == "" {
+		accountID = h.accountID
+	}
+
+	timestamp := utils.ExtractInt64(payload, "timestamp_ms")
+	if timestamp <= 0 {
+		timestamp = nowUnixMilli()
+	}
+
+	snapshot := &pb.SymbolQuoteSnapshot{
+		AccountId:       accountID,
+		CanonicalSymbol: utils.ExtractString(payload, "canonical_symbol"),
+		BrokerSymbol:    utils.ExtractString(payload, "broker_symbol"),
+		Bid:             utils.ExtractFloat64(payload, "bid"),
+		Ask:             utils.ExtractFloat64(payload, "ask"),
+		SpreadPoints:    utils.ExtractFloat64(payload, "spread_points"),
+		TimestampMs:     timestamp,
+	}
+
+	agentMsg := &pb.AgentMessage{
+		AgentId:     h.agentID,
+		TimestampMs: nowUnixMilli(),
+		Payload: &pb.AgentMessage_SymbolQuoteSnapshot{
+			SymbolQuoteSnapshot: snapshot,
+		},
+	}
+
+	select {
+	case h.sendToCoreCh <- agentMsg:
+		h.logDebug("SymbolQuoteSnapshot forwarded to Core", map[string]interface{}{
+			"account_id":       accountID,
+			"canonical_symbol": snapshot.CanonicalSymbol,
+			"bid":              snapshot.Bid,
+			"ask":              snapshot.Ask,
+		})
+	case <-h.ctx.Done():
+		return h.ctx.Err()
+	}
+
+	return nil
+}
+
+func parseSymbolGeneral(m map[string]interface{}) *pb.SymbolGeneral {
+	general := &pb.SymbolGeneral{
+		SpreadType:            parseSpreadType(utils.ExtractString(m, "spread_type")),
+		FixedSpreadPoints:     utils.ExtractFloat64(m, "fixed_spread_points"),
+		Digits:                int32(utils.ExtractInt64(m, "digits")),
+		StopsLevel:            int32(utils.ExtractInt64(m, "stops_level")),
+		ContractSize:          utils.ExtractFloat64(m, "contract_size"),
+		MarginCurrency:        utils.ExtractString(m, "margin_currency"),
+		ProfitCalculationMode: parseProfitCalculationMode(utils.ExtractString(m, "profit_calculation_mode")),
+		MarginCalculationMode: parseMarginCalculationMode(utils.ExtractString(m, "margin_calculation_mode")),
+		MarginHedge:           utils.ExtractFloat64(m, "margin_hedge"),
+		MarginPercentage:      utils.ExtractFloat64(m, "margin_percentage"),
+		TradePermission:       parseTradePermission(utils.ExtractString(m, "trade_permission")),
+		ExecutionMode:         parseExecutionMode(utils.ExtractString(m, "execution_mode")),
+		GtcMode:               parseGTCMode(utils.ExtractString(m, "gtc_mode")),
+	}
+
+	return general
+}
+
+func parseVolumeSpec(m map[string]interface{}) *pb.VolumeSpec {
+	return &pb.VolumeSpec{
+		MinVolume:  utils.ExtractFloat64(m, "min_volume"),
+		MaxVolume:  utils.ExtractFloat64(m, "max_volume"),
+		VolumeStep: utils.ExtractFloat64(m, "volume_step"),
+	}
+}
+
+func parseSwapSpec(m map[string]interface{}) *pb.SwapSpec {
+	return &pb.SwapSpec{
+		SwapType:      parseSwapType(utils.ExtractString(m, "swap_type")),
+		SwapLong:      utils.ExtractFloat64(m, "swap_long"),
+		SwapShort:     utils.ExtractFloat64(m, "swap_short"),
+		TripleSwapDay: parseWeekday(utils.ExtractString(m, "triple_swap_day")),
+	}
+}
+
+func parseSessionWindows(raw []interface{}) []*pb.SessionWindow {
+	windows := make([]*pb.SessionWindow, 0, len(raw))
+	for _, entry := range raw {
+		sessionMap, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		window := &pb.SessionWindow{
+			Day: parseWeekday(utils.ExtractString(sessionMap, "day")),
+		}
+		if quotesRaw, ok := sessionMap["quote_sessions"].([]interface{}); ok {
+			window.QuoteSessions = parseSessionRanges(quotesRaw)
+		}
+		if tradesRaw, ok := sessionMap["trade_sessions"].([]interface{}); ok {
+			window.TradeSessions = parseSessionRanges(tradesRaw)
+		}
+
+		windows = append(windows, window)
+	}
+	return windows
+}
+
+func parseSessionRanges(raw []interface{}) []*pb.SessionRange {
+	ranges := make([]*pb.SessionRange, 0, len(raw))
+	for _, entry := range raw {
+		rangeMap, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		start := utils.ExtractInt64(rangeMap, "start_minute")
+		end := utils.ExtractInt64(rangeMap, "end_minute")
+		if start < 0 || end <= 0 {
+			continue
+		}
+		ranges = append(ranges, &pb.SessionRange{
+			StartMinute: uint32(start),
+			EndMinute:   uint32(end),
+		})
+	}
+	return ranges
+}
+
+func parseSpreadType(v string) pb.SpreadType {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "floating":
+		return pb.SpreadType_SPREAD_TYPE_FLOATING
+	case "fixed":
+		return pb.SpreadType_SPREAD_TYPE_FIXED
+	default:
+		return pb.SpreadType_SPREAD_TYPE_UNSPECIFIED
+	}
+}
+
+func parseProfitCalculationMode(v string) pb.ProfitCalculationMode {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "forex":
+		return pb.ProfitCalculationMode_PROFIT_CALCULATION_MODE_FOREX
+	case "cfd":
+		return pb.ProfitCalculationMode_PROFIT_CALCULATION_MODE_CFD
+	case "futures":
+		return pb.ProfitCalculationMode_PROFIT_CALCULATION_MODE_FUTURES
+	case "exchange":
+		return pb.ProfitCalculationMode_PROFIT_CALCULATION_MODE_EXCHANGE
+	default:
+		return pb.ProfitCalculationMode_PROFIT_CALCULATION_MODE_UNSPECIFIED
+	}
+}
+
+func parseMarginCalculationMode(v string) pb.MarginCalculationMode {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "forex":
+		return pb.MarginCalculationMode_MARGIN_CALCULATION_MODE_FOREX
+	case "cfd":
+		return pb.MarginCalculationMode_MARGIN_CALCULATION_MODE_CFD
+	case "cfd_leverage":
+		return pb.MarginCalculationMode_MARGIN_CALCULATION_MODE_CFD_LEVERAGE
+	case "exchange":
+		return pb.MarginCalculationMode_MARGIN_CALCULATION_MODE_EXCHANGE
+	default:
+		return pb.MarginCalculationMode_MARGIN_CALCULATION_MODE_UNSPECIFIED
+	}
+}
+
+func parseTradePermission(v string) pb.TradePermission {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "disabled":
+		return pb.TradePermission_TRADE_PERMISSION_DISABLED
+	case "close_only":
+		return pb.TradePermission_TRADE_PERMISSION_CLOSE_ONLY
+	case "full", "full_access":
+		return pb.TradePermission_TRADE_PERMISSION_FULL
+	default:
+		return pb.TradePermission_TRADE_PERMISSION_UNSPECIFIED
+	}
+}
+
+func parseExecutionMode(v string) pb.ExecutionMode {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "request":
+		return pb.ExecutionMode_EXECUTION_MODE_REQUEST
+	case "instant":
+		return pb.ExecutionMode_EXECUTION_MODE_INSTANT
+	case "market":
+		return pb.ExecutionMode_EXECUTION_MODE_MARKET
+	case "exchange":
+		return pb.ExecutionMode_EXECUTION_MODE_EXCHANGE
+	default:
+		return pb.ExecutionMode_EXECUTION_MODE_UNSPECIFIED
+	}
+}
+
+func parseGTCMode(v string) pb.GTCMode {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "gtc", "good_till_cancel":
+		return pb.GTCMode_GTC_MODE_GTC
+	case "day":
+		return pb.GTCMode_GTC_MODE_DAY
+	case "gtc_and_day":
+		return pb.GTCMode_GTC_MODE_GTC_AND_DAY
+	default:
+		return pb.GTCMode_GTC_MODE_UNSPECIFIED
+	}
+}
+
+func parseSwapType(v string) pb.SwapType {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "points":
+		return pb.SwapType_SWAP_TYPE_POINTS
+	case "currency":
+		return pb.SwapType_SWAP_TYPE_CURRENCY
+	case "currency_symbol":
+		return pb.SwapType_SWAP_TYPE_CURRENCY_SYMBOL
+	case "interest_current":
+		return pb.SwapType_SWAP_TYPE_INTEREST_CURRENT
+	default:
+		if len(normalized) == 3 { // currency code (e.g. USD)
+			return pb.SwapType_SWAP_TYPE_CURRENCY
+		}
+		return pb.SwapType_SWAP_TYPE_UNSPECIFIED
+	}
+}
+
+func parseWeekday(v string) pb.Weekday {
+	normalized := normalizeEnumValue(v)
+	switch normalized {
+	case "sunday", "sun":
+		return pb.Weekday_WEEKDAY_SUNDAY
+	case "monday", "mon":
+		return pb.Weekday_WEEKDAY_MONDAY
+	case "tuesday", "tue":
+		return pb.Weekday_WEEKDAY_TUESDAY
+	case "wednesday", "wed":
+		return pb.Weekday_WEEKDAY_WEDNESDAY
+	case "thursday", "thu":
+		return pb.Weekday_WEEKDAY_THURSDAY
+	case "friday", "fri":
+		return pb.Weekday_WEEKDAY_FRIDAY
+	case "saturday", "sat":
+		return pb.Weekday_WEEKDAY_SATURDAY
+	default:
+		return pb.Weekday_WEEKDAY_UNSPECIFIED
+	}
+}
+
+func normalizeEnumValue(v string) string {
+	n := strings.TrimSpace(strings.ToLower(v))
+	n = strings.ReplaceAll(n, "-", "_")
+	n = strings.ReplaceAll(n, " ", "_")
+	n = strings.ReplaceAll(n, "__", "_")
+	return n
+}
+
 // handlePing procesa un ping del EA y responde con pong.
 //
 // i2b: Implementación de ping/pong para liveness checking.
@@ -578,10 +1092,19 @@ func (h *PipeHandler) handlePing(msgMap map[string]interface{}) error {
 		"echo_ms":      echoMs,
 	}
 
-	// Escribir pong directamente
+	// i2b FIX: Escribir pong directamente con flush inmediato
 	writer := ipc.NewJSONWriter(h.server)
 	if err := writer.WriteMessage(pongMsg); err != nil {
 		h.logError("Failed to send pong", err, map[string]interface{}{
+			"ping_id": pingID,
+		})
+		return err
+	}
+
+	// i2b FIX: Flush explícito para asegurar envío inmediato
+	// Aunque Named Pipes son auto-flush, esto garantiza que no quede en buffers del SO
+	if err := writer.Flush(); err != nil {
+		h.logError("Failed to flush pong", err, map[string]interface{}{
 			"ping_id": pingID,
 		})
 		return err

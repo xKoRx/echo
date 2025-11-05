@@ -17,21 +17,21 @@ import (
 //
 // # Métricas de Conteo
 //
-//	- echo.intent.received: TradeIntents recibidos por Agent
-//	- echo.intent.forwarded: TradeIntents enviados al Core
-//	- echo.order.created: ExecuteOrders creados por Core
-//	- echo.order.sent: ExecuteOrders enviados a Agents
-//	- echo.execution.dispatched: ExecuteOrders enviados a Slaves
-//	- echo.execution.completed: Ejecuciones finalizadas (success/error)
+//   - echo.intent.received: TradeIntents recibidos por Agent
+//   - echo.intent.forwarded: TradeIntents enviados al Core
+//   - echo.order.created: ExecuteOrders creados por Core
+//   - echo.order.sent: ExecuteOrders enviados a Agents
+//   - echo.execution.dispatched: ExecuteOrders enviados a Slaves
+//   - echo.execution.completed: Ejecuciones finalizadas (success/error)
 //
 // # Métricas de Latencia
 //
-//	- echo.latency.e2e: Latencia extremo a extremo (t7 - t0)
-//	- echo.latency.agent_to_core: Agent → Core (t2 - t1)
-//	- echo.latency.core_process: Procesamiento en Core (t3 - t2)
-//	- echo.latency.core_to_agent: Core → Agent (t4 - t3)
-//	- echo.latency.agent_to_slave: Agent → Slave (t5 - t4)
-//	- echo.latency.slave_execution: Ejecución en Slave (t7 - t6)
+//   - echo.latency.e2e: Latencia extremo a extremo (t7 - t0)
+//   - echo.latency.agent_to_core: Agent → Core (t2 - t1)
+//   - echo.latency.core_process: Procesamiento en Core (t3 - t2)
+//   - echo.latency.core_to_agent: Core → Agent (t4 - t3)
+//   - echo.latency.agent_to_slave: Agent → Slave (t5 - t4)
+//   - echo.latency.slave_execution: Ejecución en Slave (t7 - t6)
 //
 // # Uso
 //
@@ -53,30 +53,38 @@ import (
 //	)
 type EchoMetrics struct {
 	// Counters
-	IntentReceived       metric.Int64Counter
-	IntentForwarded      metric.Int64Counter
-	OrderCreated         metric.Int64Counter
-	OrderSent            metric.Int64Counter
-	ExecutionDispatched  metric.Int64Counter
-	ExecutionCompleted   metric.Int64Counter
-	VolumeClamp          metric.Int64Counter
-	VolumeGuardDecision  metric.Int64Counter
-	AgentSpecsForwarded  metric.Int64Counter
-	AgentSpecsFiltered   metric.Int64Counter
-	RiskPolicyLookup     metric.Int64Counter
+	IntentReceived             metric.Int64Counter
+	IntentForwarded            metric.Int64Counter
+	OrderCreated               metric.Int64Counter
+	OrderSent                  metric.Int64Counter
+	ExecutionDispatched        metric.Int64Counter
+	ExecutionCompleted         metric.Int64Counter
+	VolumeClamp                metric.Int64Counter
+	VolumeGuardDecision        metric.Int64Counter
+	AgentSpecsForwarded        metric.Int64Counter
+	AgentSpecsFiltered         metric.Int64Counter
+	RiskPolicyLookup           metric.Int64Counter
+	HandshakeVersion           metric.Int64Counter
+	HandshakeStatus            metric.Int64Counter
+	HandshakeSymbolIssue       metric.Int64Counter
+	HandshakeReconcileSkipped  metric.Int64Counter
+	AgentHandshakeForwarded    metric.Int64Counter
+	AgentHandshakeBlocked      metric.Int64Counter
+	AgentHandshakeForwardError metric.Int64Counter
 
 	// Histograms
-	LatencyE2E           metric.Float64Histogram
-	LatencyAgentToCore   metric.Float64Histogram
-	LatencyCoreProcess   metric.Float64Histogram
-	LatencyCoreToAgent   metric.Float64Histogram
-	LatencyAgentToSlave  metric.Float64Histogram
-	LatencySlaveExecution metric.Float64Histogram
-	VolumeGuardSpecAge   metric.Float64Histogram
+	LatencyE2E               metric.Float64Histogram
+	LatencyAgentToCore       metric.Float64Histogram
+	LatencyCoreProcess       metric.Float64Histogram
+	LatencyCoreToAgent       metric.Float64Histogram
+	LatencyAgentToSlave      metric.Float64Histogram
+	LatencySlaveExecution    metric.Float64Histogram
+	VolumeGuardSpecAge       metric.Float64Histogram
+	HandshakeFeedbackLatency metric.Float64Histogram
 
 	// i2: Routing metrics
-	RoutingMode     metric.Int64Counter
-	AccountLookup   metric.Int64Counter
+	RoutingMode   metric.Int64Counter
+	AccountLookup metric.Int64Counter
 
 	// i3: Symbol metrics
 	SymbolsLookup   metric.Int64Counter // echo.symbols.lookup (hit/miss)
@@ -187,6 +195,69 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	handshakeVersion, err := meter.Int64Counter(
+		"echo.core.handshake.version_total",
+		metric.WithDescription("Handshakes evaluados por versión y resultado"),
+		metric.WithUnit("{handshake}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	handshakeStatus, err := meter.Int64Counter(
+		"echo.core.handshake.status_total",
+		metric.WithDescription("Resultados globales de registro de símbolos"),
+		metric.WithUnit("{registration}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	handshakeSymbolIssue, err := meter.Int64Counter(
+		"echo.core.handshake.symbol_issues_total",
+		metric.WithDescription("Conteo de issues detectados durante el registro de símbolos"),
+		metric.WithUnit("{issue}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	handshakeReconcileSkipped, err := meter.Int64Counter(
+		"echo.core.handshake.reconcile_skipped_total",
+		metric.WithDescription("Re-evaluaciones de handshake descartadas por no presentar cambios"),
+		metric.WithUnit("{evaluation}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agentHandshakeForwarded, err := meter.Int64Counter(
+		"echo.agent.handshake.forwarded_total",
+		metric.WithDescription("Handshakes reenviados al Core por estado"),
+		metric.WithUnit("{handshake}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agentHandshakeBlocked, err := meter.Int64Counter(
+		"echo.agent.handshake.blocked_total",
+		metric.WithDescription("Handshakes bloqueados en el Agent"),
+		metric.WithUnit("{handshake}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agentHandshakeForwardError, err := meter.Int64Counter(
+		"echo.agent.handshake.forward_error_total",
+		metric.WithDescription("Errores al reenviar feedback de handshake hacia el EA"),
+		metric.WithUnit("{error}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Histograms
 	latencyE2E, err := meter.Float64Histogram(
 		"echo.latency.e2e",
@@ -251,6 +322,15 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	handshakeFeedbackLatency, err := meter.Float64Histogram(
+		"echo.handshake.feedback_latency_ms",
+		metric.WithDescription("Latencia entre handshake y feedback entregado al EA"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// i2: Routing metrics
 	routingMode, err := meter.Int64Counter(
 		"echo.routing.mode",
@@ -308,30 +388,38 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 	}
 
 	return &EchoMetrics{
-		IntentReceived:       intentReceived,
-		IntentForwarded:      intentForwarded,
-		OrderCreated:         orderCreated,
-		OrderSent:            orderSent,
-		ExecutionDispatched:  executionDispatched,
-		ExecutionCompleted:   executionCompleted,
-		VolumeClamp:          volumeClamp,
-		VolumeGuardDecision:  volumeGuardDecision,
-		AgentSpecsForwarded:  agentSpecsForwarded,
-		AgentSpecsFiltered:   agentSpecsFiltered,
-		RiskPolicyLookup:     riskPolicyLookup,
-		LatencyE2E:           latencyE2E,
-		LatencyAgentToCore:   latencyAgentToCore,
-		LatencyCoreProcess:   latencyCoreProcess,
-		LatencyCoreToAgent:   latencyCoreToAgent,
-		LatencyAgentToSlave:  latencyAgentToSlave,
-		LatencySlaveExecution: latencySlaveExecution,
-		VolumeGuardSpecAge:   volumeGuardSpecAge,
-		RoutingMode:          routingMode,     // i2
-		AccountLookup:        accountLookup,   // i2
-		SymbolsLookup:        symbolsLookup,   // i3
-		SymbolsReported:      symbolsReported, // i3
-		SymbolsValidate:      symbolsValidate, // i3
-		SymbolsLoaded:        symbolsLoaded,   // i3
+		IntentReceived:             intentReceived,
+		IntentForwarded:            intentForwarded,
+		OrderCreated:               orderCreated,
+		OrderSent:                  orderSent,
+		ExecutionDispatched:        executionDispatched,
+		ExecutionCompleted:         executionCompleted,
+		VolumeClamp:                volumeClamp,
+		VolumeGuardDecision:        volumeGuardDecision,
+		AgentSpecsForwarded:        agentSpecsForwarded,
+		AgentSpecsFiltered:         agentSpecsFiltered,
+		RiskPolicyLookup:           riskPolicyLookup,
+		HandshakeVersion:           handshakeVersion,
+		HandshakeStatus:            handshakeStatus,
+		HandshakeSymbolIssue:       handshakeSymbolIssue,
+		HandshakeReconcileSkipped:  handshakeReconcileSkipped,
+		AgentHandshakeForwarded:    agentHandshakeForwarded,
+		AgentHandshakeBlocked:      agentHandshakeBlocked,
+		AgentHandshakeForwardError: agentHandshakeForwardError,
+		LatencyE2E:                 latencyE2E,
+		LatencyAgentToCore:         latencyAgentToCore,
+		LatencyCoreProcess:         latencyCoreProcess,
+		LatencyCoreToAgent:         latencyCoreToAgent,
+		LatencyAgentToSlave:        latencyAgentToSlave,
+		LatencySlaveExecution:      latencySlaveExecution,
+		VolumeGuardSpecAge:         volumeGuardSpecAge,
+		HandshakeFeedbackLatency:   handshakeFeedbackLatency,
+		RoutingMode:                routingMode,     // i2
+		AccountLookup:              accountLookup,   // i2
+		SymbolsLookup:              symbolsLookup,   // i3
+		SymbolsReported:            symbolsReported, // i3
+		SymbolsValidate:            symbolsValidate, // i3
+		SymbolsLoaded:              symbolsLoaded,   // i3
 	}, nil
 }
 
@@ -519,3 +607,79 @@ func (m *EchoMetrics) RecordRiskPolicyLookup(ctx context.Context, result string,
 	m.RiskPolicyLookup.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
 }
 
+// RecordHandshakeVersion registra la evaluación de handshake por versión y estado global.
+func (m *EchoMetrics) RecordHandshakeVersion(ctx context.Context, version int, status string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.Int("protocol_version", version),
+		attribute.String("status", status),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.HandshakeVersion.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordSymbolRegistration registra el resultado de registro por símbolo.
+func (m *EchoMetrics) RecordSymbolRegistration(ctx context.Context, status string, canonical string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("status", status),
+		attribute.String("canonical_symbol", canonical),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.HandshakeStatus.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordSymbolRegistrationIssue registra issues observados durante la evaluación.
+func (m *EchoMetrics) RecordSymbolRegistrationIssue(ctx context.Context, issue string, scope string, canonical string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("issue", issue),
+	}
+	if scope != "" {
+		baseAttrs = append(baseAttrs, attribute.String("scope", scope))
+	}
+	if canonical != "" {
+		baseAttrs = append(baseAttrs, attribute.String("canonical_symbol", canonical))
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.HandshakeSymbolIssue.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordAgentHandshakeForwarded registra feedback reenviado por el Agent.
+func (m *EchoMetrics) RecordAgentHandshakeForwarded(ctx context.Context, status string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("status", status),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.AgentHandshakeForwarded.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordAgentHandshakeBlocked registra bloqueos tempranos en el Agent.
+func (m *EchoMetrics) RecordAgentHandshakeBlocked(ctx context.Context, reason string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{}
+	if reason != "" {
+		baseAttrs = append(baseAttrs, attribute.String("reason", reason))
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.AgentHandshakeBlocked.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordAgentHandshakeForwardError registra errores al reenviar feedback al EA.
+func (m *EchoMetrics) RecordAgentHandshakeForwardError(ctx context.Context, reason string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{}
+	if reason != "" {
+		baseAttrs = append(baseAttrs, attribute.String("reason", reason))
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.AgentHandshakeForwardError.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordHandshakeReconcileSkipped registra re-evaluaciones omitidas por falta de cambios.
+func (m *EchoMetrics) RecordHandshakeReconcileSkipped(ctx context.Context, attrs ...attribute.KeyValue) {
+	if m.HandshakeReconcileSkipped == nil {
+		return
+	}
+	m.HandshakeReconcileSkipped.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordHandshakeFeedbackLatency registra la latencia total del feedback handshake.
+func (m *EchoMetrics) RecordHandshakeFeedbackLatency(ctx context.Context, latencyMs float64, attrs ...attribute.KeyValue) {
+	m.HandshakeFeedbackLatency.Record(ctx, latencyMs, metric.WithAttributes(attrs...))
+}

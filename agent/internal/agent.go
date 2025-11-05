@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/xKoRx/echo/sdk/domain/handshake"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
 	"github.com/xKoRx/echo/sdk/telemetry/metricbundle"
@@ -45,6 +46,11 @@ type Agent struct {
 	// Estado
 	mu     sync.RWMutex
 	closed bool
+
+	handshakeMu      sync.RWMutex
+	handshakeStatus  map[string]handshake.RegistrationStatus
+	evaluationMu     sync.RWMutex
+	lastEvaluationID map[string]string
 }
 
 // New crea una nueva instancia de Agent (i1).
@@ -85,12 +91,14 @@ func New(ctx context.Context) (*Agent, error) {
 	}
 
 	agent := &Agent{
-		config:       config,
-		sendToCoreCh: make(chan *pb.AgentMessage, config.SendQueueSize),
-		telemetry:    telClient,
-		echoMetrics:  echoMetrics,
-		ctx:          agentCtx,
-		cancel:       cancel,
+		config:           config,
+		sendToCoreCh:     make(chan *pb.AgentMessage, config.SendQueueSize),
+		telemetry:        telClient,
+		echoMetrics:      echoMetrics,
+		ctx:              agentCtx,
+		cancel:           cancel,
+		handshakeStatus:  make(map[string]handshake.RegistrationStatus),
+		lastEvaluationID: make(map[string]string),
 	}
 
 	return agent, nil
@@ -132,6 +140,7 @@ func (a *Agent) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to create pipe manager: %w", err)
 	}
+	pipeManager.SetHandshakeCallback(a.markHandshakePending)
 	a.pipeManager = pipeManager
 
 	// 4. Iniciar gestión de pipes (bloquea hasta ctx.Done)
@@ -195,10 +204,75 @@ func (a *Agent) logInfo(message string, fields map[string]interface{}) {
 	a.telemetry.Info(a.ctx, message, attrs...)
 }
 
+func (a *Agent) logDebug(message string, fields map[string]interface{}) {
+	attrs := mapToAttrs(fields)
+	a.telemetry.Debug(a.ctx, message, attrs...)
+}
+
 // logError loggea un mensaje ERROR.
 func (a *Agent) logError(message string, err error, fields map[string]interface{}) {
 	attrs := mapToAttrs(fields)
-	a.telemetry.Error(a.ctx, message, err, attrs...)
+
+	if err != nil {
+		a.telemetry.Error(a.ctx, message, err, attrs...)
+	} else {
+		a.telemetry.Error(a.ctx, message, fmt.Errorf("unknown error"), attrs...)
+	}
+}
+
+func (a *Agent) setHandshakeStatus(accountID string, status handshake.RegistrationStatus) {
+	if accountID == "" {
+		return
+	}
+	a.handshakeMu.Lock()
+	a.handshakeStatus[accountID] = status
+	a.handshakeMu.Unlock()
+}
+
+func (a *Agent) setLastEvaluationID(accountID, evaluationID string) {
+	if accountID == "" || evaluationID == "" {
+		return
+	}
+	a.evaluationMu.Lock()
+	a.lastEvaluationID[accountID] = evaluationID
+	a.evaluationMu.Unlock()
+}
+
+func (a *Agent) getLastEvaluationID(accountID string) string {
+	if accountID == "" {
+		return ""
+	}
+	a.evaluationMu.RLock()
+	evaluationID := a.lastEvaluationID[accountID]
+	a.evaluationMu.RUnlock()
+	return evaluationID
+}
+
+func (a *Agent) getHandshakeStatus(accountID string) handshake.RegistrationStatus {
+	if accountID == "" {
+		return handshake.RegistrationStatusUnspecified
+	}
+	a.handshakeMu.RLock()
+	status, ok := a.handshakeStatus[accountID]
+	a.handshakeMu.RUnlock()
+	if !ok {
+		return handshake.RegistrationStatusUnspecified
+	}
+	return status
+}
+
+func (a *Agent) markHandshakePending(accountID string) {
+	a.setHandshakeStatus(accountID, handshake.RegistrationStatusUnspecified)
+	a.clearLastEvaluationID(accountID)
+}
+
+func (a *Agent) clearLastEvaluationID(accountID string) {
+	if accountID == "" {
+		return
+	}
+	a.evaluationMu.Lock()
+	delete(a.lastEvaluationID, accountID)
+	a.evaluationMu.Unlock()
 }
 
 // logWarn loggea un mensaje WARN.

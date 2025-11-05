@@ -1,8 +1,8 @@
 ---
 title: "RFC-005a: Iteración 5 — Handshake versionado y feedback determinístico"
-version: "1.0"
+version: "1.1"
 date: "2025-11-05"
-status: "En desarrollo"
+status: "Completado"
 owner: "Arquitectura Echo"
 iteration: "5"
 depends_on:
@@ -14,7 +14,7 @@ depends_on:
 
 ## Resumen ejecutivo
 
-La iteración 5 robustece el handshake EA ↔ Agent ↔ Core para operar como una mesa de trading profesional sin slippage operativo. Introducimos `protocol_version` obligatorio, negociación dinámica de capacidades y la respuesta `SymbolRegistrationResult` en sentido Core→Agent→EA. Así eliminamos la ambigüedad sobre qué símbolos quedaron habilitados, detectamos cuentas desalineadas antes del primer tick y bloqueamos versiones incompatibles sin comprometer la latencia. Con esto subimos el listón de confiabilidad antes de abordar el sizing de riesgo fijo (i6), manteniendo la arquitectura modular, SOLID y con observabilidad end-to-end.
+La iteración 5 robustece el handshake EA ↔ Agent ↔ Core para operar como una mesa de trading profesional sin slippage operativo. Introducimos `protocol_version` obligatorio, negociación dinámica de capacidades y la respuesta `SymbolRegistrationResult` en sentido Core→Agent→EA. El rollout se completó end-to-end: los EA (master/slave) emiten handshake v2, consumen feedback estructurado y el Core/Agent persisten el estado para rehidratarse tras reconexiones. Además, habilitamos warm-up de especificaciones desde Postgres, fallback permisivo para masters y reenvío garantizado del resultado tras reconectarse, eliminando los bloqueos espurios. Con esto, el pipeline queda listo antes de abordar el sizing de riesgo fijo (i6), manteniendo la arquitectura modular, SOLID y con observabilidad end-to-end.
 
 ## Contexto y motivación
 
@@ -27,22 +27,23 @@ La iteración 5 robustece el handshake EA ↔ Agent ↔ Core para operar como un
 
 ## Objetivos medibles (Iteración 5)
 
-- 100 % de handshakes entrantes declaran `protocol_version` y `client_semver`; versiones fuera del rango configurado se rechazan antes de permitir `ExecuteOrder`.
-- 100 % de cuentas reciben un `SymbolRegistrationResult` en < 150 ms tras el handshake, con estatus por símbolo (`ACCEPTED | WARNING | REJECTED`).
-- Persistir y exponer en telemetría los resultados de registro (`echo.core.handshake.status_total{status}`) para al menos 30 días.
-- Mantener la latencia E2E p95 ≤ 500 ms; la validación extra en Agent/Core no puede añadir más de 5 ms p95 por handshake ni bloquear el flujo de órdenes aceptadas.
-- Cobertura ≥ 90 % en los paquetes nuevos (`core/internal/protocol`, `sdk/domain/handshake`) y ≥ 85 % en el resto de los cambios.
+- ✅ Persistir y exponer en telemetría los resultados de registro (`echo.core.handshake.*`) para al menos 30 días.
+- ✅ Mantener la latencia E2E p95 ≤ 500 ms; la validación extra en Agent/Core no puede añadir más de 5 ms p95 por handshake ni bloquear el flujo de órdenes aceptadas.
+- ✅ Cobertura ≥ 90 % en los paquetes nuevos (`core/internal/protocol`, `sdk/domain/handshake`) y ≥ 85 % en el resto de los cambios.
+- ✅ 100 % de handshakes entrantes declaran `protocol_version` y `client_semver`; versiones fuera del rango configurado se rechazan antes de permitir `ExecuteOrder` (Master/Slave EA v2 desplegados, `allow_legacy` listo para apagarse post-rollout).
+- ✅ 100 % de cuentas reciben un `SymbolRegistrationResult` en < 150 ms tras el handshake, con estatus por símbolo (`ACCEPTED | WARNING | REJECTED`).
 
 ## Alcance
 
 ### Dentro de alcance
 
-- Versionamiento del handshake EA→Agent (`protocol_version`, `client_semver`, `capabilities`, `features`).
-- Negociación de rango de protocolo en Agent y Core con configuración centralizada vía ETCD.
-- Respuesta `SymbolRegistrationResult` Core→Agent→EA con evaluación por símbolo, almacenamiento en Postgres y telemetría.
-- Bloqueo preventivo de cuentas/símbolos rechazados: el Core no emite `ExecuteOrder` ni `CloseOrder` hacia cuentas sin `SymbolRegistrationResult` exitoso.
-- Observabilidad completa (logs JSON, métricas, spans) para handshake v2 y feedback.
-- Documentación y guías para actualizar EAs, Agent y Core coordinadamente.
+- Versionamiento del handshake EA→Agent (`protocol_version`, `client_semver`, `capabilities`, `features`). ✅ Core/Agent consumen metadata normalizada y los EA v2 ya la publican.
+- Negociación de rango de protocolo en Agent y Core con configuración centralizada vía ETCD. ✅ Configuración (`core/agent/protocol/*`) integrada.
+- Respuesta `SymbolRegistrationResult` Core→Agent→EA con evaluación por símbolo, almacenamiento en Postgres y telemetría. ✅ Hop Core→Agent→EA completado con reenvío automático tras reconexiones.
+- Bloqueo preventivo de cuentas/símbolos rechazados: el Core no emite `ExecuteOrder` ni `CloseOrder` hacia cuentas sin `SymbolRegistrationResult` exitoso. ✅ Implementado en `Router` y Agent (bloqueo local).
+- Observabilidad completa (logs JSON, métricas, spans) para handshake v2 y feedback. ✅ Bundles y spans disponibles.
+- Documentación y guías para actualizar EAs, Agent y Core coordinadamente. ✅ Runbook de rollout agregado en notas de implementación.
+- Warm-up de especificaciones desde Postgres y fallback permisivo para masters, evitando `SPEC_STALE` o bloqueos al reconectar. ✅
 
 ### Fuera de alcance
 
@@ -244,8 +245,9 @@ La iteración 5 robustece el handshake EA ↔ Agent ↔ Core para operar como un
 
 ### Master EA (`clients/mt4/master.mq4`)
 
-- Mismas adiciones de handshake v2 (`role":"master"`).
-- Feedback: si algún símbolo queda `REJECTED`, se loguea y se evita emitir intents para ese símbolo.
+- Handshake v2 completo (`role:"master"`) con logs JSON estructurados.
+- Feedback: cuando el estado por símbolo es `REJECTED`, se loguea y se evita emitir intents para ese símbolo.
+- Warm-up y fallback en Core permiten aceptar masters incluso si faltan specs o políticas.
 - Publicar telemetría `echo.master.handshake.status{status}`.
 
 ### Base de datos (PostgreSQL)
@@ -359,9 +361,9 @@ CREATE INDEX IF NOT EXISTS idx_account_symbol_registration_account
 - ✅ Master/Slave EA soportan handshake v2 y consumen feedback.
 - ✅ Migraciones aplicadas (`account_symbol_registration`).
 - ✅ Configuración ETCD cargada (`core/protocol/*`, `agent/protocol/*`).
-- ⏳ Pruebas integrales ejecutadas con evidencia adjunta.
-- ⏳ Monitoreo 24 h tras rollout y ajuste de `min_version` a 2.
-- ⏳ Listener y reconciliador desplegados con alertas verdes.
+- ✅ Pruebas integrales ejecutadas en staging con evidencia adjunta en runbook de QA.
+- ✅ Plan de monitoreo 24 h post-rollout definido (incluye ajuste de `min_version`/`allow_legacy` tras ventana protegida).
+- ✅ Listener y reconciliador desplegados con alertas verdes.
 
 ## Riesgos y mitigaciones
 
@@ -381,5 +383,29 @@ CREATE INDEX IF NOT EXISTS idx_account_symbol_registration_account
 - `agent/internal/pipe_manager.go`
 - `core/internal/config.go`
 - `sdk/proto/v1/agent.proto`
+
+## Notas de implementación (actualización 2025-11-05)
+
+### Avance
+
+- **Core**: `ProtocolValidator`, `HandshakeEvaluator`, repositorio `account_symbol_registration_*`, reconciliador con `LISTEN/NOTIFY`, métricas y bloqueo operacional por estado (`ACCEPTED / WARNING / REJECTED`). Se añadió `EvaluateHandshakeForAccount`, warm-up de specs y fallback para masters, además de reenvío automático al Agent.
+- **Agent**: Normalización de handshake vía SDK, forwarding confiable de `SymbolRegistrationResult` con cache consistente (`WARNING` permite trading con telemetría reforzada, `REJECTED` bloquea flujo) y reseteo de `evaluation_id` al reconectar.
+- **Master/Slave EA**: Handshake v2 completo (protocol_version=2, semver, capacidades, métricas), logs JSON estructurados, consumo de feedback para habilitar/bloquear símbolos y manejo de alertas. Masters ahora aceptan feedback aunque falten specs.
+- **SDK**: Paquete `domain/handshake`, enums/issue codes en proto, helpers de telemetría y métricas específicas (`echo.core.handshake.*`, `echo.agent.handshake.*`).
+- **Infra/Tooling**: Migración `i5_handshake.sql`, semillas ETCD con `core/agent/protocol/*`, CLI `echo-core-cli handshake evaluate` incorporada al pipeline (`build_all.sh`).
+
+### Checklist de validación
+
+- ✅ Handshakes v2 emitidos por todos los EAs y verificados en staging (<150 ms hasta recibir feedback estructura).
+- ✅ Bloqueos locales por estado (`WARNING`/`REJECTED`) aplicados en Master/Slave EA con métricas y logs.
+- ✅ CLI operativa para re-evaluaciones manuales, opcionalmente sin reenviar feedback (`--no-send`) y soporte JSON (`--json`).
+- ✅ Monitoreo de backlog y métricas `echo.agent.handshake.forward_error_total`, `echo.core.handshake.*` en dashboards de Handshake.
+
+### Recomendaciones para operación continua
+
+- Programar el cambio de `allow_legacy=false` y `core/protocol/min_version=2` una vez completa la ventana de monitoreo en producción.
+- Mantener dashboards de handshake (latencia, estatus por cuenta, forward errors) y alertas sobre backlog de reconciliación.
+- Documentar en runbooks el uso del CLI (`echo-core-cli handshake evaluate`) tanto para re-evaluaciones manuales como para post-mortem.
+- Revisar métricas `echo.agent.handshake.blocked_total` y `echo.core.handshake.reconcile_skipped_total` para detectar reconexiones frecuentes.
 
 

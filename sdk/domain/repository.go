@@ -4,6 +4,7 @@ package domain
 import (
 	"context"
 
+	"github.com/xKoRx/echo/sdk/domain/handshake"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 )
 
@@ -154,7 +155,7 @@ type SymbolRepository interface {
 // SymbolSpecRepository define operaciones para persistir especificaciones de símbolos.
 type SymbolSpecRepository interface {
 	UpsertSpecifications(ctx context.Context, accountID string, specs []*pb.SymbolSpecification, reportedAtMs int64) error
-	GetSpecifications(ctx context.Context, accountID string) (map[string]*pb.SymbolSpecification, error)
+	GetSpecifications(ctx context.Context, accountID string) (map[string]*AccountSymbolSpec, error)
 }
 
 // SymbolQuoteRepository define operaciones para snapshots de precios.
@@ -185,4 +186,11 @@ type RepositoryFactory interface {
 	SymbolSpecRepository() SymbolSpecRepository
 	SymbolQuoteRepository() SymbolQuoteRepository
 	RiskPolicyRepository() RiskPolicyRepository
+	HandshakeRepository() HandshakeEvaluationRepository
+}
+
+// HandshakeEvaluationRepository define operaciones para persistir evaluaciones de handshake.
+type HandshakeEvaluationRepository interface {
+	CreateEvaluation(ctx context.Context, evaluation *handshake.Evaluation) error
+	GetLatestByAccount(ctx context.Context, accountID string) (*handshake.Evaluation, error)
 }

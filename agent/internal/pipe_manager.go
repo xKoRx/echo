@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/xKoRx/echo/sdk/domain"
+	"github.com/xKoRx/echo/sdk/domain/handshake"
 	"github.com/xKoRx/echo/sdk/ipc"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
@@ -19,6 +20,7 @@ import (
 	"github.com/xKoRx/echo/sdk/telemetry/semconv"
 	"github.com/xKoRx/echo/sdk/utils"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // preview devuelve los primeros n caracteres seguros para log
@@ -59,6 +61,11 @@ type PipeManager struct {
 
 	// i2: Agent ID para notificaciones AccountConnected/AccountDisconnected
 	agentID string
+
+	onHandshake        func(string)
+	protocolMinVersion int
+	protocolMaxVersion int
+	allowLegacy        bool
 }
 
 // NewPipeManager crea un nuevo PipeManager.
@@ -66,15 +73,22 @@ func NewPipeManager(ctx context.Context, config *Config, tel *telemetry.Client, 
 	pmCtx, cancel := context.WithCancel(ctx)
 
 	pm := &PipeManager{
-		config:      config,
-		telemetry:   tel,
-		echoMetrics: metrics,
-		pipes:       make(map[string]*PipeHandler),
-		ctx:         pmCtx,
-		cancel:      cancel,
+		config:             config,
+		telemetry:          tel,
+		echoMetrics:        metrics,
+		pipes:              make(map[string]*PipeHandler),
+		ctx:                pmCtx,
+		cancel:             cancel,
+		protocolMinVersion: config.ProtocolMinVersion,
+		protocolMaxVersion: config.ProtocolMaxVersion,
+		allowLegacy:        config.ProtocolAllowLegacy,
 	}
 
 	return pm, nil
+}
+
+func (pm *PipeManager) SetHandshakeCallback(cb func(string)) {
+	pm.onHandshake = cb
 }
 
 // Start inicia la gestión de pipes.
@@ -130,16 +144,20 @@ func (pm *PipeManager) createPipe(name, role, accountID string) error {
 
 	// Crear handler
 	handler := &PipeHandler{
-		name:             name,
-		role:             role,
-		accountID:        accountID,
-		server:           pipeServer,
-		canonicalSymbols: pm.config.CanonicalSymbols,
-		telemetry:        pm.telemetry,
-		echoMetrics:      pm.echoMetrics,
-		sendToCoreCh:     pm.sendToCoreCh,
-		agentID:          pm.agentID, // i2: Pasar agentID al handler
-		ctx:              pm.ctx,
+		name:               name,
+		role:               role,
+		accountID:          accountID,
+		server:             pipeServer,
+		canonicalSymbols:   pm.config.CanonicalSymbols,
+		telemetry:          pm.telemetry,
+		echoMetrics:        pm.echoMetrics,
+		sendToCoreCh:       pm.sendToCoreCh,
+		agentID:            pm.agentID, // i2: Pasar agentID al handler
+		ctx:                pm.ctx,
+		onHandshake:        pm.onHandshake,
+		allowLegacy:        pm.allowLegacy,
+		protocolMinVersion: pm.protocolMinVersion,
+		protocolMaxVersion: pm.protocolMaxVersion,
 	}
 
 	// Registrar pipe
@@ -228,6 +246,11 @@ type PipeHandler struct {
 
 	// Cache local para filtrar reportes repetidos
 	lastSpecReportMs int64
+
+	onHandshake        func(string)
+	protocolMinVersion int
+	protocolMaxVersion int
+	allowLegacy        bool
 }
 
 // Run ejecuta el loop principal del handler.
@@ -632,69 +655,74 @@ func (h *PipeHandler) handleCloseResult(msgMap map[string]interface{}) error {
 //
 // Extrae symbols del handshake y envía AccountSymbolsReport al Core si están presentes.
 func (h *PipeHandler) handleHandshake(msgMap map[string]interface{}) error {
-	h.logInfo("Handshake received", map[string]interface{}{
-		"pipe_name": h.name,
-		"role":      h.role,
-	})
-
-	// i3: Extraer symbols del handshake (opcional)
-	payload, ok := msgMap["payload"].(map[string]interface{})
-	if !ok {
-		// No hay payload o payload inválido - continuar sin símbolos (compatibilidad)
-		return nil
+	normalized, err := handshake.NormalizeHandshakePayload(msgMap)
+	if err != nil {
+		h.logWarn("Failed to normalize handshake", map[string]interface{}{
+			"error":     err.Error(),
+			"pipe_name": h.name,
+		})
+		return err
 	}
 
-	symbolsRaw, ok := payload["symbols"].([]interface{})
-	if !ok || len(symbolsRaw) == 0 {
-		// No hay symbols en handshake - continuar sin reporte (compatibilidad i3)
-		h.logInfo("Handshake without symbols (i3 compatibility)", map[string]interface{}{
-			"account_id": h.accountID,
+	accountID := normalized.AccountID
+	if accountID == "" {
+		accountID = h.accountID
+	}
+	pipeRole := normalized.PipeRole
+	if pipeRole == "" {
+		pipeRole = h.role
+	}
+
+	if h.onHandshake != nil {
+		h.onHandshake(accountID)
+	}
+
+	if normalized.Legacy && !h.allowLegacy {
+		h.logWarn("Legacy handshake blocked by configuration", map[string]interface{}{
+			"account_id": accountID,
+			"pipe_role":  pipeRole,
 		})
 		return nil
 	}
 
-	// Convertir symbols de JSON a proto SymbolMapping
-	mappings := make([]*pb.SymbolMapping, 0, len(symbolsRaw))
-	for _, symRaw := range symbolsRaw {
-		symMap, ok := symRaw.(map[string]interface{})
-		if !ok {
-			h.logWarn("Invalid symbol format in handshake", map[string]interface{}{
-				"account_id": h.accountID,
-			})
-			continue
-		}
-
-		mapping := &pb.SymbolMapping{
-			BrokerSymbol:    utils.ExtractString(symMap, "broker_symbol"),
-			CanonicalSymbol: utils.ExtractString(symMap, "canonical_symbol"),
-			Digits:          int32(utils.ExtractInt64(symMap, "digits")),
-			Point:           utils.ExtractFloat64(symMap, "point"),
-			TickSize:        utils.ExtractFloat64(symMap, "tick_size"),
-			MinLot:          utils.ExtractFloat64(symMap, "min_lot"),
-			MaxLot:          utils.ExtractFloat64(symMap, "max_lot"),
-			LotStep:         utils.ExtractFloat64(symMap, "lot_step"),
-			StopLevel:       int32(utils.ExtractInt64(symMap, "stop_level")),
-		}
-
-		// ContractSize es opcional
-		if contractSize, ok := symMap["contract_size"].(float64); ok {
-			mapping.ContractSize = &contractSize
-		}
-
-		mappings = append(mappings, mapping)
+	if h.protocolMinVersion > 0 && normalized.ProtocolVersion < h.protocolMinVersion {
+		h.logWarn("Handshake protocol version below minimum", map[string]interface{}{
+			"account_id":       accountID,
+			"protocol_version": normalized.ProtocolVersion,
+			"min_version":      h.protocolMinVersion,
+		})
+	}
+	if h.protocolMaxVersion > 0 && normalized.ProtocolVersion > h.protocolMaxVersion {
+		h.logWarn("Handshake protocol version above maximum", map[string]interface{}{
+			"account_id":       accountID,
+			"protocol_version": normalized.ProtocolVersion,
+			"max_version":      h.protocolMaxVersion,
+		})
 	}
 
-	if len(mappings) == 0 {
-		// No hay mappings válidos
+	if len(normalized.Symbols) == 0 {
+		h.logWarn("Handshake without symbols", map[string]interface{}{
+			"account_id": accountID,
+			"pipe_name":  h.name,
+		})
 		return nil
 	}
 
-	// Enviar AccountSymbolsReport al Core
 	report := &pb.AccountSymbolsReport{
-		AccountId:    h.accountID,
-		Symbols:      mappings,
+		AccountId:    accountID,
+		Symbols:      normalized.Symbols,
 		ReportedAtMs: utils.NowUnixMilli(),
+		Metadata:     normalized.ToProtoMetadata(),
 	}
+
+	h.logInfo("Handshake normalized", map[string]interface{}{
+		"account_id":        accountID,
+		"pipe_role":         pipeRole,
+		"protocol_version":  normalized.ProtocolVersion,
+		"client_semver":     normalized.ClientSemver,
+		"symbols_count":     len(normalized.Symbols),
+		"required_features": strings.Join(normalized.RequiredFeatures, ","),
+	})
 
 	agentMsg := &pb.AgentMessage{
 		AgentId:     h.agentID,
@@ -706,9 +734,9 @@ func (h *PipeHandler) handleHandshake(msgMap map[string]interface{}) error {
 
 	select {
 	case h.sendToCoreCh <- agentMsg:
-		h.logInfo("AccountSymbolsReport sent to Core (i3)", map[string]interface{}{
-			"account_id":    h.accountID,
-			"symbols_count": len(mappings),
+		h.logInfo("AccountSymbolsReport sent to Core (i5)", map[string]interface{}{
+			"account_id":    accountID,
+			"symbols_count": len(report.Symbols),
 		})
 	case <-h.ctx.Done():
 		return h.ctx.Err()
@@ -840,7 +868,7 @@ func (h *PipeHandler) handleSymbolSpecReport(msgMap map[string]interface{}) erro
 
 	select {
 	case h.sendToCoreCh <- agentMsg:
-		h.logInfo("SymbolSpecReport forwarded to Core", map[string]interface{}{
+		h.logDebug("SymbolSpecReport forwarded to Core", map[string]interface{}{
 			"account_id":    accountID,
 			"symbols_count": len(validSpecs),
 			"spec_age_ms":   specAgeMs,
@@ -1209,6 +1237,43 @@ func (h *PipeHandler) WriteMessage(msg interface{}) error {
 	// Escribir usando SDK
 	if err := writer.WriteMessage(jsonMap); err != nil {
 		return fmt.Errorf("failed to write message: %w", err)
+	}
+
+	return nil
+}
+
+func (h *PipeHandler) WriteSymbolRegistrationResult(result *pb.SymbolRegistrationResult) error {
+	if result == nil {
+		return fmt.Errorf("nil symbol registration result")
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closed {
+		return fmt.Errorf("pipe is closed")
+	}
+
+	writer := ipc.NewJSONWriter(h.server)
+	marshaler := protojson.MarshalOptions{EmitUnpopulated: true}
+	data, err := marshaler.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal symbol registration result: %w", err)
+	}
+
+	payload, err := utils.JSONToMap(data)
+	if err != nil {
+		return fmt.Errorf("transform symbol registration payload: %w", err)
+	}
+
+	message := map[string]interface{}{
+		"type":         "symbol_registration_result",
+		"timestamp_ms": utils.NowUnixMilli(),
+		"payload":      payload,
+	}
+
+	if err := writer.WriteMessage(message); err != nil {
+		return fmt.Errorf("write symbol registration result: %w", err)
 	}
 
 	return nil

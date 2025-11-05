@@ -26,6 +26,7 @@ type SymbolSpecService struct {
 	telemetry *telemetry.Client
 	metrics   *metricbundle.EchoMetrics
 	whitelist []string
+	onChange  func(string)
 }
 
 func NewSymbolSpecService(repo domain.SymbolSpecRepository, tel *telemetry.Client, metrics *metricbundle.EchoMetrics, whitelist []string) *SymbolSpecService {
@@ -97,7 +98,7 @@ func (s *SymbolSpecService) Upsert(ctx context.Context, report *pb.SymbolSpecRep
 	s.metrics.RecordSymbolsReported(ctx, accountID, len(report.Symbols),
 		attribute.String("source", "symbol_spec_report"),
 	)
-	s.telemetry.Info(ctx, "Symbol specifications upserted",
+	s.telemetry.Debug(ctx, "Symbol specifications upserted",
 		attribute.String("account_id", accountID),
 		attribute.Int("symbols_count", len(report.Symbols)),
 	)
@@ -116,6 +117,8 @@ func (s *SymbolSpecService) Upsert(ctx context.Context, report *pb.SymbolSpecRep
 			attribute.Int64("reported_at_ms", reportedAt),
 		)
 	}
+
+	s.emitChange(accountID)
 
 	return nil
 }
@@ -191,5 +194,66 @@ func (s *SymbolSpecService) SpecAge(accountID, canonical string) (time.Duration,
 func (s *SymbolSpecService) Invalidate(accountID string) {
 	s.mu.Lock()
 	delete(s.specs, accountID)
+	s.mu.Unlock()
+
+	s.emitChange(accountID)
+}
+
+// SetOnChange registra un callback para cambios en especificaciones.
+func (s *SymbolSpecService) SetOnChange(cb func(string)) {
+	s.mu.Lock()
+	s.onChange = cb
+	s.mu.Unlock()
+}
+
+func (s *SymbolSpecService) emitChange(accountID string) {
+	s.mu.RLock()
+	cb := s.onChange
+	s.mu.RUnlock()
+	if cb != nil && accountID != "" {
+		cb(accountID)
+	}
+}
+
+// WarmAccount hidrata la caché desde la persistencia para una cuenta específica.
+func (s *SymbolSpecService) WarmAccount(ctx context.Context, accountID string) {
+	if s.repo == nil || accountID == "" {
+		return
+	}
+
+	s.mu.RLock()
+	_, exists := s.specs[accountID]
+	s.mu.RUnlock()
+	if exists {
+		return
+	}
+
+	specs, err := s.repo.GetSpecifications(ctx, accountID)
+	if err != nil {
+		if s.telemetry != nil {
+			s.telemetry.Warn(ctx, "Failed to warm symbol specifications",
+				attribute.String("account_id", accountID),
+				attribute.String("error", err.Error()),
+			)
+		}
+		return
+	}
+	if len(specs) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	if s.specs[accountID] == nil {
+		s.specs[accountID] = make(map[string]*specCacheEntry, len(specs))
+	}
+	for canonical, record := range specs {
+		if record == nil || record.Specification == nil {
+			continue
+		}
+		s.specs[accountID][canonical] = &specCacheEntry{
+			spec:         proto.Clone(record.Specification).(*pb.SymbolSpecification),
+			reportedAtMs: record.ReportedAtMs,
+		}
+	}
 	s.mu.Unlock()
 }

@@ -32,6 +32,7 @@ type OwnershipRecord struct {
 	AccountID    string
 	RegisteredAt time.Time
 	LastSeenAt   time.Time // actualizado en cada heartbeat (opcional i3+)
+	PipeRole     string
 }
 
 // NewAccountRegistry crea un nuevo registry.
@@ -47,7 +48,7 @@ func NewAccountRegistry(tel *telemetry.Client) *AccountRegistry {
 //
 // Si la cuenta ya está registrada a OTRO Agent, sobreescribe (last-write-wins).
 // Log WARNING si hay cambio de ownership.
-func (r *AccountRegistry) RegisterAccount(agentID string, accountID string) {
+func (r *AccountRegistry) RegisterAccount(agentID string, accountID string, pipeRole string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -68,6 +69,9 @@ func (r *AccountRegistry) RegisterAccount(agentID string, accountID string) {
 		} else {
 			// Mismo agente, actualizar timestamp (re-registro, posible reconexión)
 			existing.LastSeenAt = now
+			if pipeRole != "" {
+				existing.PipeRole = pipeRole
+			}
 			r.telemetry.Info(nil, "Account re-registered to same Agent (i2)",
 				attribute.String("account_id", accountID),
 				attribute.String("agent_id", agentID),
@@ -82,6 +86,7 @@ func (r *AccountRegistry) RegisterAccount(agentID string, accountID string) {
 		AccountID:    accountID,
 		RegisteredAt: now,
 		LastSeenAt:   now,
+		PipeRole:     pipeRole,
 	}
 
 	// Añadir a índice inverso
@@ -90,6 +95,7 @@ func (r *AccountRegistry) RegisterAccount(agentID string, accountID string) {
 	r.telemetry.Info(nil, "Account registered to Agent (i2)",
 		attribute.String("agent_id", agentID),
 		attribute.String("account_id", accountID),
+		attribute.String("pipe_role", pipeRole),
 	)
 }
 
@@ -157,6 +163,18 @@ func (r *AccountRegistry) GetOwner(accountID string) (string, bool) {
 		return "", false
 	}
 	return record.AgentID, true
+}
+
+// GetRecord retorna una copia del OwnershipRecord para la cuenta.
+func (r *AccountRegistry) GetRecord(accountID string) (OwnershipRecord, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	record, found := r.accountToOwner[accountID]
+	if !found || record == nil {
+		return OwnershipRecord{}, false
+	}
+	return *record, true
 }
 
 // GetAccountsByAgent retorna todas las cuentas de un Agent (diagnóstico).

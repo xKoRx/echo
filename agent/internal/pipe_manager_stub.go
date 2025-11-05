@@ -28,6 +28,8 @@ func (pm *PipeManager) Start(sendToCoreCh chan *pb.AgentMessage, agentID string)
 	return fmt.Errorf("Named Pipes are only supported on Windows")
 }
 
+func (pm *PipeManager) SetHandshakeCallback(cb func(string)) {}
+
 // GetPipe retorna nil en plataformas no-Windows.
 func (pm *PipeManager) GetPipe(name string) (*PipeHandler, bool) {
 	return nil, false
@@ -43,6 +45,10 @@ type PipeHandler struct{}
 
 // WriteMessage retorna error en plataformas no-Windows.
 func (h *PipeHandler) WriteMessage(msg interface{}) error {
+	return fmt.Errorf("Named Pipes are only supported on Windows")
+}
+
+func (h *PipeHandler) WriteSymbolRegistrationResult(result *pb.SymbolRegistrationResult) error {
 	return fmt.Errorf("Named Pipes are only supported on Windows")
 }
 

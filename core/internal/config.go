@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/xKoRx/echo/sdk/domain"
+	"github.com/xKoRx/echo/sdk/domain/handshake"
 	"github.com/xKoRx/echo/sdk/etcd"
 )
 
@@ -39,6 +40,7 @@ type Config struct {
 	SlaveAccounts    []string      // core/slave_accounts (comma separated)
 	VolumeGuard      *domain.VolumeGuardPolicy
 	Risk             RiskConfig
+	Protocol         ProtocolConfig
 
 	// PostgreSQL
 	PostgresHost        string // postgres/host
@@ -61,6 +63,16 @@ type Config struct {
 type RiskConfig struct {
 	MissingPolicy string
 	CacheTTL      time.Duration
+}
+
+// ProtocolConfig agrupa configuración de versionado de handshake.
+type ProtocolConfig struct {
+	MinVersion       int
+	MaxVersion       int
+	BlockedVersions  []int
+	RequiredFeatures []string
+	RetryInterval    time.Duration
+	VersionRange     *handshake.VersionRange
 }
 
 // LoadConfig carga configuración desde ETCD.
@@ -111,14 +123,21 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		Environment:         env,
 		LogLevel:            "INFO",
 		VolumeGuard: &domain.VolumeGuardPolicy{
-			OnMissingSpec: domain.VolumeGuardMissingSpecReject,
-			MaxSpecAge:    10 * time.Second,
+			OnMissingSpec:  domain.VolumeGuardMissingSpecReject,
+			MaxSpecAge:     10 * time.Second,
 			AlertThreshold: 8 * time.Second,
-			DefaultLot:    0.10,
+			DefaultLot:     0.10,
 		},
 		Risk: RiskConfig{
 			MissingPolicy: "reject",
 			CacheTTL:      5 * time.Second,
+		},
+		Protocol: ProtocolConfig{
+			MinVersion:       handshake.ProtocolVersionV1,
+			MaxVersion:       handshake.ProtocolVersionV2,
+			BlockedVersions:  []int{},
+			RequiredFeatures: []string{},
+			RetryInterval:    5 * time.Minute,
 		},
 	}
 
@@ -252,6 +271,62 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		}
 	}
 
+	// Protocol versioning (i5)
+	protocolMin := cfg.Protocol.MinVersion
+	protocolMax := cfg.Protocol.MaxVersion
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/protocol/min_version", ""); err == nil && val != "" {
+		if min, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			protocolMin = min
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/protocol/max_version", ""); err == nil && val != "" {
+		if max, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			protocolMax = max
+		}
+	}
+	blockedVersions := make([]int, 0)
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/protocol/blocked_versions", ""); err == nil && val != "" {
+		parts := strings.Split(val, ",")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if version, err := strconv.Atoi(part); err == nil {
+				blockedVersions = append(blockedVersions, version)
+			} else {
+				return nil, fmt.Errorf("invalid blocked version '%s': %w", part, err)
+			}
+		}
+	}
+	requiredFeatures := cfg.Protocol.RequiredFeatures
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/protocol/required_features", ""); err == nil && val != "" {
+		parts := strings.Split(val, ",")
+		features := make([]string, 0, len(parts))
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed == "" {
+				continue
+			}
+			features = append(features, trimmed)
+		}
+		requiredFeatures = features
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/protocol/retry_interval_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && ms > 0 {
+			cfg.Protocol.RetryInterval = time.Duration(ms) * time.Millisecond
+		}
+	}
+	versionRange, err := handshake.NewVersionRange(protocolMin, protocolMax, blockedVersions)
+	if err != nil {
+		return nil, fmt.Errorf("invalid core protocol range: %w", err)
+	}
+	cfg.Protocol.MinVersion = protocolMin
+	cfg.Protocol.MaxVersion = protocolMax
+	cfg.Protocol.BlockedVersions = blockedVersions
+	cfg.Protocol.RequiredFeatures = requiredFeatures
+	cfg.Protocol.VersionRange = versionRange
+
 	// Cargar PostgreSQL
 	if val, err := etcdClient.GetVarWithDefault(ctx, "postgres/host", ""); err == nil && val != "" {
 		cfg.PostgresHost = val
@@ -328,6 +403,18 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	}
 	if cfg.Risk.CacheTTL <= 0 {
 		cfg.Risk.CacheTTL = 5 * time.Second
+	}
+	if cfg.Protocol.VersionRange == nil {
+		return nil, fmt.Errorf("protocol version range not configured")
+	}
+	if cfg.Protocol.RetryInterval <= 0 {
+		cfg.Protocol.RetryInterval = 5 * time.Minute
+	}
+	if cfg.Protocol.MinVersion > cfg.Protocol.MaxVersion {
+		return nil, fmt.Errorf("protocol min_version %d greater than max_version %d", cfg.Protocol.MinVersion, cfg.Protocol.MaxVersion)
+	}
+	if cfg.Protocol.RequiredFeatures == nil {
+		cfg.Protocol.RequiredFeatures = []string{}
 	}
 
 	return cfg, nil

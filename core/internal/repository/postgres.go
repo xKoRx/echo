@@ -28,6 +28,7 @@ type PostgresFactory struct {
 	symbolSpecRepo  domain.SymbolSpecRepository
 	symbolQuoteRepo domain.SymbolQuoteRepository
 	riskPolicyRepo  domain.RiskPolicyRepository
+	handshakeRepo   domain.HandshakeEvaluationRepository
 }
 
 // NewPostgresFactory crea un factory de repositorios PostgreSQL.
@@ -117,6 +118,14 @@ func (f *PostgresFactory) RiskPolicyRepository() domain.RiskPolicyRepository {
 		f.riskPolicyRepo = &postgresRiskPolicyRepo{db: f.db}
 	}
 	return f.riskPolicyRepo
+}
+
+// HandshakeRepository retorna el repositorio de evaluaciones de handshake.
+func (f *PostgresFactory) HandshakeRepository() domain.HandshakeEvaluationRepository {
+	if f.handshakeRepo == nil {
+		f.handshakeRepo = &postgresHandshakeRepo{db: f.db}
+	}
+	return f.handshakeRepo
 }
 
 // ===========================================================================
@@ -864,9 +873,9 @@ func (r *postgresSymbolSpecRepo) UpsertSpecifications(ctx context.Context, accou
 	return nil
 }
 
-func (r *postgresSymbolSpecRepo) GetSpecifications(ctx context.Context, accountID string) (map[string]*pb.SymbolSpecification, error) {
+func (r *postgresSymbolSpecRepo) GetSpecifications(ctx context.Context, accountID string) (map[string]*domain.AccountSymbolSpec, error) {
 	query := `
-		SELECT canonical_symbol, payload
+        SELECT canonical_symbol, payload, reported_at_ms
 		FROM echo.account_symbol_spec
 		WHERE account_id = $1
 	`
@@ -877,11 +886,12 @@ func (r *postgresSymbolSpecRepo) GetSpecifications(ctx context.Context, accountI
 	}
 	defer rows.Close()
 
-	result := make(map[string]*pb.SymbolSpecification)
+	result := make(map[string]*domain.AccountSymbolSpec)
 	for rows.Next() {
 		var canonical string
 		var payload []byte
-		if err := rows.Scan(&canonical, &payload); err != nil {
+		var reportedAtMs sql.NullInt64
+		if err := rows.Scan(&canonical, &payload, &reportedAtMs); err != nil {
 			return nil, fmt.Errorf("failed to scan symbol specification: %w", err)
 		}
 
@@ -890,7 +900,11 @@ func (r *postgresSymbolSpecRepo) GetSpecifications(ctx context.Context, accountI
 			return nil, fmt.Errorf("failed to unmarshal symbol specification: %w", err)
 		}
 
-		result[canonical] = &spec
+		result[canonical] = &domain.AccountSymbolSpec{
+			CanonicalSymbol: canonical,
+			Specification:   &spec,
+			ReportedAtMs:    reportedAtMs.Int64,
+		}
 	}
 
 	if err := rows.Err(); err != nil {
@@ -926,10 +940,10 @@ func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID 
 	row := r.db.QueryRowContext(ctx, query, accountID, strategyID)
 
 	var (
-		riskType string
-		lotSize sql.NullFloat64
-		version sql.NullInt64
-		updatedAt time.Time
+		riskType   string
+		lotSize    sql.NullFloat64
+		version    sql.NullInt64
+		updatedAt  time.Time
 		validUntil sql.NullTime
 	)
 

@@ -232,6 +232,13 @@ type AccountSymbolInfo struct {
 	ContractSize    *float64
 }
 
+// AccountSymbolSpec encapsula la especificación persistida de un símbolo por cuenta.
+type AccountSymbolSpec struct {
+	CanonicalSymbol string
+	Specification   *pb.SymbolSpecification
+	ReportedAtMs    int64
+}
+
 // ToAccountSymbolInfo convierte un SymbolMapping a AccountSymbolInfo.
 func (m *SymbolMapping) ToAccountSymbolInfo() *AccountSymbolInfo {
 	return &AccountSymbolInfo{
@@ -246,6 +253,26 @@ func (m *SymbolMapping) ToAccountSymbolInfo() *AccountSymbolInfo {
 		StopLevel:       m.StopLevel,
 		ContractSize:    m.ContractSize,
 	}
+}
+
+// ToSymbolMapping convierte AccountSymbolInfo en SymbolMapping.
+func (i *AccountSymbolInfo) ToSymbolMapping() *SymbolMapping {
+	if i == nil {
+		return nil
+	}
+	mapping := &SymbolMapping{
+		CanonicalSymbol: i.CanonicalSymbol,
+		BrokerSymbol:    i.BrokerSymbol,
+		Digits:          i.Digits,
+		Point:           i.Point,
+		TickSize:        i.TickSize,
+		MinLot:          i.MinLot,
+		MaxLot:          i.MaxLot,
+		LotStep:         i.LotStep,
+		StopLevel:       i.StopLevel,
+	}
+	mapping.ContractSize = i.ContractSize
+	return mapping
 }
 
 // SymbolSpecReport representa el reporte completo de especificaciones.

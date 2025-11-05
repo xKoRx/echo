@@ -22,7 +22,7 @@ La descripción completa del producto, responsabilidades por componente, contrat
 | i2b | Estabilidad post-routing | Manejo de desconexiones de EA, timeouts en canales, reducción de latencia. | ✅ |
 | i3 | Catálogo canónico y snapshots | `canonical_symbol ⇄ broker_symbol`, reportes 250 ms, persistencia en Postgres. | ✅ |
 | i4 | Especificaciones de broker & guardián de volumen | Caché/persistencia de specs, clamps previos a `ExecuteOrder`, políticas `FIXED_LOT` base. | ✅ |
-| i5 | Versionado de handshake y feedback | `protocol_version`, `SymbolRegistrationResult` Core→Agent→EA, validaciones tempranas. | ⏳ |
+| i5 | Versionado de handshake y feedback | `protocol_version`, `SymbolRegistrationResult` Core→Agent→EA, validaciones tempranas y tooling CLI. | ✅ |
 | i6 | Sizing con riesgo fijo (Modo A) | Cálculo con distancia a SL y tick value, uso de políticas `FIXED_RISK`. | ⏳ |
 | i7 | Filtros de spread y desvío | Aplicar tolerancias por cuenta×símbolo antes de abrir. | ⏳ |
 | i8a | SL/TP con offset | Offsets configurables en apertura, fallback si broker rechaza. | ⏳ |
@@ -36,6 +36,7 @@ La descripción completa del producto, responsabilidades por componente, contrat
 | i14 | Telemetría avanzada | Dashboards de funneles, histogramas de latencia, métricas de slippage/spread. | ⏳ |
 | i15 | Paquetización y operación | CLI/scripts, health checks, runbooks y automatización básica. | ⏳ |
 | i16 | Políticas operativas de trading | Límites globales (drawdown diario/total, apalancamiento, sizing máximo). | ⏳ |
+| i17 | Garantías de replicación determinista | End-to-end delivery con reintentos, quorum de acks y reconciliación automática de operaciones para evitar pérdidas. | ⏳ |
 | TBD | Event store Mongo | Almacenamiento append-only para auditoría y análisis. | ⏳ |
 | TBD | SymbolMappings en Master | Master EA consume catálogo canónico y publica símbolos normalizados. | ⏳ |
 
@@ -45,6 +46,7 @@ La descripción completa del producto, responsabilidades por componente, contrat
 - ✅ i1 — Persistencia, dedupe y keepalive/heartbeats.
 - ✅ i3 — Catálogo de símbolos y reportes de estado (ver RFC-004c).
 - ✅ i4 — Guardián de especificaciones y políticas `FIXED_LOT` centralizadas.
+- ✅ i5 — Handshake v2 completo (EAs actualizados, feedback consumido, CLI de re-evaluación operativa).
 
 ## Referencias
 
@@ -52,3 +54,17 @@ La descripción completa del producto, responsabilidades por componente, contrat
 - `docs/rfcs/RFC-004-iteracion-4-especificaciones-broker.md`
 - `docs/rfcs/RFC-004c-iteracion-3-parte-final-slave-registro.md`
 - `docs/rfcs/RFC-003-iteration-1-implementation.md`
+
+## Próxima iteración: i17 — Garantías end-to-end de replicación
+
+- **Puntos críticos identificados**:
+  - Desconexión EA↔Agent en el instante de enviar `SymbolRegistrationResult` → Agent memoriza estado `UNSPECIFIED` y bloquea órdenes posteriores.
+  - Gaps entre `TradeIntent` y `ExecuteOrder` por reintentos/timeout del stream gRPC.
+  - Falta de confirmaciones en el pipe EA ↔ Agent; si el Named Pipe cae tras escribir el JSON, el EA podría no consumirlo.
+  - Reconexiones simultáneas Master/Slaves sin rehidratar cache → router en `UNSPECIFIED`.
+- **Propuesta**:
+  - Implementar **journal de comandos** en Core: cada `ExecuteOrder`/`CloseOrder` se marca `pending` y exige ack del Agent.
+  - En Agent, mantener un **ack ledger** y reintentar escritura al Named Pipe hasta confirmación del EA (pong correlacionado o heartbeat extendido).
+  - Incorporar **reconciliador de órdenes**: master reporta `TradeIntent` y slaves reportan `ExecutionResult`; un cron verifica faltantes y reinyecta órdenes.
+  - Telemetría dedicada (`echo.replicator.*`) + alertas cuando la ventana entre intent y ejecución supere N ms.
+  - CLI de auditoría (`echo-core-cli replicator reconcile`) para reemitir operaciones específicas.

@@ -46,7 +46,68 @@ message CoreMessage {
     ModifyOrder modify_order = 12;
     ConfigUpdate config_update = 13;
     Ack ack = 14;
+    SymbolRegistrationResult symbol_registration_result = 15; // NEW i5
   }
+}
+
+enum SymbolRegistrationStatus {
+  SYMBOL_REGISTRATION_STATUS_UNSPECIFIED = 0;
+  SYMBOL_REGISTRATION_STATUS_ACCEPTED = 1;
+  SYMBOL_REGISTRATION_STATUS_WARNING = 2;
+  SYMBOL_REGISTRATION_STATUS_REJECTED = 3;
+}
+
+enum SymbolRegistrationIssueCode {
+  SYMBOL_REGISTRATION_ISSUE_CODE_UNSPECIFIED = 0;
+  SYMBOL_REGISTRATION_ISSUE_CODE_CANONICAL_NOT_ALLOWED = 1;
+  SYMBOL_REGISTRATION_ISSUE_CODE_SPEC_STALE = 2;
+  SYMBOL_REGISTRATION_ISSUE_CODE_RISK_POLICY_MISSING = 3;
+  SYMBOL_REGISTRATION_ISSUE_CODE_PROTOCOL_VERSION_UNSUPPORTED = 4;
+  SYMBOL_REGISTRATION_ISSUE_CODE_FEATURE_MISSING = 5;
+}
+
+message SymbolRegistrationIssue {
+  SymbolRegistrationIssueCode code = 1;
+  string message = 2;
+  map<string, string> metadata = 3;
+}
+
+message SymbolRegistrationEntry {
+  string canonical_symbol = 1;
+  string broker_symbol = 2;
+  SymbolRegistrationStatus status = 3;
+  repeated SymbolRegistrationIssue warnings = 4;
+  repeated SymbolRegistrationIssue errors = 5;
+  int64 spec_age_ms = 6;
+  int64 evaluated_at_ms = 7;
+}
+
+message SymbolRegistrationResult {
+  string account_id = 1;
+  string pipe_role = 2; // "master" | "slave"
+  int32 protocol_version = 3;
+  string agent_id = 4;
+  string core_version = 5;
+  SymbolRegistrationStatus status = 6;
+  repeated SymbolRegistrationIssue errors = 7;
+  repeated SymbolRegistrationIssue warnings = 8;
+  repeated SymbolRegistrationEntry symbols = 9;
+  int64 evaluated_at_ms = 10;
+  string evaluation_id = 11;
+  string client_semver = 12;
+}
+
+message HandshakeCapabilities {
+  repeated string features = 1;
+  repeated string metrics = 2;
+}
+
+message HandshakeMetadata {
+  int32 protocol_version = 1;
+  string client_semver = 2;
+  repeated string required_features = 3;
+  repeated string optional_features = 4;
+  HandshakeCapabilities capabilities = 5;
 }
 
 // AgentHello mensaje inicial de conexión del Agent
@@ -253,6 +314,7 @@ message AccountSymbolsReport {
   string account_id = 1;                       // Cuenta del EA (master o slave)
   repeated SymbolMapping symbols = 2;          // Lista explícita de mapeos
   int64 reported_at_ms = 3;                    // Timestamp para detectar actualizaciones (idempotencia)
+  HandshakeMetadata metadata = 4;              // i5: Metadata de handshake negociado
 }
 
 // StateSnapshot snapshot de estado de cuentas/posiciones

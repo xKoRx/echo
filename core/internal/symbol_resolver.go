@@ -229,3 +229,36 @@ func (r *AccountSymbolResolver) InvalidateAccount(ctx context.Context, accountID
 	return nil
 }
 
+// ListMappings retorna la lista de mappings para una cuenta.
+func (r *AccountSymbolResolver) ListMappings(ctx context.Context, accountID string) ([]*domain.SymbolMapping, error) {
+	r.mu.RLock()
+	accountMap, ok := r.cache[accountID]
+	r.mu.RUnlock()
+
+	if !ok {
+		mappings, err := r.repo.GetAccountMapping(ctx, accountID)
+		if err != nil {
+			return nil, err
+		}
+		if mappings == nil {
+			return nil, nil
+		}
+		r.mu.Lock()
+		r.cache[accountID] = mappings
+		accountMap = mappings
+		r.mu.Unlock()
+	}
+
+	if len(accountMap) == 0 {
+		return nil, nil
+	}
+
+	result := make([]*domain.SymbolMapping, 0, len(accountMap))
+	for _, info := range accountMap {
+		if mapping := info.ToSymbolMapping(); mapping != nil {
+			result = append(result, mapping)
+		}
+	}
+	return result, nil
+}
+

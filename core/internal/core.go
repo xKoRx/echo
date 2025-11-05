@@ -15,6 +15,7 @@ import (
 	"github.com/xKoRx/echo/core/internal/repository"
 	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
+	"github.com/xKoRx/echo/sdk/domain/handshake"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
 	"github.com/xKoRx/echo/sdk/telemetry/metricbundle"
@@ -81,6 +82,11 @@ type Core struct {
 	// Telemetría
 	telemetry   *telemetry.Client
 	echoMetrics *metricbundle.EchoMetrics
+
+	// Handshake
+	handshakeEvaluator  *HandshakeEvaluator
+	handshakeRegistry   *HandshakeRegistry
+	handshakeReconciler *handshakeReconciler
 
 	// Lifecycle
 	ctx    context.Context
@@ -227,6 +233,26 @@ func New(ctx context.Context) (*Core, error) {
 		attribute.StringSlice("canonical_symbols", config.CanonicalSymbols),
 	)
 
+	// Handshake evaluator y registry
+	handshakeRepo := repoFactory.HandshakeRepository()
+	handshakeRegistry := NewHandshakeRegistry()
+	var specMaxAge time.Duration
+	if config.VolumeGuard != nil {
+		specMaxAge = config.VolumeGuard.MaxSpecAge
+	}
+	protocolValidator := NewProtocolValidator(&config.Protocol)
+	handshakeEvaluator := NewHandshakeEvaluator(
+		protocolValidator,
+		canonicalValidator,
+		symbolSpecService,
+		riskPolicySvc,
+		handshakeRepo,
+		telClient,
+		echoMetrics,
+		&config.Protocol,
+		specMaxAge,
+	)
+
 	// 7. Crear Core
 	core := &Core{
 		config:             config,
@@ -246,6 +272,37 @@ func New(ctx context.Context) (*Core, error) {
 		echoMetrics:        echoMetrics,
 		ctx:                coreCtx,
 		cancel:             cancel,
+		handshakeEvaluator: handshakeEvaluator,
+		handshakeRegistry:  handshakeRegistry,
+	}
+
+	core.handshakeReconciler = newHandshakeReconciler(
+		coreCtx,
+		handshakeEvaluator,
+		symbolResolver,
+		handshakeRegistry,
+		core.accountRegistry,
+		handshakeRepo,
+		telClient,
+		echoMetrics,
+		config.ServiceVersion,
+		func(agentID string, result *pb.SymbolRegistrationResult) error {
+			return core.sendSymbolRegistrationResult(coreCtx, agentID, result)
+		},
+	)
+
+	symbolSpecService.SetOnChange(func(accountID string) {
+		core.handshakeReconciler.Notify(accountID)
+	})
+	if rs, ok := riskPolicySvc.(*riskPolicyService); ok {
+		rs.SetOnInvalidate(func(accountID string) {
+			core.handshakeReconciler.Notify(accountID)
+		})
+	}
+	if err := core.handshakeReconciler.StartListener(config.PostgresConnStr()); err != nil {
+		telClient.Warn(coreCtx, "Failed to start handshake listener",
+			attribute.String("error", err.Error()),
+		)
 	}
 
 	// 8. Crear router
@@ -329,7 +386,9 @@ func (c *Core) Start() error {
 	c.wg.Add(1)
 	go c.dedupeCleanupLoop()
 
-	c.telemetry.Info(c.ctx, "Core started successfully (i1)")
+	if c.handshakeReconciler != nil {
+		c.handshakeReconciler.Start()
+	}
 
 	return nil
 }
@@ -430,6 +489,33 @@ func (c *Core) StreamBidi(stream pb.AgentService_StreamBidiServer) error {
 
 		// Enviar al router para procesamiento
 		c.router.HandleAgentMessage(agentCtx, agentID, msg)
+	}
+}
+
+func (c *Core) sendSymbolRegistrationResult(ctx context.Context, agentID string, result *pb.SymbolRegistrationResult) error {
+	if agentID == "" || result == nil {
+		return fmt.Errorf("datos inválidos para enviar handshake")
+	}
+
+	conn, ok := c.GetAgent(agentID)
+	if !ok {
+		return fmt.Errorf("agent %s no conectado", agentID)
+	}
+
+	msg := &pb.CoreMessage{
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.CoreMessage_SymbolRegistrationResult{
+			SymbolRegistrationResult: result,
+		},
+	}
+
+	select {
+	case conn.SendCh <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return fmt.Errorf("canal de envío lleno para agent %s", agentID)
 	}
 }
 
@@ -560,6 +646,10 @@ func (c *Core) Shutdown() error {
 		c.router.Stop()
 	}
 
+	if c.handshakeReconciler != nil {
+		c.handshakeReconciler.Stop()
+	}
+
 	// i3: Detener symbol resolver
 	if c.symbolResolver != nil {
 		c.symbolResolver.Stop()
@@ -604,6 +694,21 @@ func (c *Core) Shutdown() error {
 	c.telemetry.Info(c.ctx, "Core stopped successfully (i1)")
 
 	return nil
+}
+
+// EvaluateHandshakeForAccount fuerza una re-evaluación de handshake para una cuenta específica.
+// send indica si el resultado debe reenviarse al Agent conectado.
+func (c *Core) EvaluateHandshakeForAccount(ctx context.Context, accountID string, send bool) (*handshake.Evaluation, error) {
+	if accountID == "" {
+		return nil, fmt.Errorf("accountID vacío")
+	}
+	if c.handshakeReconciler == nil {
+		return nil, fmt.Errorf("handshake reconciler no inicializado")
+	}
+	if ctx == nil {
+		ctx = c.ctx
+	}
+	return c.handshakeReconciler.EvaluateNow(ctx, accountID, send)
 }
 
 // extractAgentIDFromMetadata extrae agent-id de los metadatos gRPC.
@@ -664,7 +769,7 @@ func (c *Core) handleAccountConnected(agentID string, msg *pb.AccountConnected) 
 	)
 
 	// Registrar cuenta en registry
-	c.accountRegistry.RegisterAccount(agentID, accountID)
+	c.accountRegistry.RegisterAccount(agentID, accountID, clientType)
 
 	// Métrica: número de cuentas registradas
 	totalAccounts, totalAgents := c.accountRegistry.GetStats()
@@ -700,6 +805,9 @@ func (c *Core) handleAccountDisconnected(agentID string, msg *pb.AccountDisconne
 
 	// Desregistrar cuenta del registry
 	c.accountRegistry.UnregisterAccount(accountID)
+	if c.handshakeRegistry != nil {
+		c.handshakeRegistry.Clear(accountID)
+	}
 
 	// i3: Invalidar caché de símbolos por cuenta
 	if err := c.symbolResolver.InvalidateAccount(c.ctx, accountID); err != nil {
@@ -730,6 +838,8 @@ func (c *Core) handleAccountDisconnected(agentID string, msg *pb.AccountDisconne
 
 // NEW i3: handleAccountSymbolsReport procesa el reporte de símbolos por cuenta.
 func (c *Core) handleAccountSymbolsReport(ctx context.Context, agentID string, report *pb.AccountSymbolsReport) {
+	start := time.Now()
+
 	// Validar usando SDK
 	if err := domain.ValidateAccountSymbolsReport(report, c.config.CanonicalSymbols); err != nil {
 		c.telemetry.Warn(ctx, "Invalid AccountSymbolsReport (i3)",
@@ -754,6 +864,9 @@ func (c *Core) handleAccountSymbolsReport(ctx context.Context, agentID string, r
 	// Convertir proto mappings a domain mappings
 	mappings := make([]*domain.SymbolMapping, 0, len(report.Symbols))
 	for _, protoMapping := range report.Symbols {
+		if protoMapping == nil {
+			continue
+		}
 		mapping := &domain.SymbolMapping{
 			CanonicalSymbol: protoMapping.CanonicalSymbol,
 			BrokerSymbol:    protoMapping.BrokerSymbol,
@@ -781,10 +894,59 @@ func (c *Core) handleAccountSymbolsReport(ctx context.Context, agentID string, r
 		return
 	}
 
-	c.telemetry.Info(ctx, "AccountSymbolsReport processed successfully (i3)",
+	// Evaluar handshake con metadata adjunta
+	metadata := report.Metadata
+	if metadata == nil {
+		metadata = &pb.HandshakeMetadata{}
+	}
+
+	ownership, _ := c.accountRegistry.GetRecord(accountID)
+	pipeRole := ownership.PipeRole
+	if pipeRole == "" {
+		pipeRole = "unknown"
+	}
+
+	evaluation, _, err := c.handshakeEvaluator.Evaluate(ctx, accountID, agentID, pipeRole, c.config.ServiceVersion, metadata, mappings)
+	if err != nil {
+		c.telemetry.RecordError(ctx, err)
+		c.telemetry.Error(ctx, "Failed to evaluate handshake",
+			err,
+			attribute.String("account_id", accountID),
+			attribute.String("agent_id", agentID),
+		)
+		return
+	}
+
+	if c.handshakeRegistry != nil {
+		c.handshakeRegistry.Set(evaluation)
+	}
+
+	result := evaluation.ToProtoResult()
+	if result != nil {
+		if err := c.sendSymbolRegistrationResult(ctx, agentID, result); err != nil {
+			c.telemetry.Warn(ctx, "Failed to send SymbolRegistrationResult",
+				attribute.String("account_id", accountID),
+				attribute.String("agent_id", agentID),
+				attribute.String("error", err.Error()),
+			)
+			c.echoMetrics.RecordAgentHandshakeForwardError(ctx, err.Error(),
+				semconv.Echo.AccountID.String(accountID),
+				attribute.String("pipe_role", pipeRole),
+			)
+		}
+	}
+
+	latencyMs := float64(time.Since(start).Milliseconds())
+	c.echoMetrics.RecordHandshakeFeedbackLatency(ctx, latencyMs,
+		semconv.Echo.AccountID.String(accountID),
+		attribute.String("pipe_role", pipeRole),
+	)
+
+	c.telemetry.Info(ctx, "AccountSymbolsReport processed successfully (i5)",
 		attribute.String("account_id", accountID),
 		attribute.Int("mappings_count", len(mappings)),
 		attribute.Int64("reported_at_ms", report.ReportedAtMs),
+		attribute.String("status", registrationStatusString(evaluation.Status)),
 	)
 }
 
@@ -815,7 +977,7 @@ func (c *Core) handleSymbolSpecReport(ctx context.Context, agentID string, repor
 		return
 	}
 
-	c.telemetry.Info(ctx, "SymbolSpecReport processed",
+	c.telemetry.Debug(ctx, "SymbolSpecReport processed",
 		attribute.String("agent_id", agentID),
 		attribute.String("account_id", accountID),
 		attribute.Int("symbols_count", len(report.Symbols)),

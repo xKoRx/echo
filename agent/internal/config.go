@@ -40,6 +40,11 @@ type Config struct {
 	KeepAliveTimeout    time.Duration // grpc/client_keepalive/timeout_s
 	PermitWithoutStream bool          // grpc/client_keepalive/permit_without_stream
 
+	// Handshake protocolo
+	ProtocolMinVersion  int
+	ProtocolMaxVersion  int
+	ProtocolAllowLegacy bool
+
 	// Telemetry
 	ServiceName     string // telemetry/service_name
 	ServiceVersion  string // telemetry/service_version
@@ -105,6 +110,9 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		Environment:         env,
 		LogLevel:            "INFO", // Default
 		CanonicalSymbols:    []string{"XAUUSD"},
+		ProtocolMinVersion:  1,
+		ProtocolMaxVersion:  2,
+		ProtocolAllowLegacy: true,
 	}
 	if val, err := etcdClient.GetVarWithDefault(ctx, "core/canonical_symbols", ""); err == nil && val != "" {
 		symbols := strings.Split(val, ",")
@@ -175,6 +183,22 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		// Trim spaces
 		for i := range cfg.SlaveAccounts {
 			cfg.SlaveAccounts[i] = strings.TrimSpace(cfg.SlaveAccounts[i])
+		}
+	}
+
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/protocol/min_version", ""); err == nil && val != "" {
+		if v, err := strconv.Atoi(val); err == nil {
+			cfg.ProtocolMinVersion = v
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/protocol/max_version", ""); err == nil && val != "" {
+		if v, err := strconv.Atoi(val); err == nil {
+			cfg.ProtocolMaxVersion = v
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/protocol/allow_legacy", ""); err == nil && val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			cfg.ProtocolAllowLegacy = b
 		}
 	}
 

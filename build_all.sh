@@ -19,6 +19,9 @@ cp "$ROOT_DIR/clients/mt4/JAson.mqh" "$BIN_DIR/JAson.mqh"
 echo "[build] Compiling core (linux amd64)..."
 GOOS=linux GOARCH=amd64 go build -o "$BIN_DIR/echo-core" "$ROOT_DIR/core/cmd/echo-core"
 
+echo "[build] Compiling core CLI (linux amd64)..."
+GOOS=linux GOARCH=amd64 go build -o "$BIN_DIR/echo-core-cli" "$ROOT_DIR/core/cmd/echo-core-cli"
+
 echo "[build] Compiling agent (windows amd64)..."
 GOOS=windows GOARCH=amd64 go build -o "$BIN_DIR/echo-agent.exe" "$ROOT_DIR/agent/cmd/echo-agent"
 

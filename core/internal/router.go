@@ -10,6 +10,7 @@ import (
 
 	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
+	"github.com/xKoRx/echo/sdk/domain/handshake"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
 	"github.com/xKoRx/echo/sdk/telemetry/semconv"
@@ -382,6 +383,22 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 	canonicalSymbol := intent.Symbol
 
 	for _, slaveAccountID := range r.core.config.SlaveAccounts {
+		handshakeStatus := r.core.handshakeRegistry.Status(slaveAccountID)
+		if handshakeStatus == handshake.RegistrationStatusRejected || handshakeStatus == handshake.RegistrationStatusUnspecified {
+			r.core.telemetry.Warn(ctx, "Skipping account due to handshake status",
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("status", registrationStatusString(handshakeStatus)),
+				attribute.String("trade_id", tradeID),
+			)
+			continue
+		}
+		if handshakeStatus == handshake.RegistrationStatusWarning {
+			r.core.telemetry.Info(ctx, "Routing with handshake warning",
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("trade_id", tradeID),
+			)
+		}
+
 		policy, err := r.core.riskPolicyService.Get(ctx, slaveAccountID, strategyID)
 		if err != nil {
 			r.core.telemetry.Error(ctx, "Failed to load risk policy",

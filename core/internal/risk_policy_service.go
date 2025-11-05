@@ -27,6 +27,7 @@ type riskPolicyService struct {
 
 	mu    sync.RWMutex
 	cache map[string]*riskPolicyCacheEntry
+	onInvalidate func(string)
 
 	listenerMu     sync.Mutex
 	listener       *pq.Listener
@@ -94,6 +95,7 @@ func (s *riskPolicyService) Invalidate(accountID, strategyID string) {
 	s.mu.Lock()
 	delete(s.cache, key)
 	s.mu.Unlock()
+	s.emitInvalidate(accountID)
 }
 
 func (s *riskPolicyService) recordLookup(ctx context.Context, policy *domain.RiskPolicy, accountID, strategyID string) {
@@ -188,6 +190,22 @@ func (s *riskPolicyService) handleNotification(payload string) {
 	s.Invalidate(accountID, strategyID)
 }
 
+// SetOnInvalidate registra un callback opcional.
+func (s *riskPolicyService) SetOnInvalidate(cb func(string)) {
+	s.mu.Lock()
+	s.onInvalidate = cb
+	s.mu.Unlock()
+}
+
+func (s *riskPolicyService) emitInvalidate(accountID string) {
+	s.mu.RLock()
+	cb := s.onInvalidate
+	s.mu.RUnlock()
+	if cb != nil && accountID != "" {
+		cb(accountID)
+	}
+}
+
 func parseRiskPolicyPayload(payload string) (string, string) {
 	parts := strings.SplitN(payload, ":", 2)
 	accountID := strings.TrimSpace(parts[0])
@@ -210,4 +228,6 @@ func (s *riskPolicyService) invalidateAccount(accountID string) {
 		}
 	}
 	s.mu.Unlock()
+
+	s.emitInvalidate(accountID)
 }

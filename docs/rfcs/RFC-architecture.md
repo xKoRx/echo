@@ -136,6 +136,7 @@ flowchart LR
 - Persistencia en PostgreSQL: `trades`, `executions`, `closes`, `dedupe`, `account_symbol_map`, `account_symbol_spec`, `account_strategy_risk_policy` (esquema tipado `FIXED_LOT`).
 - Orquestación: cálculo de lotes (próximas iteraciones), aplicación de políticas, envío de comandos selectivos.
 - Telemetría con bundles `EchoMetrics`, spans `core.*` y contadores `echo.specs.*`, `echo.risk.*`.
+- Handshake v2 completado (evaluador central, persistencia `account_symbol_registration_*`, reconciliador con `LISTEN/NOTIFY`, métricas `echo.core.handshake.*`, bloqueo operativo `WARNING/REJECTED`, CLI `echo-core-cli handshake evaluate` y consumo del feedback en los EA).
 
 ### 4.4 Slave EA
 - Ejecuta `OrderSend`, `OrderClose`, `OrderModify` (offsets/StopLevel en roadmap).
@@ -191,7 +192,7 @@ flowchart LR
 | Catálogo canónico de símbolos | `canonical_symbol ⇄ broker_symbol`, validación pre-orden, snapshots 250 ms. | i3 | ✅ |
 | Guardián de especificaciones | Caché + persistencia `min_lot`, `lot_step`, `stop_level`; clamps previos a `ExecuteOrder`. | i4 | ✅ |
 | Políticas `FIXED_LOT` | Registro en Postgres + caché `RiskPolicyService`; rechazo sin política. | i4 | ✅ |
-| Versionado de handshake & feedback | `protocol_version`, `SymbolRegistrationResult` con severidades y warnings globales persistidos. | i5 | ⏳ |
+| Versionado de handshake & feedback | `protocol_version`, `SymbolRegistrationResult` Core→Agent→EA, validaciones tempranas. | i5 | ✅ |
 | Sizing con riesgo fijo (Modo A) | Distancia SL × tick value; clamps min/max lot. | i6 | ⏳ |
 | Filtros de spread y desvío | Evaluación de tolerancias por cuenta×símbolo. | i7 | ⏳ |
 | SL/TP con offset | Aplicar offsets configurables en apertura. | i8a | ⏳ |
@@ -355,6 +356,7 @@ Estructura típica (`/echo/...`):
 - ✅ i2 — Routing selectivo.
 - ✅ i3 — Catálogo canónico + specs base en repositorios, reporting 250 ms.
 - 🚧 i4 — Guardián de especificaciones y políticas `FIXED_LOT` centralizadas.
+- 🚧 i5 — Handshake versionado: Core/Agent listos con feedback persistente y métricas; falta actualizar EAs y tooling CLI para completar rollout.
 - ⏳ Iteraciones siguientes según `docs/01-arquitectura-y-roadmap.md`.
 
 ## 13. Riesgos y mitigaciones
@@ -367,6 +369,7 @@ Estructura típica (`/echo/...`):
 | Alta frecuencia en modificaciones | Coalescing (~250 ms) |
 | Named Pipes inestables | Watchdog + reconexión automática |
 | Falta de políticas de riesgo | Rechazo inmediato + alertas `risk_policy_missing` |
+| Handshake v2 incompleto (EAs legacy) | Actualizar Master/Slave EA para enviar/consumir metadata v2 y añadir runbook de migración; rollback temporal permitiendo `allow_legacy=true` |
 
 ## 14. Referencias
 

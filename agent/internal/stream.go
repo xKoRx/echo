@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 
+	"github.com/xKoRx/echo/sdk/domain/handshake"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry/semconv"
 	"github.com/xKoRx/echo/sdk/utils"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // connectToCore establece la conexión gRPC con el Core (i1).
@@ -134,6 +137,9 @@ func (a *Agent) routeCoreMessage(msg *pb.CoreMessage) error {
 	case *pb.CoreMessage_CloseOrder:
 		return a.routeCloseOrder(payload.CloseOrder)
 
+	case *pb.CoreMessage_SymbolRegistrationResult:
+		return a.routeSymbolRegistrationResult(payload.SymbolRegistrationResult)
+
 	default:
 		a.logWarn("Unknown message type from Core", map[string]interface{}{
 			"type": fmt.Sprintf("%T", payload),
@@ -162,6 +168,30 @@ func (a *Agent) routeExecuteOrder(order *pb.ExecuteOrder) error {
 	}
 
 	accountID := order.TargetAccountId
+	status := a.getHandshakeStatus(accountID)
+	if status == handshake.RegistrationStatusRejected || status == handshake.RegistrationStatusUnspecified {
+		reason := "pending"
+		if status == handshake.RegistrationStatusRejected {
+			reason = "rejected"
+		}
+		a.echoMetrics.RecordAgentHandshakeBlocked(a.ctx, reason,
+			semconv.Echo.AccountID.String(accountID),
+			semconv.Echo.CommandID.String(order.CommandId),
+		)
+		a.logWarn("Blocking ExecuteOrder due to handshake status", map[string]interface{}{
+			"account_id": accountID,
+			"status":     handshakeStatusString(status),
+			"command_id": order.CommandId,
+		})
+		return fmt.Errorf("handshake status %s blocks execute order", handshakeStatusString(status))
+	}
+	if status == handshake.RegistrationStatusWarning {
+		a.logInfo("ExecuteOrder under handshake warning", map[string]interface{}{
+			"account_id": accountID,
+			"command_id": order.CommandId,
+		})
+	}
+
 	pipeName := fmt.Sprintf("%sslave_%s", a.config.PipePrefix, accountID)
 
 	// Obtener handler del pipe
@@ -212,6 +242,24 @@ func (a *Agent) routeCloseOrder(order *pb.CloseOrder) error {
 	}
 
 	accountID := order.TargetAccountId
+	status := a.getHandshakeStatus(accountID)
+	if status == handshake.RegistrationStatusRejected || status == handshake.RegistrationStatusUnspecified {
+		reason := "pending"
+		if status == handshake.RegistrationStatusRejected {
+			reason = "rejected"
+		}
+		a.echoMetrics.RecordAgentHandshakeBlocked(a.ctx, reason,
+			semconv.Echo.AccountID.String(accountID),
+			semconv.Echo.CommandID.String(order.CommandId),
+		)
+		a.logWarn("Blocking CloseOrder due to handshake status", map[string]interface{}{
+			"account_id": accountID,
+			"status":     handshakeStatusString(status),
+			"command_id": order.CommandId,
+		})
+		return fmt.Errorf("handshake status %s blocks close order", handshakeStatusString(status))
+	}
+
 	pipeName := fmt.Sprintf("%sslave_%s", a.config.PipePrefix, accountID)
 
 	// Obtener handler del pipe
@@ -232,6 +280,86 @@ func (a *Agent) routeCloseOrder(order *pb.CloseOrder) error {
 	})
 
 	return nil
+}
+
+func (a *Agent) routeSymbolRegistrationResult(result *pb.SymbolRegistrationResult) error {
+	if result == nil {
+		return fmt.Errorf("nil symbol registration result")
+	}
+
+	accountID := result.GetAccountId()
+	status := handshake.RegistrationStatus(result.GetStatus())
+	a.setHandshakeStatus(accountID, status)
+
+	evaluationID := strings.TrimSpace(result.GetEvaluationId())
+	if evaluationID != "" {
+		if last := a.getLastEvaluationID(accountID); last == evaluationID {
+			a.logDebug("SymbolRegistrationResult skipped (duplicate evaluation_id)", map[string]interface{}{
+				"account_id":    accountID,
+				"evaluation_id": evaluationID,
+				"pipe_role":     result.GetPipeRole(),
+				"status":        handshakeStatusString(status),
+			})
+			return nil
+		}
+	}
+
+	pipeRole := result.GetPipeRole()
+	if pipeRole == "" {
+		pipeRole = "slave"
+	}
+
+	pipeName := fmt.Sprintf("%s%s_%s", a.config.PipePrefix, pipeRole, accountID)
+	handler, ok := a.pipeManager.GetPipe(pipeName)
+	if !ok {
+		a.logWarn("Pipe not found for SymbolRegistrationResult", map[string]interface{}{
+			"pipe_name":  pipeName,
+			"account_id": accountID,
+		})
+		a.echoMetrics.RecordAgentHandshakeForwardError(a.ctx, "pipe_not_found",
+			semconv.Echo.AccountID.String(accountID),
+			attribute.String("pipe_role", pipeRole),
+		)
+		return nil
+	}
+
+	if err := handler.WriteSymbolRegistrationResult(result); err != nil {
+		a.echoMetrics.RecordAgentHandshakeForwardError(a.ctx, err.Error(),
+			semconv.Echo.AccountID.String(accountID),
+			attribute.String("pipe_role", pipeRole),
+		)
+		return fmt.Errorf("failed to forward symbol registration result: %w", err)
+	}
+
+	a.echoMetrics.RecordAgentHandshakeForwarded(a.ctx, handshakeStatusString(status),
+		semconv.Echo.AccountID.String(accountID),
+		attribute.String("pipe_role", pipeRole),
+	)
+
+	a.logDebug("SymbolRegistrationResult routed", map[string]interface{}{
+		"account_id": accountID,
+		"pipe_role":  pipeRole,
+		"status":     handshakeStatusString(status),
+	})
+
+	if evaluationID != "" {
+		a.setLastEvaluationID(accountID, evaluationID)
+	}
+
+	return nil
+}
+
+func handshakeStatusString(status handshake.RegistrationStatus) string {
+	switch status {
+	case handshake.RegistrationStatusAccepted:
+		return "ACCEPTED"
+	case handshake.RegistrationStatusWarning:
+		return "WARNING"
+	case handshake.RegistrationStatusRejected:
+		return "REJECTED"
+	default:
+		return "UNSPECIFIED"
+	}
 }
 
 // logSentMessage loggea un mensaje enviado al Core según su tipo.
@@ -259,7 +387,7 @@ func (a *Agent) logSentMessage(msg *pb.AgentMessage) {
 		})
 
 	default:
-		a.logInfo("Message sent to Core", map[string]interface{}{
+		a.logDebug("Message sent to Core", map[string]interface{}{
 			"type": fmt.Sprintf("%T", payload),
 		})
 	}

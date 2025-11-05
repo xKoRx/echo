@@ -18,6 +18,7 @@ import (
 	"github.com/xKoRx/echo/sdk/telemetry/metricbundle"
 	"github.com/xKoRx/echo/sdk/telemetry/semconv"
 	"github.com/xKoRx/echo/sdk/utils"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // preview devuelve los primeros n caracteres seguros para log
@@ -129,15 +130,16 @@ func (pm *PipeManager) createPipe(name, role, accountID string) error {
 
 	// Crear handler
 	handler := &PipeHandler{
-		name:         name,
-		role:         role,
-		accountID:    accountID,
-		server:       pipeServer,
-		telemetry:    pm.telemetry,
-		echoMetrics:  pm.echoMetrics,
-		sendToCoreCh: pm.sendToCoreCh,
-		agentID:      pm.agentID, // i2: Pasar agentID al handler
-		ctx:          pm.ctx,
+		name:             name,
+		role:             role,
+		accountID:        accountID,
+		server:           pipeServer,
+		canonicalSymbols: pm.config.CanonicalSymbols,
+		telemetry:        pm.telemetry,
+		echoMetrics:      pm.echoMetrics,
+		sendToCoreCh:     pm.sendToCoreCh,
+		agentID:          pm.agentID, // i2: Pasar agentID al handler
+		ctx:              pm.ctx,
 	}
 
 	// Registrar pipe
@@ -206,6 +208,8 @@ type PipeHandler struct {
 	role      string // "master" o "slave"
 	accountID string
 	server    ipc.PipeServer
+	// Configuración compartida
+	canonicalSymbols []string
 
 	// Telemetría
 	telemetry   *telemetry.Client
@@ -221,6 +225,9 @@ type PipeHandler struct {
 	ctx    context.Context
 	closed bool
 	mu     sync.Mutex
+
+	// Cache local para filtrar reportes repetidos
+	lastSpecReportMs int64
 }
 
 // Run ejecuta el loop principal del handler.
@@ -726,22 +733,46 @@ func (h *PipeHandler) handleSymbolSpecReport(msgMap map[string]interface{}) erro
 	if reportedAt <= 0 {
 		reportedAt = nowUnixMilli()
 	}
+	nowMs := nowUnixMilli()
+	specAgeMs := nowMs - reportedAt
+	if specAgeMs < 0 {
+		specAgeMs = 0
+	}
+
+	if reportedAt <= h.lastSpecReportMs {
+		h.logWarn("SymbolSpecReport ignored due to stale reported_at", map[string]interface{}{
+			"account_id":          accountID,
+			"reported_at_ms":      reportedAt,
+			"last_reported_at_ms": h.lastSpecReportMs,
+		})
+		h.echoMetrics.RecordAgentSpecsFiltered(h.ctx, accountID, "stale_report",
+			attribute.Int64("reported_at_ms", reportedAt),
+			attribute.Int64("last_reported_at_ms", h.lastSpecReportMs),
+		)
+		return nil
+	}
 
 	symbolsRaw, ok := payload["symbols"].([]interface{})
 	if !ok || len(symbolsRaw) == 0 {
 		h.logWarn("SymbolSpecReport without symbols", map[string]interface{}{
 			"account_id": accountID,
 		})
+		h.echoMetrics.RecordAgentSpecsFiltered(h.ctx, accountID, "empty_payload",
+			attribute.Int64("reported_at_ms", reportedAt),
+		)
 		return nil
 	}
 
-	specs := make([]*pb.SymbolSpecification, 0, len(symbolsRaw))
+	validSpecs := make([]*pb.SymbolSpecification, 0, len(symbolsRaw))
 	for _, raw := range symbolsRaw {
 		symMap, ok := raw.(map[string]interface{})
 		if !ok {
 			h.logWarn("Invalid symbol specification format", map[string]interface{}{
 				"account_id": accountID,
 			})
+			h.echoMetrics.RecordAgentSpecsFiltered(h.ctx, accountID, "invalid_format",
+				attribute.String("reason", "non_object_entry"),
+			)
 			continue
 		}
 
@@ -766,19 +797,36 @@ func (h *PipeHandler) handleSymbolSpecReport(msgMap map[string]interface{}) erro
 			spec.Sessions = parseSessionWindows(sessionsRaw)
 		}
 
-		specs = append(specs, spec)
+		if err := domain.ValidateSymbolSpecification(spec, h.canonicalSymbols); err != nil {
+			h.logWarn("Symbol specification validation failed", map[string]interface{}{
+				"account_id":       accountID,
+				"canonical_symbol": spec.CanonicalSymbol,
+				"error":            err.Error(),
+			})
+			h.echoMetrics.RecordAgentSpecsFiltered(h.ctx, accountID, "validation_failed",
+				attribute.String("canonical_symbol", spec.CanonicalSymbol),
+				attribute.String("error", err.Error()),
+			)
+			continue
+		}
+
+		validSpecs = append(validSpecs, spec)
 	}
 
-	if len(specs) == 0 {
-		h.logWarn("SymbolSpecReport without valid specs", map[string]interface{}{
-			"account_id": accountID,
+	if len(validSpecs) == 0 {
+		h.logWarn("SymbolSpecReport filtered completely", map[string]interface{}{
+			"account_id":     accountID,
+			"reported_at_ms": reportedAt,
 		})
+		h.echoMetrics.RecordAgentSpecsFiltered(h.ctx, accountID, "empty_after_validation",
+			attribute.Int64("reported_at_ms", reportedAt),
+		)
 		return nil
 	}
 
 	report := &pb.SymbolSpecReport{
 		AccountId:    accountID,
-		Symbols:      specs,
+		Symbols:      validSpecs,
 		ReportedAtMs: reportedAt,
 	}
 
@@ -794,8 +842,15 @@ func (h *PipeHandler) handleSymbolSpecReport(msgMap map[string]interface{}) erro
 	case h.sendToCoreCh <- agentMsg:
 		h.logInfo("SymbolSpecReport forwarded to Core", map[string]interface{}{
 			"account_id":    accountID,
-			"symbols_count": len(specs),
+			"symbols_count": len(validSpecs),
+			"spec_age_ms":   specAgeMs,
 		})
+		h.echoMetrics.RecordAgentSpecsForwarded(h.ctx, accountID,
+			attribute.Int("symbols_count", len(validSpecs)),
+			attribute.Float64("spec_age_ms", float64(specAgeMs)),
+			attribute.Int64("reported_at_ms", reportedAt),
+		)
+		h.lastSpecReportMs = reportedAt
 	case <-h.ctx.Done():
 		return h.ctx.Err()
 	}

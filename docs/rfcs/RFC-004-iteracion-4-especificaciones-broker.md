@@ -2,7 +2,7 @@
 title: "RFC-004d: Iteración 4 — Especificaciones de broker y clamps de volumen"
 version: "1.1"
 date: "2025-11-04"
-status: "Propuesto"
+status: "Implementado"
 owner: "Arquitectura Echo"
 iteration: "4"
 depends_on:
@@ -150,10 +150,24 @@ Nuevas claves (todas bajo `core/specs/`):
 
 ## Checklist
 
-- ⏳ Guardián de volumen implementado y cableado en `Router`.
-- ⏳ Configuración de ETCD documentada y cargada en `core/internal/config.go`.
-- ⏳ Métricas, logs y spans habilitados para specs, decisiones de volumen y políticas de riesgo.
-- ⏳ Migraciones aplicadas e índices verificados (`account_symbol_spec`, `account_strategy_risk_policy`).
+- ✅ Guardián de volumen implementado y cableado en `Router`.
+- ✅ Configuración de ETCD documentada y cargada en `core/internal/config.go`.
+- ✅ Métricas, logs y spans habilitados para specs, decisiones de volumen y políticas de riesgo.
+- ✅ Migraciones aplicadas e índices verificados (`account_symbol_spec`, `account_strategy_risk_policy`).
 - ⏳ Documentación actualizada para EA, Agent y Core.
 - ⏳ Evidencia de pruebas unitarias e integrales adjunta antes del rollout.
 - Recomendación: inicializar atributos comunes (`AppendCommonAttrs`) en `core/cmd/echo-core/main.go` dentro de `bootstrapTelemetry` para evitar repetir metadata en clamps y decisiones de riesgo.
+
+## Notas de implementación (i4)
+
+- Se incorporó el paquete `core/internal/volumeguard` con decisiones `clamp/reject/pass_through`, telemetría estandarizada (`echo.core.volume_guard_*`) y clamps basados en `domain.ClampLotSize`.
+- El `Router` ahora obtiene políticas `FIXED_LOT` vía el nuevo `RiskPolicyService`, rechaza órdenes sin política vigente (`ERROR_CODE_RISK_POLICY_MISSING`) y propaga `strategy_id` hasta los Slaves.
+- `RiskPolicyService` cachea resultados con TTL, escucha `LISTEN/NOTIFY` desde Postgres y expone métricas `echo.core.risk_policy_lookup_total`.
+- `SymbolSpecService` expone `GetVolumeSpec`, edad de reportes y helpers `IsStale/SpecAge` usados por el guardián y la lógica de stops.
+- El Agent filtra `SymbolSpecReport` duplicados/obsoletos, valida contra la whitelist y publica métricas `echo.agent.specs.forwarded_total` y `echo.agent.specs.filtered_total`.
+- `sdk/telemetry` amplió el bundle Echo con contadores/histogramas nuevos y los semánticos necesarios (`decision`, `policy_type`, etc.).
+- `sdk/domain/transformers` ahora preserva `strategy_id` end-to-end; `domain/validation` se limpió para evitar redundancias.
+- `core/internal/config.go` consume claves ETCD `core/specs/*` y `core/risk/*`, validando defaults y fallback legacy.
+- Nuevas migraciones: `i4_symbol_spec_guard.sql` agrega índices sobre specs y `i4_risk_policy.sql` crea la tabla `account_strategy_risk_policy` con trigger de invalidación.
+- El seed de ETCD (`TestSeedEchoConfig_Development`) carga las nuevas llaves para specs, políticas de riesgo y canonical symbols.
+- El Master EA ahora adjunta `strategy_id` en cada `trade_intent` (convención `magic_<magic_number>`), manteniendo Core y Agent agnósticos a la derivación de estrategias.

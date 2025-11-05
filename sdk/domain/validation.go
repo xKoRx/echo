@@ -264,7 +264,7 @@ func ValidateUUIDv7(uuid string) error {
 	}
 
 	versionChar := uuid[14]
-	if versionChar != '7' && versionChar != '7' {
+	if versionChar != '7' {
 		return NewValidationError("uuid", uuid, fmt.Sprintf("not UUIDv7 (version nibble is '%c', expected '7')", versionChar))
 	}
 

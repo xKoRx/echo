@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	_ "github.com/lib/pq" // Driver PostgreSQL
 	"github.com/xKoRx/echo/sdk/domain"
@@ -26,6 +27,7 @@ type PostgresFactory struct {
 	symbolRepo      domain.SymbolRepository // NEW i3
 	symbolSpecRepo  domain.SymbolSpecRepository
 	symbolQuoteRepo domain.SymbolQuoteRepository
+	riskPolicyRepo  domain.RiskPolicyRepository
 }
 
 // NewPostgresFactory crea un factory de repositorios PostgreSQL.
@@ -107,6 +109,14 @@ func (f *PostgresFactory) SymbolQuoteRepository() domain.SymbolQuoteRepository {
 		f.symbolQuoteRepo = &postgresSymbolQuoteRepo{db: f.db}
 	}
 	return f.symbolQuoteRepo
+}
+
+// RiskPolicyRepository retorna el repositorio de políticas de riesgo.
+func (f *PostgresFactory) RiskPolicyRepository() domain.RiskPolicyRepository {
+	if f.riskPolicyRepo == nil {
+		f.riskPolicyRepo = &postgresRiskPolicyRepo{db: f.db}
+	}
+	return f.riskPolicyRepo
 }
 
 // ===========================================================================
@@ -896,6 +906,63 @@ func (r *postgresSymbolSpecRepo) GetSpecifications(ctx context.Context, accountI
 
 type postgresSymbolQuoteRepo struct {
 	db *sql.DB
+}
+
+// ==========================================================================
+// postgresRiskPolicyRepo
+// ==========================================================================
+
+type postgresRiskPolicyRepo struct {
+	db *sql.DB
+}
+
+func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID string) (*domain.RiskPolicy, error) {
+	query := `
+		SELECT risk_type, lot_size, version, updated_at, valid_until
+		FROM echo.account_strategy_risk_policy
+		WHERE account_id = $1 AND strategy_id = $2
+	`
+
+	row := r.db.QueryRowContext(ctx, query, accountID, strategyID)
+
+	var (
+		riskType string
+		lotSize sql.NullFloat64
+		version sql.NullInt64
+		updatedAt time.Time
+		validUntil sql.NullTime
+	)
+
+	if err := row.Scan(&riskType, &lotSize, &version, &updatedAt, &validUntil); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get risk policy: %w", err)
+	}
+
+	policy := &domain.RiskPolicy{
+		AccountID:  accountID,
+		StrategyID: strategyID,
+		Type:       domain.RiskPolicyType(riskType),
+		Version:    version.Int64,
+		UpdatedAt:  updatedAt,
+	}
+
+	if validUntil.Valid {
+		policy.ValidUntil = &validUntil.Time
+	}
+
+	switch policy.Type {
+	case domain.RiskPolicyTypeFixedLot:
+		if !lotSize.Valid {
+			return nil, fmt.Errorf("risk policy FIXED_LOT missing lot_size (account=%s, strategy=%s)", accountID, strategyID)
+		}
+		policy.FixedLot = &domain.FixedLotConfig{LotSize: lotSize.Float64}
+	default:
+		return nil, fmt.Errorf("unsupported risk policy type: %s", riskType)
+	}
+
+	return policy, nil
 }
 
 func (r *postgresSymbolQuoteRepo) InsertSnapshot(ctx context.Context, snapshot *pb.SymbolQuoteSnapshot) error {

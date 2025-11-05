@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xKoRx/echo/core/internal/repository"
+	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
@@ -63,6 +64,10 @@ type Core struct {
 
 	// Deduplicación persistente (i1)
 	dedupeService *DedupeService
+
+	// i4: Políticas de riesgo y guardián de volumen
+	riskPolicyService domain.RiskPolicyService
+	volumeGuard       volumeguard.Guard
 
 	// i3: Validación y resolución de símbolos
 	canonicalValidator *CanonicalValidator
@@ -207,6 +212,15 @@ func New(ctx context.Context) (*Core, error) {
 	symbolResolver.Start() // Iniciar worker de persistencia async
 	symbolSpecService := NewSymbolSpecService(repoFactory.SymbolSpecRepository(), telClient, echoMetrics, config.CanonicalSymbols)
 	symbolQuoteService := NewSymbolQuoteService(repoFactory.SymbolQuoteRepository(), telClient)
+	riskPolicySvc := NewRiskPolicyService(repoFactory.RiskPolicyRepository(), config.Risk.CacheTTL, telClient, echoMetrics)
+	volumeGuard := volumeguard.New(symbolSpecService, config.VolumeGuard, telClient, echoMetrics)
+	if rs, ok := riskPolicySvc.(*riskPolicyService); ok {
+		if err := rs.StartListener(coreCtx, config.PostgresConnStr()); err != nil {
+			telClient.Warn(coreCtx, "Failed to start risk policy listener",
+				attribute.String("error", err.Error()),
+			)
+		}
+	}
 
 	// Registrar carga inicial de símbolos canónicos desde ETCD
 	echoMetrics.RecordSymbolsLoaded(coreCtx, "etcd", len(config.CanonicalSymbols),
@@ -220,6 +234,8 @@ func New(ctx context.Context) (*Core, error) {
 		repoFactory:        repoFactory,
 		correlationSvc:     correlationSvc,
 		dedupeService:      dedupeService,
+		riskPolicyService:  riskPolicySvc,
+		volumeGuard:        volumeGuard,
 		canonicalValidator: canonicalValidator, // NEW i3
 		symbolResolver:     symbolResolver,     // NEW i3
 		symbolSpecService:  symbolSpecService,
@@ -549,6 +565,11 @@ func (c *Core) Shutdown() error {
 		c.symbolResolver.Stop()
 	}
 
+	// Detener listener de políticas de riesgo
+	if rs, ok := c.riskPolicyService.(*riskPolicyService); ok {
+		rs.StopListener()
+	}
+
 	// Cerrar conexiones de agents
 	c.agentsMu.Lock()
 	for _, conn := range c.agents {
@@ -694,6 +715,9 @@ func (c *Core) handleAccountDisconnected(agentID string, msg *pb.AccountDisconne
 	}
 	if c.symbolQuoteService != nil {
 		c.symbolQuoteService.Invalidate(accountID)
+	}
+	if c.riskPolicyService != nil {
+		c.riskPolicyService.Invalidate(accountID, "")
 	}
 
 	// Métrica: número de cuentas registradas

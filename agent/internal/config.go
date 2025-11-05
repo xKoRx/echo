@@ -19,6 +19,9 @@ type Config struct {
 	// Core
 	CoreAddress string // endpoints/core_addr
 
+	// Catálogo de símbolos canónicos (compartido con Core)
+	CanonicalSymbols []string
+
 	// Pipes
 	PipePrefix     string   // agent/pipe_prefix
 	MasterAccounts []string // agent/master_accounts (comma separated)
@@ -101,6 +104,20 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		ServiceVersion:      "1.0.0-i1",
 		Environment:         env,
 		LogLevel:            "INFO", // Default
+		CanonicalSymbols:    []string{"XAUUSD"},
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/canonical_symbols", ""); err == nil && val != "" {
+		symbols := strings.Split(val, ",")
+		for i := range symbols {
+			symbols[i] = strings.TrimSpace(symbols[i])
+		}
+		cfg.CanonicalSymbols = symbols
+	} else if val, err := etcdClient.GetVarWithDefault(ctx, "core/symbol_whitelist", ""); err == nil && val != "" {
+		symbols := strings.Split(val, ",")
+		for i := range symbols {
+			symbols[i] = strings.TrimSpace(symbols[i])
+		}
+		cfg.CanonicalSymbols = symbols
 	}
 
 	// Cargar endpoints
@@ -188,7 +205,7 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	if val, err := etcdClient.GetVarWithDefault(ctx, "telemetry/environment", ""); err == nil && val != "" {
 		cfg.Environment = val
 	}
-	
+
 	// Cargar Log Level desde agent/log_level
 	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/log_level", ""); err == nil && val != "" {
 		cfg.LogLevel = val

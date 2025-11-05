@@ -47,6 +47,8 @@ enum ErrorCode {
   ERROR_CODE_TRADE_DISABLED = 12;
   ERROR_CODE_LONG_ONLY = 13;
   ERROR_CODE_SHORT_ONLY = 14;
+  ERROR_CODE_SPEC_MISSING = 1001;
+  ERROR_CODE_RISK_POLICY_MISSING = 1002;
 }
 
 // TimestampMetadata contiene los timestamps de latencia E2E

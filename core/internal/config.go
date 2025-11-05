@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xKoRx/echo/sdk/domain"
 	"github.com/xKoRx/echo/sdk/etcd"
 )
 
@@ -30,12 +31,14 @@ type Config struct {
 	KeepAliveMinTime time.Duration // grpc/keepalive/min_time_s
 
 	// Core
-	DefaultLotSize   float64       // core/default_lot_size (i0 hardcoded)
+	DefaultLotSize   float64       // core/default_lot_size (i0 hardcoded) - deprecated i4, usar VolumeGuardPolicy.DefaultLot
 	DedupeTTL        time.Duration // core/dedupe_ttl_minutes
 	SymbolWhitelist  []string      // core/symbol_whitelist (comma separated) - deprecated i3, usar CanonicalSymbols
 	CanonicalSymbols []string      // core/canonical_symbols (comma separated) - NEW i3
 	UnknownAction    string        // core/symbols/unknown_action ("warn"|"reject") - NEW i3
 	SlaveAccounts    []string      // core/slave_accounts (comma separated)
+	VolumeGuard      *domain.VolumeGuardPolicy
+	Risk             RiskConfig
 
 	// PostgreSQL
 	PostgresHost        string // postgres/host
@@ -52,6 +55,12 @@ type Config struct {
 	ServiceVersion string // telemetry/service_version
 	Environment    string // telemetry/environment
 	LogLevel       string // core/log_level (DEBUG|INFO|WARN|ERROR)
+}
+
+// RiskConfig agrupa configuración del servicio de políticas de riesgo.
+type RiskConfig struct {
+	MissingPolicy string
+	CacheTTL      time.Duration
 }
 
 // LoadConfig carga configuración desde ETCD.
@@ -101,6 +110,16 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		ServiceVersion:      "1.0.0-i1",
 		Environment:         env,
 		LogLevel:            "INFO",
+		VolumeGuard: &domain.VolumeGuardPolicy{
+			OnMissingSpec: domain.VolumeGuardMissingSpecReject,
+			MaxSpecAge:    10 * time.Second,
+			AlertThreshold: 8 * time.Second,
+			DefaultLot:    0.10,
+		},
+		Risk: RiskConfig{
+			MissingPolicy: "reject",
+			CacheTTL:      5 * time.Second,
+		},
 	}
 
 	// Cargar endpoints
@@ -139,14 +158,41 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	}
 
 	// Cargar Core
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/specs/default_lot", ""); err == nil && val != "" {
+		if lotSize, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.VolumeGuard.DefaultLot = lotSize
+			cfg.DefaultLotSize = lotSize
+		}
+	}
 	if val, err := etcdClient.GetVarWithDefault(ctx, "core/default_lot_size", ""); err == nil && val != "" {
 		if lotSize, err := strconv.ParseFloat(val, 64); err == nil {
 			cfg.DefaultLotSize = lotSize
+			if cfg.VolumeGuard != nil {
+				cfg.VolumeGuard.DefaultLot = lotSize
+			}
 		}
 	}
 	if val, err := etcdClient.GetVarWithDefault(ctx, "core/dedupe_ttl_minutes", ""); err == nil && val != "" {
 		if minutes, err := strconv.Atoi(val); err == nil {
 			cfg.DedupeTTL = time.Duration(minutes) * time.Minute
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/specs/missing_policy", ""); err == nil && val != "" {
+		switch strings.ToLower(val) {
+		case string(domain.VolumeGuardMissingSpecReject):
+			cfg.VolumeGuard.OnMissingSpec = domain.VolumeGuardMissingSpecReject
+		default:
+			return nil, fmt.Errorf("unsupported core/specs/missing_policy: %s", val)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/specs/max_age_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(val); err == nil {
+			cfg.VolumeGuard.MaxSpecAge = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/specs/alert_threshold_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(val); err == nil {
+			cfg.VolumeGuard.AlertThreshold = time.Duration(ms) * time.Millisecond
 		}
 	}
 	// i3: Leer canonical_symbols (prioridad) con fallback a symbol_whitelist (compatibilidad)
@@ -190,6 +236,19 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		// Trim spaces
 		for i := range cfg.SlaveAccounts {
 			cfg.SlaveAccounts[i] = strings.TrimSpace(cfg.SlaveAccounts[i])
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/missing_policy", ""); err == nil && val != "" {
+		switch strings.ToLower(val) {
+		case "reject":
+			cfg.Risk.MissingPolicy = "reject"
+		default:
+			return nil, fmt.Errorf("unsupported core/risk/missing_policy: %s", val)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/cache_ttl_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(val); err == nil {
+			cfg.Risk.CacheTTL = time.Duration(ms) * time.Millisecond
 		}
 	}
 
@@ -257,6 +316,18 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	}
 	if len(cfg.SlaveAccounts) == 0 {
 		return nil, fmt.Errorf("core/slave_accounts not configured in ETCD")
+	}
+	if cfg.VolumeGuard == nil {
+		return nil, fmt.Errorf("volume guard policy must be configured")
+	}
+	if err := cfg.VolumeGuard.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid volume guard policy: %w", err)
+	}
+	if cfg.Risk.MissingPolicy != "reject" {
+		return nil, fmt.Errorf("invalid risk missing policy: %s", cfg.Risk.MissingPolicy)
+	}
+	if cfg.Risk.CacheTTL <= 0 {
+		cfg.Risk.CacheTTL = 5 * time.Second
 	}
 
 	return cfg, nil

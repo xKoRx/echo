@@ -189,8 +189,8 @@ flowchart LR
 | Routing selectivo | Ownership `account_id → agent_id`, envío dirigido de comandos. | i2 | ✅ |
 | Control de backpressure en broadcast | Timeouts de envío a canales, latencia estabilizada (<500 ms). | i2b | ✅ |
 | Catálogo canónico de símbolos | `canonical_symbol ⇄ broker_symbol`, validación pre-orden, snapshots 250 ms. | i3 | ✅ |
-| Guardián de especificaciones | Caché + persistencia `min_lot`, `lot_step`, `stop_level`; clamps previos a `ExecuteOrder`. | i4 | 🚧 |
-| Políticas `FIXED_LOT` | Registro en Postgres + caché `RiskPolicyService`; rechazo sin política. | i4 | 🚧 |
+| Guardián de especificaciones | Caché + persistencia `min_lot`, `lot_step`, `stop_level`; clamps previos a `ExecuteOrder`. | i4 | ✅ |
+| Políticas `FIXED_LOT` | Registro en Postgres + caché `RiskPolicyService`; rechazo sin política. | i4 | ✅ |
 | Versionado de handshake & feedback | `protocol_version`, `SymbolRegistrationResult`. | i5 | ⏳ |
 | Sizing con riesgo fijo (Modo A) | Distancia SL × tick value; clamps min/max lot. | i6 | ⏳ |
 | Filtros de spread y desvío | Evaluación de tolerancias por cuenta×símbolo. | i7 | ⏳ |
@@ -206,6 +206,7 @@ flowchart LR
 | Paquetización & operación | CLI/scripts, health checks, runbooks. | i15 | ⏳ |
 | Políticas operativas (DD, apalancamiento) | Límites globales por cuenta. | i16 | ⏳ |
 | Eventos crudos en MongoDB | Event store append-only. | TBD | ⏳ |
+| SymbolMappings en Master | Master EA consume catálogo canónico y publica símbolos ya normalizados. | TBD | ⏳ |
 
 ## 7. Stack Tecnológico
 

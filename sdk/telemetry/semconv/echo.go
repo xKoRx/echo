@@ -70,6 +70,9 @@ var Echo = echoAttributes{
 	Spread:      attribute.Key("echo.spread"),
 	PipeCount:   attribute.Key("echo.pipe_count"),
 	Attempt:     attribute.Key("echo.attempt"),
+	Decision:    attribute.Key("echo.decision"),
+	Reason:      attribute.Key("echo.reason"),
+	PolicyType:  attribute.Key("echo.policy_type"),
 }
 
 type echoAttributes struct {
@@ -100,6 +103,9 @@ type echoAttributes struct {
 	Spread    attribute.Key // Spread en points
 	PipeCount attribute.Key // Número de pipes activos
 	Attempt   attribute.Key // Número de intento (reintentos)
+	Decision  attribute.Key // Decisión (clamp/reject/pass_through)
+	Reason    attribute.Key // Razón asociada a la decisión
+	PolicyType attribute.Key // Tipo de política de riesgo
 }
 
 // Values pre-definidos para atributos comunes

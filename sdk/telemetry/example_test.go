@@ -17,6 +17,7 @@ func ExampleNew() {
 	client, err := telemetry.New(ctx, "echo-example", "development",
 		telemetry.WithVersion("0.0.1"),
 		telemetry.WithOTLPEndpoint("192.168.31.60:4317"),
+		telemetry.WithLogLevel("ERROR"),
 	)
 	if err != nil {
 		panic(err)

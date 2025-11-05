@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
@@ -196,12 +197,18 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 		intent.Timestamps.T2CoreRecvMs = utils.NowUnixMilli()
 	}
 
+	strategyID := intent.GetStrategyId()
+	if strategyID == "" {
+		strategyID = "default"
+	}
+
 	// Configurar contexto con atributos del evento (usando funciones del paquete)
 	ctx = telemetry.AppendEventAttrs(ctx,
 		semconv.Echo.TradeID.String(tradeID),
 		semconv.Echo.Symbol.String(intent.Symbol),
 		semconv.Echo.OrderSide.String(orderSideToString(intent.Side)),
 		semconv.Echo.ClientID.String(intent.ClientId),
+		semconv.Echo.Strategy.String(strategyID),
 	)
 
 	r.core.telemetry.Info(ctx, "TradeIntent received from Agent",
@@ -211,6 +218,7 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 		attribute.Float64("lot_size", intent.LotSize),
 		attribute.Float64("price", intent.Price),
 		attribute.Int("ticket", int(intent.Ticket)),
+		attribute.String("strategy_id", strategyID),
 	)
 
 	// 2. Validar símbolo canónico (i3)
@@ -272,7 +280,7 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 
 	// 4. Transformar TradeIntent → ExecuteOrder (usando SDK)
 	// i1: Pasar tradeID normalizado a createExecuteOrders
-	orders := r.createExecuteOrders(ctx, intent, tradeID)
+	orders := r.createExecuteOrders(ctx, intent, tradeID, strategyID)
 
 	r.core.telemetry.Info(ctx, "ExecuteOrders created from TradeIntent",
 		attribute.Int("num_orders", len(orders)),
@@ -369,15 +377,69 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 //
 // TODO i0: broadcast a todos (sin routing), lot size hardcoded.
 // TODO i1: routing inteligente por configuración, MM central.
-func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent, tradeID string) []*pb.ExecuteOrder {
-	// Issue #C5: Crear 1 ExecuteOrder por cada Slave configurado
-	orders := []*pb.ExecuteOrder{}
+func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent, tradeID, strategyID string) []*pb.ExecuteOrder {
+	orders := make([]*pb.ExecuteOrder, 0, len(r.core.config.SlaveAccounts))
+	canonicalSymbol := intent.Symbol
 
 	for _, slaveAccountID := range r.core.config.SlaveAccounts {
-		// Generar command_id único por slave
-		commandID := utils.GenerateUUIDv7()
+		policy, err := r.core.riskPolicyService.Get(ctx, slaveAccountID, strategyID)
+		if err != nil {
+			r.core.telemetry.Error(ctx, "Failed to load risk policy",
+				err,
+				attribute.String("trade_id", tradeID),
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("strategy_id", strategyID),
+			)
+			continue
+		}
 
-		// Issue #A2: Verificar dedupe de command_id antes de crear la orden
+		if policy == nil || policy.Type != domain.RiskPolicyTypeFixedLot || policy.FixedLot == nil || policy.FixedLot.LotSize <= 0 {
+			r.core.telemetry.Warn(ctx, "Risk policy missing or invalid",
+				attribute.String("trade_id", tradeID),
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("strategy_id", strategyID),
+			)
+			r.core.echoMetrics.RecordVolumeGuardDecision(ctx, string(volumeguard.DecisionReject),
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("canonical_symbol", canonicalSymbol),
+				attribute.String("strategy_id", strategyID),
+				attribute.String("reason", "risk_policy_missing"),
+			)
+			continue
+		}
+
+		requiredLot := policy.FixedLot.LotSize
+		lotSize := requiredLot
+		decision := volumeguard.DecisionPassThrough
+		var guardErr error
+		if r.core.volumeGuard != nil {
+			lotSize, decision, guardErr = r.core.volumeGuard.Execute(ctx, slaveAccountID, canonicalSymbol, strategyID, requiredLot)
+		}
+		if guardErr != nil {
+			if decision == volumeguard.DecisionReject {
+				r.core.telemetry.Warn(ctx, "Volume guard rejected lot",
+					attribute.String("trade_id", tradeID),
+					attribute.String("account_id", slaveAccountID),
+					attribute.String("strategy_id", strategyID),
+					attribute.String("canonical_symbol", canonicalSymbol),
+					attribute.String("error", guardErr.Error()),
+				)
+				continue
+			}
+			r.core.telemetry.Error(ctx, "Volume guard failed",
+				guardErr,
+				attribute.String("trade_id", tradeID),
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("strategy_id", strategyID),
+				attribute.String("canonical_symbol", canonicalSymbol),
+			)
+			continue
+		}
+		if decision == volumeguard.DecisionReject {
+			continue
+		}
+
+		commandID := utils.GenerateUUIDv7()
 		if r.isCommandIDDuplicate(commandID) {
 			r.core.telemetry.Warn(ctx, "Duplicate command_id detected, skipping",
 				attribute.String("command_id", commandID),
@@ -386,43 +448,32 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			continue
 		}
 
-		// Registrar command_id en dedupe
 		r.registerCommandID(commandID)
-
-		// i1: Registrar contexto del comando para correlación (usando tradeID normalizado)
 		r.registerCommandContext(commandID, tradeID, slaveAccountID, "execute_order")
 
-		// Opciones de transformación con target slave
 		opts := &domain.TransformOptions{
-			LotSize:   r.core.config.DefaultLotSize, // TODO i0: hardcoded 0.10
+			LotSize:   lotSize,
 			CommandID: commandID,
-			ClientID:  fmt.Sprintf("slave_%s", slaveAccountID), // Issue #C5
-			AccountID: slaveAccountID,                          // Issue #C5
+			ClientID:  fmt.Sprintf("slave_%s", slaveAccountID),
+			AccountID: slaveAccountID,
 		}
 
-		// Transformar usando SDK (propaga timestamps automáticamente)
 		order := domain.TradeIntentToExecuteOrder(intent, opts)
 
-		// i3: Traducir símbolo canónico a broker_symbol por cuenta
-		canonicalSymbol := intent.Symbol
 		brokerSymbol, info, found := r.core.symbolResolver.ResolveForAccount(ctx, slaveAccountID, canonicalSymbol)
 		if !found {
-			// No hay mapeo - aplicar política unknown_action
 			if r.core.canonicalValidator.UnknownAction() == UnknownActionReject {
 				r.core.telemetry.Warn(ctx, "Symbol mapping missing, order rejected (i3)",
 					attribute.String("account_id", slaveAccountID),
 					attribute.String("canonical_symbol", canonicalSymbol),
 				)
-				continue // Omitir esta orden
+				continue
 			}
-			// unknown_action=warn: continuar con símbolo original (compatibilidad)
 			r.core.telemetry.Warn(ctx, "Symbol mapping missing, using canonical symbol (i3)",
 				attribute.String("account_id", slaveAccountID),
 				attribute.String("canonical_symbol", canonicalSymbol),
 			)
-			// order.Symbol ya tiene el canonical desde TradeIntentToExecuteOrder
 		} else {
-			// Traducir a broker_symbol
 			order.Symbol = brokerSymbol
 			r.core.telemetry.Debug(ctx, "Symbol mapping applied (i3)",
 				attribute.String("account_id", slaveAccountID),
@@ -431,11 +482,19 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			)
 		}
 
-		// Ajustar SL/TP usando especificaciones y cotizaciones recientes
 		var spec *pb.SymbolSpecification
 		if r.core.symbolSpecService != nil {
-			if s, ok := r.core.symbolSpecService.GetSpecification(slaveAccountID, canonicalSymbol); ok {
-				spec = s
+			if specEntry, _, ok := r.core.symbolSpecService.GetSpecification(ctx, slaveAccountID, canonicalSymbol); ok {
+				spec = specEntry
+			}
+		}
+		if spec != nil && r.core.symbolSpecService != nil && r.core.config.VolumeGuard != nil {
+			if r.core.symbolSpecService.IsStale(slaveAccountID, canonicalSymbol, r.core.config.VolumeGuard.MaxSpecAge) {
+				r.core.telemetry.Warn(ctx, "Symbol specification stale for stop adjustment",
+					attribute.String("account_id", slaveAccountID),
+					attribute.String("canonical_symbol", canonicalSymbol),
+				)
+				spec = nil
 			}
 		}
 
@@ -462,9 +521,23 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			attribute.String("target_account_id", order.TargetAccountId),
 			attribute.String("symbol", order.Symbol),
 			attribute.Float64("lot_size", order.LotSize),
+			attribute.String("strategy_id", strategyID),
+			attribute.String("policy_type", string(policy.Type)),
 		)
 
 		orders = append(orders, order)
+	}
+
+	if len(orders) == 0 {
+		r.core.telemetry.Warn(ctx, "No ExecuteOrders generated after guard",
+			attribute.String("trade_id", tradeID),
+			attribute.String("strategy_id", strategyID),
+		)
+		if err := r.core.dedupeService.UpdateStatus(ctx, tradeID, domain.OrderStatusRejected); err != nil {
+			r.core.telemetry.Error(ctx, "Failed to update dedupe status after rejection", err,
+				attribute.String("trade_id", tradeID),
+			)
+		}
 	}
 
 	return orders

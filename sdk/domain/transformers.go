@@ -135,6 +135,10 @@ func JSONToTradeIntent(m map[string]interface{}) (*pb.TradeIntent, error) {
 		intent.Attempt = &attempt
 	}
 
+	if strategyID := utils.ExtractString(payload, "strategy_id"); strategyID != "" {
+		intent.StrategyId = strategyID
+	}
+
 	// Timestamps (Issue #C1)
 	intent.Timestamps = parseTimestamps(payload)
 
@@ -168,6 +172,10 @@ func TradeIntentToJSON(intent *pb.TradeIntent) (map[string]interface{}, error) {
 		"price":        intent.Price,
 		"magic_number": intent.MagicNumber,
 		"ticket":       intent.Ticket,
+	}
+
+	if intent.StrategyId != "" {
+		payload["strategy_id"] = intent.StrategyId
 	}
 
 	// Opcionales
@@ -640,6 +648,10 @@ func stringToProtoErrorCode(s string) pb.ErrorCode {
 		return pb.ErrorCode_ERROR_CODE_LONG_ONLY
 	case "SHORT_ONLY", "ERR_SHORT_ONLY":
 		return pb.ErrorCode_ERROR_CODE_SHORT_ONLY
+	case "SPEC_MISSING", "ERR_SPEC_MISSING":
+		return pb.ErrorCode_ERROR_CODE_SPEC_MISSING
+	case "RISK_POLICY_MISSING", "ERR_RISK_POLICY_MISSING":
+		return pb.ErrorCode_ERROR_CODE_RISK_POLICY_MISSING
 	default:
 		return pb.ErrorCode_ERROR_CODE_UNSPECIFIED
 	}
@@ -678,6 +690,10 @@ func protoErrorCodeToString(code pb.ErrorCode) string {
 		return "ERR_LONG_ONLY"
 	case pb.ErrorCode_ERROR_CODE_SHORT_ONLY:
 		return "ERR_SHORT_ONLY"
+	case pb.ErrorCode_ERROR_CODE_SPEC_MISSING:
+		return "ERR_SPEC_MISSING"
+	case pb.ErrorCode_ERROR_CODE_RISK_POLICY_MISSING:
+		return "ERR_RISK_POLICY_MISSING"
 	default:
 		return "ERR_UNKNOWN"
 	}

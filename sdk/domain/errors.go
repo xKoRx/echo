@@ -48,6 +48,8 @@ const (
 	ErrSpreadExceeded    ErrorCode = "SPREAD_EXCEEDED"
 	ErrSlippageExceeded  ErrorCode = "SLIPPAGE_EXCEEDED"
 	ErrDelayExceeded     ErrorCode = "DELAY_EXCEEDED"
+	ErrSpecMissing       ErrorCode = "SPEC_MISSING"
+	ErrRiskPolicyMissing ErrorCode = "RISK_POLICY_MISSING"
 )
 
 // TradingError representa un error del dominio de trading con contexto.
@@ -140,6 +142,10 @@ func ErrorCodeFromProto(protoCode pb.ErrorCode) ErrorCode {
 		return ErrLongOnly
 	case pb.ErrorCode_ERROR_CODE_SHORT_ONLY:
 		return ErrShortOnly
+	case pb.ErrorCode_ERROR_CODE_SPEC_MISSING:
+		return ErrSpecMissing
+	case pb.ErrorCode_ERROR_CODE_RISK_POLICY_MISSING:
+		return ErrRiskPolicyMissing
 	default:
 		return ErrUnknown
 	}
@@ -178,6 +184,10 @@ func ErrorCodeToProto(code ErrorCode) pb.ErrorCode {
 		return pb.ErrorCode_ERROR_CODE_LONG_ONLY
 	case ErrShortOnly:
 		return pb.ErrorCode_ERROR_CODE_SHORT_ONLY
+	case ErrSpecMissing:
+		return pb.ErrorCode_ERROR_CODE_SPEC_MISSING
+	case ErrRiskPolicyMissing:
+		return pb.ErrorCode_ERROR_CODE_RISK_POLICY_MISSING
 	default:
 		return pb.ErrorCode_ERROR_CODE_UNSPECIFIED
 	}

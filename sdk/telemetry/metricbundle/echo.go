@@ -59,6 +59,11 @@ type EchoMetrics struct {
 	OrderSent            metric.Int64Counter
 	ExecutionDispatched  metric.Int64Counter
 	ExecutionCompleted   metric.Int64Counter
+	VolumeClamp          metric.Int64Counter
+	VolumeGuardDecision  metric.Int64Counter
+	AgentSpecsForwarded  metric.Int64Counter
+	AgentSpecsFiltered   metric.Int64Counter
+	RiskPolicyLookup     metric.Int64Counter
 
 	// Histograms
 	LatencyE2E           metric.Float64Histogram
@@ -67,6 +72,7 @@ type EchoMetrics struct {
 	LatencyCoreToAgent   metric.Float64Histogram
 	LatencyAgentToSlave  metric.Float64Histogram
 	LatencySlaveExecution metric.Float64Histogram
+	VolumeGuardSpecAge   metric.Float64Histogram
 
 	// i2: Routing metrics
 	RoutingMode     metric.Int64Counter
@@ -136,6 +142,51 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	volumeClamp, err := meter.Int64Counter(
+		"echo.core.volume_guard_clamp_total",
+		metric.WithDescription("Órdenes ajustadas por el guardián de volumen"),
+		metric.WithUnit("{clamp}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	volumeGuardDecision, err := meter.Int64Counter(
+		"echo.core.volume_guard_decision_total",
+		metric.WithDescription("Decisiones del guardián de volumen (clamp/reject/pass_through)"),
+		metric.WithUnit("{decision}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agentSpecsForwarded, err := meter.Int64Counter(
+		"echo.agent.specs.forwarded_total",
+		metric.WithDescription("Reportes de especificaciones reenviados al Core"),
+		metric.WithUnit("{report}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agentSpecsFiltered, err := meter.Int64Counter(
+		"echo.agent.specs.filtered_total",
+		metric.WithDescription("Reportes de especificaciones filtrados en el Agent"),
+		metric.WithUnit("{report}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	riskPolicyLookup, err := meter.Int64Counter(
+		"echo.core.risk_policy_lookup_total",
+		metric.WithDescription("Consultas al servicio de políticas de riesgo (hit/miss)"),
+		metric.WithUnit("{lookup}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Histograms
 	latencyE2E, err := meter.Float64Histogram(
 		"echo.latency.e2e",
@@ -185,6 +236,15 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 	latencySlaveExecution, err := meter.Float64Histogram(
 		"echo.latency.slave_execution",
 		metric.WithDescription("Latencia ejecución en Slave (t7 - t6)"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	volumeGuardSpecAge, err := meter.Float64Histogram(
+		"echo.core.volume_guard_spec_age_ms",
+		metric.WithDescription("Edad de la especificación de símbolo utilizada por el guardián de volumen"),
 		metric.WithUnit("ms"),
 	)
 	if err != nil {
@@ -254,12 +314,18 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		OrderSent:            orderSent,
 		ExecutionDispatched:  executionDispatched,
 		ExecutionCompleted:   executionCompleted,
+		VolumeClamp:          volumeClamp,
+		VolumeGuardDecision:  volumeGuardDecision,
+		AgentSpecsForwarded:  agentSpecsForwarded,
+		AgentSpecsFiltered:   agentSpecsFiltered,
+		RiskPolicyLookup:     riskPolicyLookup,
 		LatencyE2E:           latencyE2E,
 		LatencyAgentToCore:   latencyAgentToCore,
 		LatencyCoreProcess:   latencyCoreProcess,
 		LatencyCoreToAgent:   latencyCoreToAgent,
 		LatencyAgentToSlave:  latencyAgentToSlave,
 		LatencySlaveExecution: latencySlaveExecution,
+		VolumeGuardSpecAge:   volumeGuardSpecAge,
 		RoutingMode:          routingMode,     // i2
 		AccountLookup:        accountLookup,   // i2
 		SymbolsLookup:        symbolsLookup,   // i3
@@ -402,5 +468,54 @@ func (m *EchoMetrics) RecordSymbolsLoaded(ctx context.Context, source string, co
 	}
 	baseAttrs = append(baseAttrs, attrs...)
 	m.SymbolsLoaded.Add(ctx, int64(count), metric.WithAttributes(baseAttrs...))
+}
+
+// RecordVolumeClamp registra un clamp de lot size por el guardián de volumen.
+func (m *EchoMetrics) RecordVolumeClamp(ctx context.Context, attrs ...attribute.KeyValue) {
+	m.VolumeClamp.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordVolumeGuardDecision registra la decisión del guardián de volumen.
+// decision: clamp | reject | pass_through
+func (m *EchoMetrics) RecordVolumeGuardDecision(ctx context.Context, decision string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("decision", decision),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.VolumeGuardDecision.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordVolumeGuardSpecAge registra la edad (en ms) de la especificación usada.
+func (m *EchoMetrics) RecordVolumeGuardSpecAge(ctx context.Context, ageMs float64, attrs ...attribute.KeyValue) {
+	m.VolumeGuardSpecAge.Record(ctx, ageMs, metric.WithAttributes(attrs...))
+}
+
+// RecordAgentSpecsForwarded registra reportes de especificaciones enviados al Core.
+func (m *EchoMetrics) RecordAgentSpecsForwarded(ctx context.Context, accountID string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("account_id", accountID),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.AgentSpecsForwarded.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordAgentSpecsFiltered registra reportes de especificaciones filtrados en el Agent.
+func (m *EchoMetrics) RecordAgentSpecsFiltered(ctx context.Context, accountID, reason string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("account_id", accountID),
+		attribute.String("reason", reason),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.AgentSpecsFiltered.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordRiskPolicyLookup registra consultas al servicio de políticas de riesgo.
+// result: hit | miss
+func (m *EchoMetrics) RecordRiskPolicyLookup(ctx context.Context, result string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("result", result),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.RiskPolicyLookup.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
 }
 

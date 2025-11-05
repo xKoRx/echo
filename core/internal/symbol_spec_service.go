@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/xKoRx/echo/sdk/domain"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
@@ -120,20 +121,70 @@ func (s *SymbolSpecService) Upsert(ctx context.Context, report *pb.SymbolSpecRep
 }
 
 // GetSpecification retorna una copia de la especificación almacenada.
-func (s *SymbolSpecService) GetSpecification(accountID, canonical string) (*pb.SymbolSpecification, bool) {
+func (s *SymbolSpecService) GetSpecification(ctx context.Context, accountID, canonical string) (*pb.SymbolSpecification, int64, bool) {
 	s.mu.RLock()
 	accountSpecs, ok := s.specs[accountID]
 	if !ok {
 		s.mu.RUnlock()
-		return nil, false
+		return nil, 0, false
 	}
 	entry, ok := accountSpecs[canonical]
 	s.mu.RUnlock()
 	if !ok || entry == nil {
-		return nil, false
+		return nil, 0, false
 	}
 
-	return proto.Clone(entry.spec).(*pb.SymbolSpecification), true
+	return proto.Clone(entry.spec).(*pb.SymbolSpecification), entry.reportedAtMs, true
+}
+
+// GetVolumeSpec retorna la sección de volumen y su timestamp ReportedAt.
+func (s *SymbolSpecService) GetVolumeSpec(ctx context.Context, accountID, canonical string) (*pb.VolumeSpec, int64, bool) {
+	spec, reportedAt, ok := s.GetSpecification(ctx, accountID, canonical)
+	if !ok || spec == nil || spec.Volume == nil {
+		return nil, reportedAt, false
+	}
+
+	return proto.Clone(spec.Volume).(*pb.VolumeSpec), reportedAt, true
+}
+
+// IsStale indica si la especificación está vencida según el maxAge provisto.
+func (s *SymbolSpecService) IsStale(accountID, canonical string, maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		return false
+	}
+
+	s.mu.RLock()
+	accountSpecs, ok := s.specs[accountID]
+	if !ok {
+		s.mu.RUnlock()
+		return true
+	}
+	entry := accountSpecs[canonical]
+	s.mu.RUnlock()
+	if entry == nil || entry.reportedAtMs == 0 {
+		return true
+	}
+
+	reportedAt := time.UnixMilli(entry.reportedAtMs)
+	age := time.Since(reportedAt)
+	return age > maxAge
+}
+
+// SpecAge retorna la edad de la especificación y un booleano indicando si existe.
+func (s *SymbolSpecService) SpecAge(accountID, canonical string) (time.Duration, bool) {
+	s.mu.RLock()
+	accountSpecs, ok := s.specs[accountID]
+	if !ok {
+		s.mu.RUnlock()
+		return 0, false
+	}
+	entry := accountSpecs[canonical]
+	s.mu.RUnlock()
+	if entry == nil || entry.reportedAtMs == 0 {
+		return 0, false
+	}
+
+	return time.Since(time.UnixMilli(entry.reportedAtMs)), true
 }
 
 // Invalidate elimina especificaciones en caché para la cuenta (mantiene persistencia).

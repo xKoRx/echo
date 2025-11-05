@@ -26,6 +26,9 @@ message TradeIntent {
   
   // Timestamps para latencia E2E (Issue #C1)
   TimestampMetadata timestamps = 20;
+
+  // Identificador de estrategia (iteración 4)
+  string strategy_id = 21;
 }
 
 // TradeClose representa el cierre de un trade del Master

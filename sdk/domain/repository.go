@@ -163,6 +163,11 @@ type SymbolQuoteRepository interface {
 	GetLatestSnapshot(ctx context.Context, accountID, canonicalSymbol string) (*pb.SymbolQuoteSnapshot, error)
 }
 
+// RiskPolicyRepository define operaciones para políticas de riesgo.
+type RiskPolicyRepository interface {
+	Get(ctx context.Context, accountID, strategyID string) (*RiskPolicy, error)
+}
+
 // RepositoryFactory crea instancias de repositorios.
 //
 // Uso:
@@ -179,4 +184,5 @@ type RepositoryFactory interface {
 	SymbolRepository() SymbolRepository // NEW i3
 	SymbolSpecRepository() SymbolSpecRepository
 	SymbolQuoteRepository() SymbolQuoteRepository
+	RiskPolicyRepository() RiskPolicyRepository
 }

@@ -44,7 +44,7 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		"agent/flush_force":         "false", // Desactivado por defecto (i1)
 		"agent/send_queue_size":     "100",
 		"agent/reconnect_backoff_s": "5",
-		"agent/log_level":           "INFO", // INFO, DEBUG, WARN, ERROR
+		"agent/log_level":           "WARN", // INFO, DEBUG, WARN, ERROR
 
 		// gRPC KeepAlive Server (RFC-003 sección 7)
 		"grpc/keepalive/time_s":     "60",
@@ -57,17 +57,26 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		"grpc/client_keepalive/permit_without_stream": "false",
 
 		// Core
-		"core/grpc_port":          "50051",
-		"core/default_lot_size":   "0.10",   // i0 hardcoded, se mantiene en i1
-		"core/dedupe_ttl_minutes": "60",     // 1 hora
-		"core/symbol_whitelist":   "XAUUSD", // i0: solo XAUUSD
-		"core/log_level":          "INFO",   // INFO, DEBUG, WARN, ERROR
+		"core/grpc_port":                "50051",
+		"core/default_lot_size":         "0.10",   // i0 hardcoded, se mantiene en i1 (deprecated i4)
+		"core/dedupe_ttl_minutes":       "60",     // 1 hora
+		"core/symbol_whitelist":         "XAUUSD", // i0: solo XAUUSD
+		"core/log_level":                "WARN",   // INFO, DEBUG, WARN, ERROR
+		"core/specs/default_lot":        "0.10",
+		"core/specs/missing_policy":     "reject",
+		"core/specs/max_age_ms":         "10000",
+		"core/specs/alert_threshold_ms": "8000",
+		"core/risk/missing_policy":      "reject",
+		"core/risk/cache_ttl_ms":        "5000",
 
 		// Slave Accounts (i0: cuentas demo reales)
 		"core/slave_accounts": "2089126183,2089126186",
 
 		"core/canonical_symbols":      "XAUUSD,DAX", // XAUUSD,DAX,EURUSD,GBPUSD,USDCHF,USDJPY
 		"core/symbols/unknown_action": "reject",     // reject, warn, error
+
+		// Agent extras
+		"agent/canonical_symbols": "XAUUSD,DAX",
 
 		// PostgreSQL
 		"postgres/host":           "192.168.31.220",

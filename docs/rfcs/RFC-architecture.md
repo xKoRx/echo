@@ -191,7 +191,7 @@ flowchart LR
 | Catálogo canónico de símbolos | `canonical_symbol ⇄ broker_symbol`, validación pre-orden, snapshots 250 ms. | i3 | ✅ |
 | Guardián de especificaciones | Caché + persistencia `min_lot`, `lot_step`, `stop_level`; clamps previos a `ExecuteOrder`. | i4 | ✅ |
 | Políticas `FIXED_LOT` | Registro en Postgres + caché `RiskPolicyService`; rechazo sin política. | i4 | ✅ |
-| Versionado de handshake & feedback | `protocol_version`, `SymbolRegistrationResult`. | i5 | ⏳ |
+| Versionado de handshake & feedback | `protocol_version`, `SymbolRegistrationResult` con severidades y warnings globales persistidos. | i5 | ⏳ |
 | Sizing con riesgo fijo (Modo A) | Distancia SL × tick value; clamps min/max lot. | i6 | ⏳ |
 | Filtros de spread y desvío | Evaluación de tolerancias por cuenta×símbolo. | i7 | ⏳ |
 | SL/TP con offset | Aplicar offsets configurables en apertura. | i8a | ⏳ |

@@ -477,7 +477,7 @@ func (h *PipeHandler) handleTradeIntent(msgMap map[string]interface{}) error {
 	t1 := utils.NowUnixMilli()
 
 	// Transformar JSON → Proto usando SDK
-	protoIntent, err := domain.JSONToTradeIntent(msgMap)
+	protoIntent, err := domain.JSONToTradeIntentWithWhitelist(msgMap, h.canonicalSymbols)
 	if err != nil {
 		return fmt.Errorf("failed to parse trade_intent: %w", err)
 	}

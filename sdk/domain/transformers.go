@@ -89,6 +89,31 @@ func cloneTimestamps(ts *pb.TimestampMetadata) *pb.TimestampMetadata {
 //	jsonMap, _ := utils.JSONToMap(jsonBytes)
 //	intent, err := domain.JSONToTradeIntent(jsonMap)
 func JSONToTradeIntent(m map[string]interface{}) (*pb.TradeIntent, error) {
+	return JSONToTradeIntentWithWhitelist(m, []string{"XAUUSD"})
+}
+
+// JSONToTradeIntentWithWhitelist convierte un map JSON a TradeIntent proto utilizando una whitelist dinámica.
+//
+// Si la whitelist está vacía se usa el fallback histórico `[]string{"XAUUSD"}` para mantener compatibilidad.
+func JSONToTradeIntentWithWhitelist(m map[string]interface{}, whitelist []string) (*pb.TradeIntent, error) {
+	intent, err := buildTradeIntentFromJSON(m)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+
+ 	effective := whitelist
+ 	if len(effective) == 0 {
+ 		effective = []string{"XAUUSD"}
+ 	}
+
+ 	if err := ValidateTradeIntent(intent, effective); err != nil {
+ 		return nil, fmt.Errorf("validation failed: %w", err)
+ 	}
+
+ 	return intent, nil
+}
+
+func buildTradeIntentFromJSON(m map[string]interface{}) (*pb.TradeIntent, error) {
 	// Extraer payload
 	payload, ok := m["payload"].(map[string]interface{})
 	if !ok {
@@ -143,11 +168,6 @@ func JSONToTradeIntent(m map[string]interface{}) (*pb.TradeIntent, error) {
 
 	// Timestamps (Issue #C1)
 	intent.Timestamps = parseTimestamps(payload)
-
-	// Validar antes de retornar (Issue #A1)
-	if err := ValidateTradeIntent(intent, []string{"XAUUSD"}); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
-	}
 
 	return intent, nil
 }

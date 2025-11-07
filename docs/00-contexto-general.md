@@ -1,7 +1,7 @@
 ---
 title: "Echo — Contexto General del Copiador de Operaciones"
-version: "1.0"
-date: "2025-10-29"
+version: "1.1"
+date: "2025-11-07"
 status: "Base"
 owner: "Aranea Labs"
 ---
@@ -39,6 +39,7 @@ Un copiador replica en una o varias cuentas seguidoras (slaves) las operaciones 
   - Tolerancia de desvío configurable (puntos/pips) y filtro de spread máximo. Implementado desde i6.
   - Fanout paralelo a múltiples slaves para minimizar colas y sesgos por orden, con envío dirigido a Agents propietarios desde i2 (routing selectivo).
   - Opción de "espera de mejora" con timeout estricto (solo si reduce slippage neto). Implementado en i10 (opcional, time-boxed).
+  - Hardening multi-activo (i6): master y slave validan precios por símbolo usando `MarketInfo(symbol, MODE_ASK/BID)` y rechazan ejecuciones cuando el feed no corresponde, evitando replicar quotes de otro instrumento.
 
 2) SL/TP desincronizados y StopLevel
 - Problema: el slave puede tocar SL/TP que el master no toca; StopLevel del broker puede impedir setear niveles en la apertura.

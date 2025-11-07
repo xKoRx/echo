@@ -1,7 +1,7 @@
 ---
 title: "RFC-001 — Arquitectura de Echo V1"
-version: "2.1"
-date: "2025-11-05"
+version: "2.2"
+date: "2025-11-07"
 status: "Living"
 authors:
   - "Equipo Echo"
@@ -122,6 +122,8 @@ flowchart LR
 - Emite `TradeIntent`, `TradeClose`, `TradeModify` con trace id compartido.
 - No realiza Money Management ni filtros de spread.
 - Logs estructurados vía `JAson.mqh` (JSON con campos obligatorios).
+- Input configurable `Symbols` (CSV) para publicar múltiples símbolos canónicos en el handshake y habilitar detección de órdenes en cada uno. El EA solo emite intents para los símbolos aceptados por el Core.
+- Sanitiza precios multi-activo: cada intent serializa el precio y SL/TP del símbolo origen, evitando dependencias del chart activo (hardening i6).
 
 ### 4.2 Agent
 - Mantiene un pipe por EA (`handshake`, `trade_intent`, `execution_result`, `symbol_spec_report`, `quote_snapshot`).
@@ -142,6 +144,7 @@ flowchart LR
 - Ejecuta `OrderSend`, `OrderClose`, `OrderModify` (offsets/StopLevel en roadmap).
 - Envía `ExecutionResult` con timestamps `t0…t7`, logs estructurados y `terminal_boot_id` + `server_time_ms` para evitar staleness.
 - Publica `symbol_spec_report` y `quote_snapshot` (250 ms) tras handshake y reconexión.
+- Desde i6 reforzado: al ejecutar/cerrar órdenes utiliza siempre `MarketInfo(symbol, MODE_ASK/BID)` del símbolo objetivo, validando disponibilidad de cotización y rechazando comandos cuando el feed no está vigente.
 
 ### 4.5 SDK Echo
 - Proto `agent.proto`, `trade.proto`, `common.proto` (mensajes compartidos).
@@ -190,6 +193,7 @@ flowchart LR
 | Routing selectivo | Ownership `account_id → agent_id`, envío dirigido de comandos. | i2 | ✅ |
 | Control de backpressure en broadcast | Timeouts de envío a canales, latencia estabilizada (<500 ms). | i2b | ✅ |
 | Catálogo canónico de símbolos | `canonical_symbol ⇄ broker_symbol`, validación pre-orden, snapshots 250 ms. | i3 | ✅ |
+| Integridad multi-activo de precios | Handshake + Agent propagan specs/quotes y los EAs consumen `MarketInfo` por símbolo al ejecutar/cerrar, evitando que activos compartan precios. | i3 (hardening i6) | ✅ |
 | Guardián de especificaciones | Caché/persistencia `min_lot`, `lot_step`, `stop_level`; clamps previos a `ExecuteOrder`. | i4 | ✅ |
 | Políticas `FIXED_LOT` | Registro en Postgres + caché `RiskPolicyService`; rechazo inmediato sin política. | i4 | ✅ |
 | Motor `FIXED_RISK` | Cálculo centralizado de lotes según riesgo monetario, validación de SL/quotes/specs, métricas `echo.core.risk.*`. | i6 | ✅ |

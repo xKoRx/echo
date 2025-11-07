@@ -105,6 +105,7 @@ La iteración 6 habilita el primer modo de money management profesional en Echo:
   - `SymbolSpecReport` incluirá `general.tick_value = MarketInfo(symbol, MODE_TICKVALUE)` y `general.margin_currency = AccountCurrency()`.
   - Actualizar logs estructurados para registrar `tick_value` y `currency` por símbolo.
   - El EA seguirá aplicando órdenes a mercado; SL/TP provienen del Core.
+  - Hardening multi-activo: `OrderSend`/`OrderClose` consultan `MarketInfo(symbol, MODE_ASK/BID)` del símbolo recibido en el comando y abortan con `price_unavailable` cuando la cotización no está disponible o pertenece a otro instrumento.
 
 ### Agent (`echo/agent`)
 

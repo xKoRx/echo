@@ -57,21 +57,27 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		"grpc/client_keepalive/permit_without_stream": "false",
 
 		// Core
-		"core/grpc_port":                  "50051",
-		"core/default_lot_size":           "0.10",   // i0 hardcoded, se mantiene en i1 (deprecated i4)
-		"core/dedupe_ttl_minutes":         "60",     // 1 hora
-		"core/symbol_whitelist":           "XAUUSD", // i0: solo XAUUSD
-		"core/log_level":                  "WARN",   // INFO, DEBUG, WARN, ERROR
-		"core/specs/default_lot":          "0.10",
-		"core/specs/missing_policy":       "reject",
-		"core/specs/max_age_ms":           "10000",
-		"core/specs/alert_threshold_ms":   "8000",
-		"core/risk/missing_policy":        "reject",
-		"core/risk/cache_ttl_ms":          "5000",
-		"core/protocol/min_version":       "1",
-		"core/protocol/max_version":       "2",
-		"core/protocol/required_features": "spec_report/v1,quotes/250ms",
-		"core/protocol/retry_interval_ms": "600000",
+		"core/grpc_port":                         "50051",
+		"core/default_lot_size":                  "0.10",   // i0 hardcoded, se mantiene en i1 (deprecated i4)
+		"core/dedupe_ttl_minutes":                "60",     // 1 hora
+		"core/symbol_whitelist":                  "XAUUSD", // i0: solo XAUUSD
+		"core/log_level":                         "WARN",   // INFO, DEBUG, WARN, ERROR
+		"core/specs/default_lot":                 "0.10",
+		"core/specs/missing_policy":              "reject",
+		"core/specs/max_age_ms":                  "10000",
+		"core/specs/alert_threshold_ms":          "8000",
+		"core/risk/missing_policy":               "reject",
+		"core/risk/cache_ttl_ms":                 "5000",
+		"core/risk/quote_max_age_ms":             "750",
+		"core/risk/min_distance_points":          "5",
+		"core/risk/max_risk_drift_pct":           "0.02",
+		"core/risk/default_currency":             "USD",
+		"core/risk/enable_currency_fallback":     "false",
+		"core/risk/reject_on_missing_tick_value": "true",
+		"core/protocol/min_version":              "1",
+		"core/protocol/max_version":              "2",
+		"core/protocol/required_features":        "spec_report/v1,quotes/250ms,spec_report/tickvalue",
+		"core/protocol/retry_interval_ms":        "600000",
 
 		// Slave Accounts (i0: cuentas demo reales)
 		"core/slave_accounts": "2089126183,2089126186",

@@ -728,8 +728,18 @@ func ValidateAccountSymbolsReport(report *pb.AccountSymbolsReport, allowedCanoni
 	return nil
 }
 
+// SymbolSpecValidationOptions define banderas opcionales para validar especificaciones de símbolo.
+type SymbolSpecValidationOptions struct {
+	RequireTickValue bool
+}
+
 // ValidateSymbolSpecReport valida un SymbolSpecReport completo.
 func ValidateSymbolSpecReport(report *pb.SymbolSpecReport, allowedCanonicals []string) error {
+	return ValidateSymbolSpecReportWithOptions(report, allowedCanonicals, SymbolSpecValidationOptions{})
+}
+
+// ValidateSymbolSpecReportWithOptions permite validar incluyendo opciones adicionales (i6).
+func ValidateSymbolSpecReportWithOptions(report *pb.SymbolSpecReport, allowedCanonicals []string, opts SymbolSpecValidationOptions) error {
 	if report == nil {
 		return NewError(ErrMissingRequiredField, "SymbolSpecReport is nil")
 	}
@@ -747,7 +757,7 @@ func ValidateSymbolSpecReport(report *pb.SymbolSpecReport, allowedCanonicals []s
 	}
 
 	for i, spec := range report.Symbols {
-		if err := ValidateSymbolSpecification(spec, allowedCanonicals); err != nil {
+		if err := validateSymbolSpecification(spec, allowedCanonicals, opts); err != nil {
 			return fmt.Errorf("invalid symbol specification at index %d: %w", i, err)
 		}
 	}
@@ -757,6 +767,15 @@ func ValidateSymbolSpecReport(report *pb.SymbolSpecReport, allowedCanonicals []s
 
 // ValidateSymbolSpecification valida las especificaciones completas de un símbolo.
 func ValidateSymbolSpecification(spec *pb.SymbolSpecification, allowedCanonicals []string) error {
+	return validateSymbolSpecification(spec, allowedCanonicals, SymbolSpecValidationOptions{})
+}
+
+// ValidateSymbolSpecificationWithOptions permite validar especificaciones con opciones avanzadas.
+func ValidateSymbolSpecificationWithOptions(spec *pb.SymbolSpecification, allowedCanonicals []string, opts SymbolSpecValidationOptions) error {
+	return validateSymbolSpecification(spec, allowedCanonicals, opts)
+}
+
+func validateSymbolSpecification(spec *pb.SymbolSpecification, allowedCanonicals []string, opts SymbolSpecValidationOptions) error {
 	if spec == nil {
 		return NewError(ErrMissingRequiredField, "SymbolSpecification is nil")
 	}
@@ -777,7 +796,7 @@ func ValidateSymbolSpecification(spec *pb.SymbolSpecification, allowedCanonicals
 		return NewValidationError("general", nil, "general specification is required")
 	}
 
-	if err := validateSymbolGeneral(spec.General); err != nil {
+	if err := validateSymbolGeneral(spec.General, opts.RequireTickValue); err != nil {
 		return err
 	}
 
@@ -806,7 +825,7 @@ func ValidateSymbolSpecification(spec *pb.SymbolSpecification, allowedCanonicals
 	return nil
 }
 
-func validateSymbolGeneral(general *pb.SymbolGeneral) error {
+func validateSymbolGeneral(general *pb.SymbolGeneral, requireTickValue bool) error {
 	if general == nil {
 		return NewValidationError("general", nil, "general specification is required")
 	}
@@ -861,6 +880,14 @@ func validateSymbolGeneral(general *pb.SymbolGeneral) error {
 
 	if general.GtcMode == pb.GTCMode_GTC_MODE_UNSPECIFIED {
 		return NewValidationError("gtc_mode", general.GtcMode, "gtc_mode cannot be unspecified")
+	}
+
+	if general.TickValue < 0 {
+		return NewValidationError("tick_value", general.TickValue, "tick_value cannot be negative")
+	}
+
+	if requireTickValue && general.TickValue <= 0 {
+		return NewValidationError("tick_value", general.TickValue, "tick_value must be > 0 when spec_report/tickvalue capability is present")
 	}
 
 	return nil

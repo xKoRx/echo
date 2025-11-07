@@ -49,6 +49,8 @@ enum ErrorCode {
   ERROR_CODE_SHORT_ONLY = 14;
   ERROR_CODE_SPEC_MISSING = 1001;
   ERROR_CODE_RISK_POLICY_MISSING = 1002;
+  ERROR_CODE_RISK_POLICY_INVALID = 1003;
+  ERROR_CODE_STOP_REQUIRED = 1004;
 }
 
 // TimestampMetadata contiene los timestamps de latencia E2E

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xKoRx/echo/core/internal/repository"
+	"github.com/xKoRx/echo/core/internal/riskengine"
 	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
 	"github.com/xKoRx/echo/sdk/domain/handshake"
@@ -71,10 +72,12 @@ type Core struct {
 	volumeGuard       volumeguard.Guard
 
 	// i3: Validación y resolución de símbolos
-	canonicalValidator *CanonicalValidator
-	symbolResolver     *AccountSymbolResolver
-	symbolSpecService  *SymbolSpecService
-	symbolQuoteService *SymbolQuoteService
+	canonicalValidator  *CanonicalValidator
+	symbolResolver      *AccountSymbolResolver
+	symbolSpecService   *SymbolSpecService
+	symbolQuoteService  *SymbolQuoteService
+	accountStateService *AccountStateService
+	riskEngine          *riskengine.FixedRiskEngine
 
 	// Router/Processor
 	router *Router
@@ -218,8 +221,18 @@ func New(ctx context.Context) (*Core, error) {
 	symbolResolver.Start() // Iniciar worker de persistencia async
 	symbolSpecService := NewSymbolSpecService(repoFactory.SymbolSpecRepository(), telClient, echoMetrics, config.CanonicalSymbols)
 	symbolQuoteService := NewSymbolQuoteService(repoFactory.SymbolQuoteRepository(), telClient)
+	accountStateService := NewAccountStateService(telClient)
 	riskPolicySvc := NewRiskPolicyService(repoFactory.RiskPolicyRepository(), config.Risk.CacheTTL, telClient, echoMetrics)
 	volumeGuard := volumeguard.New(symbolSpecService, config.VolumeGuard, telClient, echoMetrics)
+	riskEngineCfg := riskengine.Config{
+		MaxQuoteAge:              config.Risk.Engine.QuoteMaxAge,
+		MinDistancePoints:        config.Risk.Engine.MinDistancePoints,
+		MaxRiskDrift:             config.Risk.Engine.MaxRiskDrift,
+		DefaultCurrency:          config.Risk.Engine.DefaultCurrency,
+		EnableCurrencyFallback:   config.Risk.Engine.EnableCurrencyFallback,
+		RejectOnMissingTickValue: config.Risk.Engine.RejectOnMissingTickValue,
+	}
+	fixedRiskEngine := riskengine.NewFixedRiskEngine(symbolSpecService, symbolQuoteService, accountStateService, &symbolInfoAdapter{resolver: symbolResolver}, volumeGuard, riskEngineCfg, telClient, echoMetrics)
 	if rs, ok := riskPolicySvc.(*riskPolicyService); ok {
 		if err := rs.StartListener(coreCtx, config.PostgresConnStr()); err != nil {
 			telClient.Warn(coreCtx, "Failed to start risk policy listener",
@@ -255,25 +268,27 @@ func New(ctx context.Context) (*Core, error) {
 
 	// 7. Crear Core
 	core := &Core{
-		config:             config,
-		db:                 db,
-		repoFactory:        repoFactory,
-		correlationSvc:     correlationSvc,
-		dedupeService:      dedupeService,
-		riskPolicyService:  riskPolicySvc,
-		volumeGuard:        volumeGuard,
-		canonicalValidator: canonicalValidator, // NEW i3
-		symbolResolver:     symbolResolver,     // NEW i3
-		symbolSpecService:  symbolSpecService,
-		symbolQuoteService: symbolQuoteService,
-		agents:             make(map[string]*AgentConnection),
-		accountRegistry:    NewAccountRegistry(telClient), // NEW i2
-		telemetry:          telClient,
-		echoMetrics:        echoMetrics,
-		ctx:                coreCtx,
-		cancel:             cancel,
-		handshakeEvaluator: handshakeEvaluator,
-		handshakeRegistry:  handshakeRegistry,
+		config:              config,
+		db:                  db,
+		repoFactory:         repoFactory,
+		correlationSvc:      correlationSvc,
+		dedupeService:       dedupeService,
+		riskPolicyService:   riskPolicySvc,
+		volumeGuard:         volumeGuard,
+		canonicalValidator:  canonicalValidator, // NEW i3
+		symbolResolver:      symbolResolver,     // NEW i3
+		symbolSpecService:   symbolSpecService,
+		symbolQuoteService:  symbolQuoteService,
+		accountStateService: accountStateService,
+		riskEngine:          fixedRiskEngine,
+		agents:              make(map[string]*AgentConnection),
+		accountRegistry:     NewAccountRegistry(telClient), // NEW i2
+		telemetry:           telClient,
+		echoMetrics:         echoMetrics,
+		ctx:                 coreCtx,
+		cancel:              cancel,
+		handshakeEvaluator:  handshakeEvaluator,
+		handshakeRegistry:   handshakeRegistry,
 	}
 
 	core.handshakeReconciler = newHandshakeReconciler(
@@ -1022,4 +1037,16 @@ func (c *Core) handleSymbolQuoteSnapshot(ctx context.Context, agentID string, sn
 		attribute.Float64("bid", snapshot.Bid),
 		attribute.Float64("ask", snapshot.Ask),
 	)
+}
+
+type symbolInfoAdapter struct {
+	resolver *AccountSymbolResolver
+}
+
+func (a *symbolInfoAdapter) Resolve(ctx context.Context, accountID, canonical string) (*domain.AccountSymbolInfo, bool) {
+	if a == nil || a.resolver == nil {
+		return nil, false
+	}
+	_, info, found := a.resolver.ResolveForAccount(ctx, accountID, canonical)
+	return info, found
 }

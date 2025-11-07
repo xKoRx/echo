@@ -135,11 +135,20 @@ func (e *HandshakeEvaluator) evaluate(
 			prev.Capabilities = evaluation.Capabilities
 
 			if e.telemetry != nil {
-				e.telemetry.Debug(ctx, "Handshake evaluation unchanged (master)",
-					semconv.Echo.AccountID.String(accountID),
-					attribute.String("pipe_role", pipeRole),
-					attribute.String("status", registrationStatusString(prev.Status)),
-				)
+				status := registrationStatusString(prev.Status)
+				if status != "ACCEPTED" {
+					e.telemetry.Debug(ctx, "Handshake evaluation unchanged (master)",
+						semconv.Echo.AccountID.String(accountID),
+						attribute.String("pipe_role", pipeRole),
+						attribute.String("status", status),
+					)
+				} else {
+					e.telemetry.Info(ctx, "Handshake evaluation unchanged (master)",
+						semconv.Echo.AccountID.String(accountID),
+						attribute.String("pipe_role", pipeRole),
+						attribute.String("status", status),
+					)
+				}
 			}
 
 			return prev, false, nil
@@ -171,11 +180,20 @@ func (e *HandshakeEvaluator) evaluate(
 		prev.Capabilities = evaluation.Capabilities
 
 		if e.telemetry != nil {
-			e.telemetry.Debug(ctx, "Handshake evaluation unchanged",
+			status := registrationStatusString(prev.Status)
+			if status != "ACCEPTED" {
+				e.telemetry.Debug(ctx, "Handshake evaluation unchanged",
+					semconv.Echo.AccountID.String(accountID),
+					attribute.String("pipe_role", pipeRole),
+					attribute.String("status", status),
+				)
+			} else {
+				e.telemetry.Info(ctx, "Handshake evaluation unchanged",
 				semconv.Echo.AccountID.String(accountID),
 				attribute.String("pipe_role", pipeRole),
-				attribute.String("status", registrationStatusString(prev.Status)),
+					attribute.String("status", status),
 			)
+			}
 		}
 		return prev, false, nil
 	}
@@ -279,7 +297,7 @@ func (e *HandshakeEvaluator) buildEvaluation(
 		}
 
 		policy, policyErr := e.riskPolicyService.Get(ctx, accountID, "default")
-		if policyErr != nil || policy == nil || policy.Type != domain.RiskPolicyTypeFixedLot || policy.FixedLot == nil || policy.FixedLot.LotSize <= 0 {
+		if policyErr != nil || policy == nil {
 			entry.Errors = append(entry.Errors, handshake.Issue{
 				Code:    handshake.IssueCodeRiskPolicyMissing,
 				Message: "Política de riesgo faltante",
@@ -288,6 +306,34 @@ func (e *HandshakeEvaluator) buildEvaluation(
 				},
 			})
 			entry.Status = handshake.RegistrationStatusRejected
+		} else if policy.Type == domain.RiskPolicyTypeFixedLot {
+			if policy.FixedLot == nil || policy.FixedLot.LotSize <= 0 {
+				entry.Errors = append(entry.Errors, handshake.Issue{
+					Code:    handshake.IssueCodeRiskPolicyMissing,
+					Message: "Política FIXED_LOT sin lot_size válido",
+					Metadata: map[string]string{
+						"account_id": accountID,
+					},
+				})
+				entry.Status = handshake.RegistrationStatusRejected
+			}
+		}
+
+		supportsTick := evaluation.Capabilities.Supports("spec_report/tickvalue") ||
+			handshake.Supports(evaluation.RequiredFeatures, "spec_report/tickvalue") ||
+			handshake.Supports(evaluation.OptionalFeatures, "spec_report/tickvalue")
+
+		if policy != nil && policy.Type == domain.RiskPolicyTypeFixedRisk {
+			if !supportsTick {
+				entry.Errors = append(entry.Errors, handshake.Issue{
+					Code:    handshake.IssueCodeFeatureMissing,
+					Message: "Capability spec_report/tickvalue requerida para FIXED_RISK",
+					Metadata: map[string]string{
+						"account_id": accountID,
+					},
+				})
+				entry.Status = handshake.RegistrationStatusRejected
+			}
 		}
 
 		evaluation.Status = mergeStatus(evaluation.Status, entry.Status)
@@ -348,6 +394,7 @@ func (e *HandshakeEvaluator) logEvaluation(ctx context.Context, evaluation *hand
 		return
 	}
 
+	status := registrationStatusString(evaluation.Status)
 	attrs := []attribute.KeyValue{
 		semconv.Echo.AccountID.String(evaluation.AccountID),
 		attribute.String("pipe_role", evaluation.PipeRole),
@@ -368,7 +415,12 @@ func (e *HandshakeEvaluator) logEvaluation(ctx context.Context, evaluation *hand
 		attrs = append(attrs, attribute.String("symbol_issue_codes", entryCodes))
 	}
 
-	e.telemetry.Info(ctx, "Handshake evaluado", attrs...)
+	e.telemetry.Debug(ctx, "Handshake evaluado", attrs...)
+	if status != "ACCEPTED" {
+		e.telemetry.Debug(ctx, "Handshake evaluado", attrs...)
+	} else {
+		e.telemetry.Info(ctx, "Handshake evaluado", attrs...)
+	}
 }
 
 func (e *HandshakeEvaluator) startSpan(ctx context.Context, name string) (context.Context, trace.Span) {

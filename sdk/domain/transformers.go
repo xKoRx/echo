@@ -2,6 +2,8 @@ package domain
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/utils"
@@ -697,4 +699,126 @@ func protoErrorCodeToString(code pb.ErrorCode) string {
 	default:
 		return "ERR_UNKNOWN"
 	}
+}
+
+// JSONToStateSnapshot convierte un map JSON a StateSnapshot proto.
+func JSONToStateSnapshot(m map[string]interface{}) (*pb.StateSnapshot, error) {
+	if m == nil {
+		return nil, fmt.Errorf("state snapshot payload is nil")
+	}
+
+	snapshot := &pb.StateSnapshot{}
+
+	if ts := utils.ExtractInt64(m, "timestamp_ms"); ts > 0 {
+		snapshot.TimestampMs = ts
+	}
+
+	accountsRaw, _ := m["accounts"].([]interface{})
+	for _, rawAccount := range accountsRaw {
+		accountMap, ok := rawAccount.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		accountID := strings.TrimSpace(utils.ExtractString(accountMap, "account_id"))
+		if accountID == "" {
+			continue
+		}
+
+		info := &pb.AccountInfo{
+			AccountId:   accountID,
+			Balance:     utils.ExtractFloat64(accountMap, "balance"),
+			Equity:      utils.ExtractFloat64(accountMap, "equity"),
+			Margin:      utils.ExtractFloat64(accountMap, "margin"),
+			MarginFree:  utils.ExtractFloat64(accountMap, "margin_free"),
+			MarginLevel: utils.ExtractFloat64(accountMap, "margin_level"),
+		}
+
+		if ts := utils.ExtractInt64(accountMap, "timestamp_ms"); ts > 0 {
+			info.TimestampMs = ts
+		} else if snapshot.TimestampMs > 0 {
+			info.TimestampMs = snapshot.TimestampMs
+		}
+
+		currency := strings.ToUpper(strings.TrimSpace(utils.ExtractString(accountMap, "currency")))
+		if currency != "" {
+			info.Currency = currency
+		}
+
+		snapshot.Accounts = append(snapshot.Accounts, info)
+	}
+
+	positionsRaw, _ := m["positions"].([]interface{})
+	for _, rawPosition := range positionsRaw {
+		posMap, ok := rawPosition.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		ticket := int32(utils.ExtractInt64(posMap, "ticket"))
+		if ticket == 0 {
+			continue
+		}
+
+		position := &pb.PositionInfo{
+			Ticket:      ticket,
+			Symbol:      strings.TrimSpace(utils.ExtractString(posMap, "symbol")),
+			Volume:      utils.ExtractFloat64(posMap, "volume"),
+			OpenPrice:   utils.ExtractFloat64(posMap, "open_price"),
+			Profit:      utils.ExtractFloat64(posMap, "profit"),
+			MagicNumber: utils.ExtractInt64(posMap, "magic_number"),
+		}
+
+		switch strings.ToUpper(strings.TrimSpace(utils.ExtractString(posMap, "side"))) {
+		case "BUY":
+			position.Side = pb.OrderSide_ORDER_SIDE_BUY
+		case "SELL":
+			position.Side = pb.OrderSide_ORDER_SIDE_SELL
+		default:
+			position.Side = pb.OrderSide_ORDER_SIDE_UNSPECIFIED
+		}
+
+		if sl, ok := extractOptionalFloat(posMap, "stop_loss"); ok {
+			position.StopLoss = &sl
+		}
+		if tp, ok := extractOptionalFloat(posMap, "take_profit"); ok {
+			position.TakeProfit = &tp
+		}
+
+		if comment := strings.TrimSpace(utils.ExtractString(posMap, "comment")); comment != "" {
+			position.Comment = &comment
+		}
+
+		if ts := utils.ExtractInt64(posMap, "open_time_ms"); ts > 0 {
+			position.OpenTimeMs = ts
+		}
+
+		snapshot.Positions = append(snapshot.Positions, position)
+	}
+
+	return snapshot, nil
+}
+
+func extractOptionalFloat(m map[string]interface{}, key string) (float64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	value, exists := m[key]
+	if !exists {
+		return 0, false
+	}
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case string:
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }

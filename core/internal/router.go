@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xKoRx/echo/core/internal/riskengine"
 	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
 	"github.com/xKoRx/echo/sdk/domain/handshake"
@@ -170,6 +171,9 @@ func (r *Router) processMessage(msg *routerMessage) {
 
 	case *pb.AgentMessage_TradeClose:
 		r.handleTradeClose(msg.ctx, msg.agentID, payload.TradeClose)
+
+	case *pb.AgentMessage_StateSnapshot:
+		r.handleStateSnapshot(msg.ctx, msg.agentID, payload.StateSnapshot)
 
 	default:
 		r.core.telemetry.Warn(r.ctx, "Unknown AgentMessage type",
@@ -410,55 +414,217 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			continue
 		}
 
-		if policy == nil || policy.Type != domain.RiskPolicyTypeFixedLot || policy.FixedLot == nil || policy.FixedLot.LotSize <= 0 {
-			r.core.telemetry.Warn(ctx, "Risk policy missing or invalid",
+		policyAttrs := []attribute.KeyValue{
+			attribute.String("account_id", slaveAccountID),
+			attribute.String("strategy_id", strategyID),
+			attribute.String("canonical_symbol", canonicalSymbol),
+		}
+
+		if policy == nil {
+			r.core.telemetry.Warn(ctx, "Risk policy missing",
 				attribute.String("trade_id", tradeID),
 				attribute.String("account_id", slaveAccountID),
 				attribute.String("strategy_id", strategyID),
 			)
-			r.core.echoMetrics.RecordVolumeGuardDecision(ctx, string(volumeguard.DecisionReject),
-				attribute.String("account_id", slaveAccountID),
-				attribute.String("canonical_symbol", canonicalSymbol),
-				attribute.String("strategy_id", strategyID),
-				attribute.String("reason", "risk_policy_missing"),
+			r.core.echoMetrics.RecordRiskPolicyRejected(ctx, "missing",
+				policyAttrs...,
 			)
 			continue
 		}
 
-		requiredLot := policy.FixedLot.LotSize
-		lotSize := requiredLot
-		decision := volumeguard.DecisionPassThrough
-		var guardErr error
-		if r.core.volumeGuard != nil {
-			lotSize, decision, guardErr = r.core.volumeGuard.Execute(ctx, slaveAccountID, canonicalSymbol, strategyID, requiredLot)
-		}
-		if guardErr != nil {
-			if decision == volumeguard.DecisionReject {
-				r.core.telemetry.Warn(ctx, "Volume guard rejected lot",
+		ctxPolicy := telemetry.AppendEventAttrs(ctx, semconv.Echo.PolicyType.String(string(policy.Type)))
+		ctxPolicy = telemetry.AppendMetricAttrs(ctxPolicy, semconv.Echo.PolicyType.String(string(policy.Type)))
+
+		var (
+			lotSize                float64
+			expectedLoss           float64
+			commissionTotalResult  float64
+			commissionPerLotResult float64
+			commissionRateResult   float64
+			commissionFixedResult  float64
+		)
+
+		switch policy.Type {
+		case domain.RiskPolicyTypeFixedRisk:
+			policyAttrs = append(policyAttrs, attribute.String("policy_type", string(policy.Type)))
+			if policy.FixedRisk == nil {
+				r.core.telemetry.Warn(ctxPolicy, "Fixed risk policy missing configuration",
+					attribute.String("trade_id", tradeID),
+				)
+				r.core.echoMetrics.RecordRiskPolicyRejected(ctxPolicy, "config_missing", policyAttrs...)
+				continue
+			}
+
+			commissionPerLotFixed := 0.0
+			if policy.FixedRisk.CommissionPerLot != nil && *policy.FixedRisk.CommissionPerLot > 0 {
+				commissionPerLotFixed = *policy.FixedRisk.CommissionPerLot
+			}
+			commissionRatePercent := 0.0
+			commissionRate := 0.0
+			if policy.FixedRisk.CommissionRate != nil && *policy.FixedRisk.CommissionRate > 0 {
+				commissionRatePercent = *policy.FixedRisk.CommissionRate
+				commissionRate = commissionRatePercent / 100.0
+			}
+			ctxPolicy = telemetry.AppendEventAttrs(ctxPolicy,
+				attribute.Float64("commission_fixed_per_lot", commissionPerLotFixed),
+				attribute.Float64("commission_rate_percent", commissionRatePercent),
+				semconv.Echo.RiskCommissionRate.Float64(commissionRate),
+			)
+			ctxPolicy = telemetry.AppendMetricAttrs(ctxPolicy,
+				attribute.Float64("commission_fixed_per_lot", commissionPerLotFixed),
+				attribute.Float64("commission_rate_percent", commissionRatePercent),
+				semconv.Echo.RiskCommissionRate.Float64(commissionRate),
+			)
+			policyAttrs = append(policyAttrs,
+				attribute.Float64("commission_fixed_per_lot", commissionPerLotFixed),
+				attribute.Float64("commission_rate_percent", commissionRatePercent),
+				semconv.Echo.RiskCommissionRate.Float64(commissionRate),
+			)
+
+			if r.core.riskEngine == nil {
+				r.core.telemetry.Error(ctxPolicy, "Fixed risk engine not initialized", nil,
+					attribute.String("trade_id", tradeID),
+				)
+				r.core.echoMetrics.RecordRiskPolicyRejected(ctxPolicy, "engine_not_available", policyAttrs...)
+				continue
+			}
+
+			riskResult, err := r.core.riskEngine.ComputeLot(ctxPolicy, slaveAccountID, strategyID, canonicalSymbol, intent, policy.FixedRisk)
+			if err != nil {
+				r.core.telemetry.Info(ctxPolicy, "Fixed risk engine returned error",
 					attribute.String("trade_id", tradeID),
 					attribute.String("account_id", slaveAccountID),
 					attribute.String("strategy_id", strategyID),
 					attribute.String("canonical_symbol", canonicalSymbol),
-					attribute.String("error", guardErr.Error()),
+					attribute.String("error", err.Error()),
+				)
+			}
+			if err != nil {
+				r.core.telemetry.Warn(ctxPolicy, "Fixed risk calculation failed",
+					attribute.String("trade_id", tradeID),
+					attribute.String("error", err.Error()),
 				)
 				continue
 			}
-			r.core.telemetry.Error(ctx, "Volume guard failed",
-				guardErr,
+			r.core.telemetry.Info(ctxPolicy, "Fixed risk engine decision",
 				attribute.String("trade_id", tradeID),
 				attribute.String("account_id", slaveAccountID),
 				attribute.String("strategy_id", strategyID),
 				attribute.String("canonical_symbol", canonicalSymbol),
+				attribute.String("decision", string(riskResult.Decision)),
+				attribute.Float64("lot", riskResult.Lot),
+				attribute.Float64("expected_loss", riskResult.ExpectedLoss),
+				attribute.Float64("commission_fixed_per_lot", riskResult.CommissionFixedPerLot),
+				attribute.Float64("commission_rate_percent", commissionRatePercent),
+				attribute.Float64("commission_rate", riskResult.CommissionRate),
+				attribute.Float64("commission_per_lot", riskResult.CommissionPerLot),
+				attribute.Float64("commission_total", riskResult.CommissionTotal),
+				attribute.String("reason", riskResult.Reason),
 			)
-			continue
-		}
-		if decision == volumeguard.DecisionReject {
+
+			if riskResult.Decision != riskengine.DecisionProceed {
+				r.core.telemetry.Warn(ctxPolicy, "Fixed risk decision rejected",
+					attribute.String("trade_id", tradeID),
+					attribute.String("reason", riskResult.Reason),
+				)
+				r.core.echoMetrics.RecordRiskPolicyRejected(ctxPolicy, riskResult.Reason, policyAttrs...)
+				continue
+			}
+
+			lotSize = riskResult.Lot
+			expectedLoss = riskResult.ExpectedLoss
+			commissionTotalResult = riskResult.CommissionTotal
+			commissionPerLotResult = riskResult.CommissionPerLot
+			commissionRateResult = riskResult.CommissionRate
+			commissionFixedResult = riskResult.CommissionFixedPerLot
+			policyAttrs = append(policyAttrs,
+				attribute.Float64("commission_fixed_per_lot_result", riskResult.CommissionFixedPerLot),
+				semconv.Echo.RiskCommissionPerLot.Float64(riskResult.CommissionPerLot),
+				semconv.Echo.RiskCommissionTotal.Float64(riskResult.CommissionTotal),
+				semconv.Echo.RiskCommissionRate.Float64(riskResult.CommissionRate),
+			)
+			ctxPolicy = telemetry.AppendEventAttrs(ctxPolicy,
+				semconv.Echo.RiskDecision.String(string(riskResult.Decision)),
+				attribute.Float64("expected_loss", expectedLoss),
+				attribute.Float64("commission_fixed_per_lot_result", riskResult.CommissionFixedPerLot),
+				semconv.Echo.RiskCommissionPerLot.Float64(riskResult.CommissionPerLot),
+				semconv.Echo.RiskCommissionTotal.Float64(riskResult.CommissionTotal),
+				semconv.Echo.RiskCommissionRate.Float64(riskResult.CommissionRate),
+			)
+			ctxPolicy = telemetry.AppendMetricAttrs(ctxPolicy,
+				semconv.Echo.RiskDecision.String(string(riskResult.Decision)),
+				attribute.Float64("commission_fixed_per_lot_result", riskResult.CommissionFixedPerLot),
+				semconv.Echo.RiskCommissionPerLot.Float64(riskResult.CommissionPerLot),
+				semconv.Echo.RiskCommissionTotal.Float64(riskResult.CommissionTotal),
+				semconv.Echo.RiskCommissionRate.Float64(riskResult.CommissionRate),
+			)
+
+		case domain.RiskPolicyTypeFixedLot:
+			if policy.FixedLot == nil || policy.FixedLot.LotSize <= 0 {
+				r.core.telemetry.Warn(ctxPolicy, "Risk policy FIXED_LOT missing lot_size",
+					attribute.String("trade_id", tradeID),
+				)
+				r.core.echoMetrics.RecordVolumeGuardDecision(ctxPolicy, string(volumeguard.DecisionReject),
+					append(policyAttrs, attribute.String("reason", "risk_policy_missing"))...,
+				)
+				continue
+			}
+
+			requiredLot := policy.FixedLot.LotSize
+			lotSize = requiredLot
+			decision := volumeguard.DecisionPassThrough
+			var guardErr error
+			if r.core.volumeGuard != nil {
+				lotSize, decision, guardErr = r.core.volumeGuard.Execute(ctxPolicy, slaveAccountID, canonicalSymbol, strategyID, requiredLot)
+			}
+			r.core.telemetry.Info(ctxPolicy, "Fixed lot evaluation",
+				attribute.String("trade_id", tradeID),
+				attribute.String("account_id", slaveAccountID),
+				attribute.String("strategy_id", strategyID),
+				attribute.String("canonical_symbol", canonicalSymbol),
+				attribute.Float64("requested_lot", requiredLot),
+				attribute.Float64("final_lot", lotSize),
+				attribute.String("volume_guard_decision", string(decision)),
+			)
+			if guardErr != nil {
+				if decision == volumeguard.DecisionReject {
+					r.core.telemetry.Warn(ctxPolicy, "Volume guard rejected lot",
+						attribute.String("trade_id", tradeID),
+						attribute.String("account_id", slaveAccountID),
+						attribute.String("strategy_id", strategyID),
+						attribute.String("canonical_symbol", canonicalSymbol),
+						attribute.String("error", guardErr.Error()),
+					)
+				} else {
+					r.core.telemetry.Error(ctxPolicy, "Volume guard failed",
+						guardErr,
+						attribute.String("trade_id", tradeID),
+						attribute.String("account_id", slaveAccountID),
+						attribute.String("strategy_id", strategyID),
+						attribute.String("canonical_symbol", canonicalSymbol),
+					)
+				}
+				continue
+			}
+			if decision == volumeguard.DecisionReject {
+				continue
+			}
+			r.core.echoMetrics.RecordVolumeGuardDecision(ctxPolicy, string(decision),
+				append(policyAttrs, attribute.Float64("requested_lot", requiredLot), attribute.Float64("final_lot", lotSize))...,
+			)
+
+		default:
+			r.core.telemetry.Warn(ctxPolicy, "Unsupported risk policy type",
+				attribute.String("trade_id", tradeID),
+				attribute.String("policy_type", string(policy.Type)),
+			)
+			r.core.echoMetrics.RecordRiskPolicyRejected(ctxPolicy, "unsupported_type", policyAttrs...)
 			continue
 		}
 
 		commandID := utils.GenerateUUIDv7()
 		if r.isCommandIDDuplicate(commandID) {
-			r.core.telemetry.Warn(ctx, "Duplicate command_id detected, skipping",
+			r.core.telemetry.Warn(ctxPolicy, "Duplicate command_id detected, skipping",
 				attribute.String("command_id", commandID),
 				attribute.String("trade_id", tradeID),
 			)
@@ -477,22 +643,24 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 
 		order := domain.TradeIntentToExecuteOrder(intent, opts)
 
+		ctxForOrder := ctxPolicy
+
 		brokerSymbol, info, found := r.core.symbolResolver.ResolveForAccount(ctx, slaveAccountID, canonicalSymbol)
 		if !found {
 			if r.core.canonicalValidator.UnknownAction() == UnknownActionReject {
-				r.core.telemetry.Warn(ctx, "Symbol mapping missing, order rejected (i3)",
+				r.core.telemetry.Warn(ctxForOrder, "Symbol mapping missing, order rejected (i3)",
 					attribute.String("account_id", slaveAccountID),
 					attribute.String("canonical_symbol", canonicalSymbol),
 				)
 				continue
 			}
-			r.core.telemetry.Warn(ctx, "Symbol mapping missing, using canonical symbol (i3)",
+			r.core.telemetry.Warn(ctxForOrder, "Symbol mapping missing, using canonical symbol (i3)",
 				attribute.String("account_id", slaveAccountID),
 				attribute.String("canonical_symbol", canonicalSymbol),
 			)
 		} else {
 			order.Symbol = brokerSymbol
-			r.core.telemetry.Debug(ctx, "Symbol mapping applied (i3)",
+			r.core.telemetry.Debug(ctxForOrder, "Symbol mapping applied (i3)",
 				attribute.String("account_id", slaveAccountID),
 				attribute.String("canonical", canonicalSymbol),
 				attribute.String("broker", brokerSymbol),
@@ -507,7 +675,7 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 		}
 		if spec != nil && r.core.symbolSpecService != nil && r.core.config.VolumeGuard != nil {
 			if r.core.symbolSpecService.IsStale(slaveAccountID, canonicalSymbol, r.core.config.VolumeGuard.MaxSpecAge) {
-				r.core.telemetry.Warn(ctx, "Symbol specification stale for stop adjustment",
+				r.core.telemetry.Warn(ctxForOrder, "Symbol specification stale for stop adjustment",
 					attribute.String("account_id", slaveAccountID),
 					attribute.String("canonical_symbol", canonicalSymbol),
 				)
@@ -523,15 +691,15 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 		}
 
 		if quote != nil {
-			r.adjustStopsAndTargets(ctx, order, intent, quote, info, spec, slaveAccountID)
+			r.adjustStopsAndTargets(ctxForOrder, order, intent, quote, info, spec, slaveAccountID)
 		} else {
-			r.core.telemetry.Debug(ctx, "No quote snapshot available for stop adjustment",
+			r.core.telemetry.Debug(ctxForOrder, "No quote snapshot available for stop adjustment",
 				attribute.String("account_id", slaveAccountID),
 				attribute.String("canonical_symbol", canonicalSymbol),
 			)
 		}
 
-		r.core.telemetry.Debug(ctx, "ExecuteOrder created",
+		debugAttrs := []attribute.KeyValue{
 			attribute.String("command_id", commandID),
 			attribute.String("trade_id", tradeID),
 			attribute.String("target_client_id", order.TargetClientId),
@@ -540,7 +708,27 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			attribute.Float64("lot_size", order.LotSize),
 			attribute.String("strategy_id", strategyID),
 			attribute.String("policy_type", string(policy.Type)),
-		)
+		}
+		if expectedLoss > 0 {
+			debugAttrs = append(debugAttrs, attribute.Float64("expected_loss", expectedLoss))
+		}
+		if commissionTotalResult > 0 {
+			debugAttrs = append(debugAttrs,
+				attribute.Float64("commission_total", commissionTotalResult),
+				attribute.Float64("commission_per_lot", commissionPerLotResult),
+				attribute.Float64("commission_rate", commissionRateResult),
+				attribute.Float64("commission_fixed_per_lot", commissionFixedResult),
+			)
+		}
+		if commissionTotalResult > 0 {
+			debugAttrs = append(debugAttrs,
+				attribute.Float64("commission_total", commissionTotalResult),
+				attribute.Float64("commission_per_lot", commissionPerLotResult),
+				attribute.Float64("commission_rate", commissionRateResult),
+			)
+		}
+
+		r.core.telemetry.Debug(ctxForOrder, "ExecuteOrder created", debugAttrs...)
 
 		orders = append(orders, order)
 	}
@@ -1100,6 +1288,27 @@ func (r *Router) handleCloseResult(ctx context.Context, agentID string, result *
 		semconv.Echo.Status.String(statusToString(result.Success)),
 		semconv.Echo.ErrorCode.String(errorCode),
 	)
+}
+
+// handleStateSnapshot procesa un StateSnapshot del Slave (i1).
+//
+// Flujo:
+//  1. Persistir el estado del Slave en el registro de estado (i1)
+//  2. Actualizar el estado del Slave en el registro de estado (i1)
+//  3. Métricas
+func (r *Router) handleStateSnapshot(ctx context.Context, agentID string, snapshot *pb.StateSnapshot) {
+	if snapshot == nil {
+		return
+	}
+
+	r.core.telemetry.Info(ctx, "StateSnapshot received from Agent",
+		attribute.String("agent_id", agentID),
+		attribute.Int("accounts", len(snapshot.Accounts)),
+		attribute.Int("positions", len(snapshot.Positions)),
+		attribute.Int64("timestamp_ms", snapshot.TimestampMs),
+	)
+
+	r.core.accountStateService.Update(ctx, agentID, snapshot)
 }
 
 // Helper: orderSideToString convierte OrderSide a string.

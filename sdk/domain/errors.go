@@ -15,13 +15,13 @@ const (
 	ErrNoError ErrorCode = "NO_ERROR"
 
 	// Errores de validación
-	ErrInvalidPrice        ErrorCode = "INVALID_PRICE"
-	ErrInvalidStops        ErrorCode = "INVALID_STOPS"
-	ErrInvalidVolume       ErrorCode = "INVALID_VOLUME"
-	ErrInvalidSymbol       ErrorCode = "INVALID_SYMBOL"
-	ErrInvalidMagicNumber  ErrorCode = "INVALID_MAGIC_NUMBER"
-	ErrInvalidTradeID      ErrorCode = "INVALID_TRADE_ID"
-	ErrInvalidCommandID    ErrorCode = "INVALID_COMMAND_ID"
+	ErrInvalidPrice         ErrorCode = "INVALID_PRICE"
+	ErrInvalidStops         ErrorCode = "INVALID_STOPS"
+	ErrInvalidVolume        ErrorCode = "INVALID_VOLUME"
+	ErrInvalidSymbol        ErrorCode = "INVALID_SYMBOL"
+	ErrInvalidMagicNumber   ErrorCode = "INVALID_MAGIC_NUMBER"
+	ErrInvalidTradeID       ErrorCode = "INVALID_TRADE_ID"
+	ErrInvalidCommandID     ErrorCode = "INVALID_COMMAND_ID"
 	ErrMissingRequiredField ErrorCode = "MISSING_REQUIRED_FIELD"
 
 	// Errores de mercado/broker
@@ -49,7 +49,10 @@ const (
 	ErrSlippageExceeded  ErrorCode = "SLIPPAGE_EXCEEDED"
 	ErrDelayExceeded     ErrorCode = "DELAY_EXCEEDED"
 	ErrSpecMissing       ErrorCode = "SPEC_MISSING"
+	ErrInvalidSpec       ErrorCode = "INVALID_SPEC"
 	ErrRiskPolicyMissing ErrorCode = "RISK_POLICY_MISSING"
+	ErrRiskPolicyInvalid ErrorCode = "RISK_POLICY_INVALID"
+	ErrStopRequired      ErrorCode = "STOP_REQUIRED"
 )
 
 // TradingError representa un error del dominio de trading con contexto.
@@ -144,6 +147,10 @@ func ErrorCodeFromProto(protoCode pb.ErrorCode) ErrorCode {
 		return ErrShortOnly
 	case pb.ErrorCode_ERROR_CODE_SPEC_MISSING:
 		return ErrSpecMissing
+	case pb.ErrorCode_ERROR_CODE_RISK_POLICY_INVALID:
+		return ErrRiskPolicyInvalid
+	case pb.ErrorCode_ERROR_CODE_STOP_REQUIRED:
+		return ErrStopRequired
 	case pb.ErrorCode_ERROR_CODE_RISK_POLICY_MISSING:
 		return ErrRiskPolicyMissing
 	default:
@@ -186,8 +193,14 @@ func ErrorCodeToProto(code ErrorCode) pb.ErrorCode {
 		return pb.ErrorCode_ERROR_CODE_SHORT_ONLY
 	case ErrSpecMissing:
 		return pb.ErrorCode_ERROR_CODE_SPEC_MISSING
+	case ErrInvalidSpec:
+		return pb.ErrorCode_ERROR_CODE_SPEC_MISSING
 	case ErrRiskPolicyMissing:
 		return pb.ErrorCode_ERROR_CODE_RISK_POLICY_MISSING
+	case ErrRiskPolicyInvalid:
+		return pb.ErrorCode_ERROR_CODE_RISK_POLICY_INVALID
+	case ErrStopRequired:
+		return pb.ErrorCode_ERROR_CODE_STOP_REQUIRED
 	default:
 		return pb.ErrorCode_ERROR_CODE_UNSPECIFIED
 	}
@@ -265,4 +278,3 @@ func ErrorFromMT4Code(mt4Code int) ErrorCode {
 		return ErrUnknown
 	}
 }
-

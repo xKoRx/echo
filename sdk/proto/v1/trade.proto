@@ -124,6 +124,7 @@ message AccountInfo {
   double margin_free = 5;
   double margin_level = 6;
   int64 timestamp_ms = 7;
+  string currency = 8;
 }
 
 // PositionInfo información de posición abierta

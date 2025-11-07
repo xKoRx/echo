@@ -134,7 +134,7 @@ flowchart LR
 - Router secuencial (roadmap hacia worker pool por `trade_id`).
 - Servicios: `SymbolResolver`, `SymbolSpecService`, `RiskPolicyService` (TTL corto + invalidación `LISTEN/NOTIFY`, rechazo inmediato sin política), `DedupService`, `AccountRegistry`, `CorrelationService`.
 - Persistencia en PostgreSQL: `trades`, `executions`, `closes`, `dedupe`, `account_symbol_map`, `account_symbol_spec`, `account_strategy_risk_policy` (esquema tipado `FIXED_LOT`).
-- Orquestación: cálculo de lotes (próximas iteraciones), aplicación de políticas, envío de comandos selectivos.
+- Orquestación: cálculo de lotes (incluye motor `FixedRiskEngine` para políticas `FIXED_RISK` con clamps y control de drift), aplicación de políticas, envío de comandos selectivos.
 - Telemetría con bundles `EchoMetrics`, spans `core.*` y contadores `echo.specs.*`, `echo.risk.*`.
 - Handshake v2 completado (evaluador central, persistencia `account_symbol_registration_*`, reconciliador con `LISTEN/NOTIFY`, métricas `echo.core.handshake.*`, bloqueo operativo `WARNING/REJECTED`, CLI `echo-core-cli handshake evaluate` y consumo del feedback en los EA).
 
@@ -190,10 +190,11 @@ flowchart LR
 | Routing selectivo | Ownership `account_id → agent_id`, envío dirigido de comandos. | i2 | ✅ |
 | Control de backpressure en broadcast | Timeouts de envío a canales, latencia estabilizada (<500 ms). | i2b | ✅ |
 | Catálogo canónico de símbolos | `canonical_symbol ⇄ broker_symbol`, validación pre-orden, snapshots 250 ms. | i3 | ✅ |
-| Guardián de especificaciones | Caché + persistencia `min_lot`, `lot_step`, `stop_level`; clamps previos a `ExecuteOrder`. | i4 | ✅ |
-| Políticas `FIXED_LOT` | Registro en Postgres + caché `RiskPolicyService`; rechazo sin política. | i4 | ✅ |
+| Guardián de especificaciones | Caché/persistencia `min_lot`, `lot_step`, `stop_level`; clamps previos a `ExecuteOrder`. | i4 | ✅ |
+| Políticas `FIXED_LOT` | Registro en Postgres + caché `RiskPolicyService`; rechazo inmediato sin política. | i4 | ✅ |
+| Motor `FIXED_RISK` | Cálculo centralizado de lotes según riesgo monetario, validación de SL/quotes/specs, métricas `echo.core.risk.*`. | i6 | ✅ |
 | Versionado de handshake & feedback | `protocol_version`, `SymbolRegistrationResult` Core→Agent→EA, validaciones tempranas. | i5 | ✅ |
-| Sizing con riesgo fijo (Modo A) | Distancia SL × tick value; clamps min/max lot. | i6 | ⏳ |
+| Sizing con riesgo fijo (Modo A) | Distancia SL × tick value; clamps min/max lot con motor centralizado. | i6 | ✅ |
 | Filtros de spread y desvío | Evaluación de tolerancias por cuenta×símbolo. | i7 | ⏳ |
 | SL/TP con offset | Aplicar offsets configurables en apertura. | i8a | ⏳ |
 | StopLevel-aware + modify post-fill | Validar StopLevel y ajustar tras fill. | i8b | ⏳ |
@@ -338,7 +339,7 @@ Estructura típica (`/echo/...`):
 
 - Iteración 0: lot fijo hardcoded (0.10).
 - Iteración 4: políticas `FixedLot` registradas en Postgres; ausencia = rechazo.
-- Iteración 6: cálculo riesgo fijo (`lot = riesgo / (distancia_pips × tick_value)`), clamps `[min_lot, max_lot]`, ajuste a `lot_step`.
+- Iteración 6: cálculo riesgo fijo (`lot = riesgo / (distancia_pips × tick_value)`), clamps `[min_lot, max_lot]`, ajuste a `lot_step`, control de drift y telemetría dedicada — ✅ completado.
 - Futuro: cálculo RR (Risk/Reward) y estrategias adicionales (`FixedRisk`, `Kelly`, etc.).
 
 ## 11. Observabilidad y Calidad

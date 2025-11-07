@@ -6,25 +6,25 @@ import "go.opentelemetry.io/otel/attribute"
 //
 // # Identificadores
 //
-//	- echo.trade_id: UUID del trade (UUIDv7)
-//	- echo.command_id: UUID del comando ExecuteOrder
-//	- echo.client_id: ID del cliente (master_XXX o slave_XXX)
-//	- echo.account_id: ID de la cuenta MT4/MT5
+//   - echo.trade_id: UUID del trade (UUIDv7)
+//   - echo.command_id: UUID del comando ExecuteOrder
+//   - echo.client_id: ID del cliente (master_XXX o slave_XXX)
+//   - echo.account_id: ID de la cuenta MT4/MT5
 //
 // # Trading
 //
-//	- echo.symbol: Símbolo del instrumento (XAUUSD, etc.)
-//	- echo.order_side: Lado de la orden (BUY/SELL)
-//	- echo.lot_size: Tamaño en lotes
-//	- echo.price: Precio de la orden
-//	- echo.magic_number: MagicNumber MT4/MT5
-//	- echo.ticket: Ticket MT4/MT5
+//   - echo.symbol: Símbolo del instrumento (XAUUSD, etc.)
+//   - echo.order_side: Lado de la orden (BUY/SELL)
+//   - echo.lot_size: Tamaño en lotes
+//   - echo.price: Precio de la orden
+//   - echo.magic_number: MagicNumber MT4/MT5
+//   - echo.ticket: Ticket MT4/MT5
 //
 // # Estado
 //
-//	- echo.status: Estado de ejecución (success/rejected/timeout)
-//	- echo.error_code: Código de error si aplica
-//	- echo.component: Componente (agent/core/master_ea/slave_ea)
+//   - echo.status: Estado de ejecución (success/rejected/timeout)
+//   - echo.error_code: Código de error si aplica
+//   - echo.component: Componente (agent/core/master_ea/slave_ea)
 //
 // # Uso
 //
@@ -63,16 +63,23 @@ var Echo = echoAttributes{
 	Component: attribute.Key("echo.component"),
 
 	// Adicionales
-	Strategy:    attribute.Key("echo.strategy"),
-	Timeframe:   attribute.Key("echo.timeframe"),
-	ATR:         attribute.Key("echo.atr"),
-	SlipPage:    attribute.Key("echo.slippage"),
-	Spread:      attribute.Key("echo.spread"),
-	PipeCount:   attribute.Key("echo.pipe_count"),
-	Attempt:     attribute.Key("echo.attempt"),
-	Decision:    attribute.Key("echo.decision"),
-	Reason:      attribute.Key("echo.reason"),
-	PolicyType:  attribute.Key("echo.policy_type"),
+	Strategy:             attribute.Key("echo.strategy"),
+	Timeframe:            attribute.Key("echo.timeframe"),
+	ATR:                  attribute.Key("echo.atr"),
+	SlipPage:             attribute.Key("echo.slippage"),
+	Spread:               attribute.Key("echo.spread"),
+	PipeCount:            attribute.Key("echo.pipe_count"),
+	Attempt:              attribute.Key("echo.attempt"),
+	Decision:             attribute.Key("echo.decision"),
+	Reason:               attribute.Key("echo.reason"),
+	PolicyType:           attribute.Key("echo.policy_type"),
+	RiskAmount:           attribute.Key("echo.risk.amount"),
+	RiskCurrency:         attribute.Key("echo.risk.currency"),
+	RiskDecision:         attribute.Key("echo.risk.decision"),
+	RiskRejectReason:     attribute.Key("echo.risk.reject_reason"),
+	RiskCommissionPerLot: attribute.Key("echo.risk.commission_per_lot"),
+	RiskCommissionTotal:  attribute.Key("echo.risk.commission_total"),
+	RiskCommissionRate:   attribute.Key("echo.risk.commission_rate"),
 }
 
 type echoAttributes struct {
@@ -96,16 +103,23 @@ type echoAttributes struct {
 	Component attribute.Key // Componente (agent/core/master_ea/slave_ea)
 
 	// Adicionales
-	Strategy  attribute.Key // ID de estrategia
-	Timeframe attribute.Key // Timeframe (M1, M5, H1, etc.)
-	ATR       attribute.Key // Average True Range
-	SlipPage  attribute.Key // Slippage en points
-	Spread    attribute.Key // Spread en points
-	PipeCount attribute.Key // Número de pipes activos
-	Attempt   attribute.Key // Número de intento (reintentos)
-	Decision  attribute.Key // Decisión (clamp/reject/pass_through)
-	Reason    attribute.Key // Razón asociada a la decisión
-	PolicyType attribute.Key // Tipo de política de riesgo
+	Strategy             attribute.Key // ID de estrategia
+	Timeframe            attribute.Key // Timeframe (M1, M5, H1, etc.)
+	ATR                  attribute.Key // Average True Range
+	SlipPage             attribute.Key // Slippage en points
+	Spread               attribute.Key // Spread en points
+	PipeCount            attribute.Key // Número de pipes activos
+	Attempt              attribute.Key // Número de intento (reintentos)
+	Decision             attribute.Key // Decisión (clamp/reject/pass_through)
+	Reason               attribute.Key // Razón asociada a la decisión
+	PolicyType           attribute.Key // Tipo de política de riesgo
+	RiskAmount           attribute.Key // Monto de riesgo configurado
+	RiskCurrency         attribute.Key // Divisa del riesgo
+	RiskDecision         attribute.Key // Decisión del motor de riesgo (proceed/reject/fallback)
+	RiskRejectReason     attribute.Key // Motivo del rechazo del riesgo
+	RiskCommissionPerLot attribute.Key // Comisión por lote considerada en el cálculo de riesgo
+	RiskCommissionTotal  attribute.Key // Comisión total estimada para el lote calculado
+	RiskCommissionRate   attribute.Key // Comisión porcentual aplicada al valor de la orden
 }
 
 // Values pre-definidos para atributos comunes
@@ -223,4 +237,3 @@ func ErrorAttributes(errorCode, status string) []attribute.KeyValue {
 		Echo.Status.String(status),
 	}
 }
-

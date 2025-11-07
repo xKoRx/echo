@@ -11,11 +11,24 @@ type RiskPolicyType string
 const (
 	// RiskPolicyTypeFixedLot representa una política de lote fijo (iteración 4).
 	RiskPolicyTypeFixedLot RiskPolicyType = "FIXED_LOT"
+
+	// RiskPolicyTypeFixedRisk representa una política de riesgo fijo (iteración 6).
+	RiskPolicyTypeFixedRisk RiskPolicyType = "FIXED_RISK"
 )
 
 // FixedLotConfig almacena la configuración de una política FIXED_LOT.
 type FixedLotConfig struct {
 	LotSize float64
+}
+
+// FixedRiskConfig almacena la configuración de una política FIXED_RISK.
+type FixedRiskConfig struct {
+	Amount           float64
+	Currency         string
+	MinLotOverride   *float64
+	MaxLotOverride   *float64
+	CommissionPerLot *float64
+	CommissionRate   *float64
 }
 
 // RiskPolicy representa una política de riesgo por cuenta × estrategia.
@@ -24,6 +37,7 @@ type RiskPolicy struct {
 	StrategyID string
 	Type       RiskPolicyType
 	FixedLot   *FixedLotConfig
+	FixedRisk  *FixedRiskConfig
 	Version    int64
 	UpdatedAt  time.Time
 	ValidUntil *time.Time

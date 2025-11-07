@@ -229,6 +229,9 @@ type PipeHandler struct {
 	// Configuración compartida
 	canonicalSymbols []string
 
+	// Capacidades negociadas por handshake
+	supportsTickValue bool
+
 	// Telemetría
 	telemetry   *telemetry.Client
 	echoMetrics *metricbundle.EchoMetrics
@@ -444,6 +447,9 @@ func (h *PipeHandler) handleMasterMessage(msgMap map[string]interface{}) error {
 	case "symbol_spec_report":
 		return h.handleSymbolSpecReport(msgMap)
 
+	case "state_snapshot":
+		return h.handleStateSnapshot(msgMap)
+
 	case "quote_snapshot":
 		return h.handleQuoteSnapshot(msgMap)
 
@@ -564,6 +570,9 @@ func (h *PipeHandler) handleSlaveMessage(msgMap map[string]interface{}) error {
 	case "symbol_spec_report":
 		return h.handleSymbolSpecReport(msgMap)
 
+	case "state_snapshot":
+		return h.handleStateSnapshot(msgMap)
+
 	case "quote_snapshot":
 		return h.handleQuoteSnapshot(msgMap)
 
@@ -651,6 +660,68 @@ func (h *PipeHandler) handleCloseResult(msgMap map[string]interface{}) error {
 	return nil
 }
 
+// handleStateSnapshot procesa snapshots de cuentas/posiciones y los reenvía al Core.
+func (h *PipeHandler) handleStateSnapshot(msgMap map[string]interface{}) error {
+	payload, ok := msgMap["payload"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("state_snapshot missing payload")
+	}
+
+	snapshot, err := domain.JSONToStateSnapshot(payload)
+	if err != nil {
+		h.logWarn("Failed to parse StateSnapshot", map[string]interface{}{
+			"error":     err.Error(),
+			"pipe_name": h.name,
+		})
+		return err
+	}
+
+	if len(snapshot.Accounts) == 0 && h.accountID != "" {
+		// Algunos EAs no incluyen account_id dentro del payload; usar el del handler como fallback.
+		snapshot.Accounts = append(snapshot.Accounts, &pb.AccountInfo{
+			AccountId:   h.accountID,
+			TimestampMs: snapshot.TimestampMs,
+		})
+	}
+
+	// Normalizar currency en mayúsculas y completar account_id cuando sea necesario.
+	for _, account := range snapshot.Accounts {
+		if account == nil {
+			continue
+		}
+		if account.AccountId == "" {
+			account.AccountId = h.accountID
+		}
+		account.Currency = strings.ToUpper(strings.TrimSpace(account.Currency))
+	}
+
+	h.logInfo("StateSnapshot received", map[string]interface{}{
+		"accounts":  len(snapshot.Accounts),
+		"positions": len(snapshot.Positions),
+		"pipe_name": h.name,
+	})
+
+	agentMsg := &pb.AgentMessage{
+		AgentId:     h.agentID,
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.AgentMessage_StateSnapshot{
+			StateSnapshot: snapshot,
+		},
+	}
+
+	select {
+	case h.sendToCoreCh <- agentMsg:
+		h.logDebug("StateSnapshot forwarded to Core", map[string]interface{}{
+			"accounts":  len(snapshot.Accounts),
+			"positions": len(snapshot.Positions),
+		})
+	case <-h.ctx.Done():
+		return h.ctx.Err()
+	}
+
+	return nil
+}
+
 // handleHandshake procesa un handshake del EA (i3).
 //
 // Extrae symbols del handshake y envía AccountSymbolsReport al Core si están presentes.
@@ -685,6 +756,15 @@ func (h *PipeHandler) handleHandshake(msgMap map[string]interface{}) error {
 		return nil
 	}
 
+	h.supportsTickValue = normalized.Capabilities.Supports("spec_report/tickvalue")
+	if !h.supportsTickValue {
+		h.logWarn("Handshake missing spec_report/tickvalue capability", map[string]interface{}{
+			"account_id":       accountID,
+			"pipe_role":        pipeRole,
+			"protocol_version": normalized.ProtocolVersion,
+		})
+	}
+
 	if h.protocolMinVersion > 0 && normalized.ProtocolVersion < h.protocolMinVersion {
 		h.logWarn("Handshake protocol version below minimum", map[string]interface{}{
 			"account_id":       accountID,
@@ -716,12 +796,13 @@ func (h *PipeHandler) handleHandshake(msgMap map[string]interface{}) error {
 	}
 
 	h.logInfo("Handshake normalized", map[string]interface{}{
-		"account_id":        accountID,
-		"pipe_role":         pipeRole,
-		"protocol_version":  normalized.ProtocolVersion,
-		"client_semver":     normalized.ClientSemver,
-		"symbols_count":     len(normalized.Symbols),
-		"required_features": strings.Join(normalized.RequiredFeatures, ","),
+		"account_id":          accountID,
+		"pipe_role":           pipeRole,
+		"protocol_version":    normalized.ProtocolVersion,
+		"client_semver":       normalized.ClientSemver,
+		"symbols_count":       len(normalized.Symbols),
+		"required_features":   strings.Join(normalized.RequiredFeatures, ","),
+		"supports_tick_value": h.supportsTickValue,
 	})
 
 	agentMsg := &pb.AgentMessage{
@@ -825,7 +906,20 @@ func (h *PipeHandler) handleSymbolSpecReport(msgMap map[string]interface{}) erro
 			spec.Sessions = parseSessionWindows(sessionsRaw)
 		}
 
-		if err := domain.ValidateSymbolSpecification(spec, h.canonicalSymbols); err != nil {
+		if h.supportsTickValue {
+			if spec.General == nil || spec.General.TickValue <= 0 {
+				h.logWarn("Symbol specification missing tick_value", map[string]interface{}{
+					"account_id":       accountID,
+					"canonical_symbol": spec.CanonicalSymbol,
+				})
+				h.echoMetrics.RecordAgentSpecsFiltered(h.ctx, accountID, "missing_tick_value",
+					attribute.String("canonical_symbol", spec.CanonicalSymbol),
+				)
+				continue
+			}
+		}
+
+		if err := domain.ValidateSymbolSpecificationWithOptions(spec, h.canonicalSymbols, domain.SymbolSpecValidationOptions{RequireTickValue: h.supportsTickValue}); err != nil {
 			h.logWarn("Symbol specification validation failed", map[string]interface{}{
 				"account_id":       accountID,
 				"canonical_symbol": spec.CanonicalSymbol,
@@ -951,6 +1045,7 @@ func parseSymbolGeneral(m map[string]interface{}) *pb.SymbolGeneral {
 		TradePermission:       parseTradePermission(utils.ExtractString(m, "trade_permission")),
 		ExecutionMode:         parseExecutionMode(utils.ExtractString(m, "execution_mode")),
 		GtcMode:               parseGTCMode(utils.ExtractString(m, "gtc_mode")),
+		TickValue:             utils.ExtractFloat64(m, "tick_value"),
 	}
 
 	return general

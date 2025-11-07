@@ -248,6 +248,7 @@ message SymbolGeneral {
   TradePermission trade_permission = 11;
   ExecutionMode execution_mode = 12;
   GTCMode gtc_mode = 13;
+  double tick_value = 14; // Valor monetario de un tick en la divisa de la cuenta
 }
 
 // VolumeSpec contiene los límites de volumen permitidos.

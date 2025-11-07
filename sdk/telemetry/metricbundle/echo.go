@@ -64,6 +64,8 @@ type EchoMetrics struct {
 	AgentSpecsForwarded        metric.Int64Counter
 	AgentSpecsFiltered         metric.Int64Counter
 	RiskPolicyLookup           metric.Int64Counter
+	FixedRiskCalculation       metric.Int64Counter
+	RiskPolicyRejected         metric.Int64Counter
 	HandshakeVersion           metric.Int64Counter
 	HandshakeStatus            metric.Int64Counter
 	HandshakeSymbolIssue       metric.Int64Counter
@@ -81,6 +83,8 @@ type EchoMetrics struct {
 	LatencySlaveExecution    metric.Float64Histogram
 	VolumeGuardSpecAge       metric.Float64Histogram
 	HandshakeFeedbackLatency metric.Float64Histogram
+	FixedRiskExposure        metric.Float64Histogram
+	FixedRiskDistancePoints  metric.Float64Histogram
 
 	// i2: Routing metrics
 	RoutingMode   metric.Int64Counter
@@ -190,6 +194,24 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		"echo.core.risk_policy_lookup_total",
 		metric.WithDescription("Consultas al servicio de políticas de riesgo (hit/miss)"),
 		metric.WithUnit("{lookup}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	fixedRiskCalculation, err := meter.Int64Counter(
+		"echo.core.risk.fixed_risk_calculation_total",
+		metric.WithDescription("Cálculos del motor de riesgo fijo por resultado"),
+		metric.WithUnit("{calculation}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	riskPolicyRejected, err := meter.Int64Counter(
+		"echo.core.risk.policy_rejected_total",
+		metric.WithDescription("Políticas de riesgo rechazadas por motivo"),
+		metric.WithUnit("{reject}"),
 	)
 	if err != nil {
 		return nil, err
@@ -331,6 +353,24 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	fixedRiskExposure, err := meter.Float64Histogram(
+		"echo.core.risk.expected_loss",
+		metric.WithDescription("Pérdida monetaria esperada por orden en políticas FIXED_RISK"),
+		metric.WithUnit("{currency}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	fixedRiskDistancePoints, err := meter.Float64Histogram(
+		"echo.core.risk.distance_points",
+		metric.WithDescription("Distancia en puntos entre precio y stop para políticas FIXED_RISK"),
+		metric.WithUnit("{point}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// i2: Routing metrics
 	routingMode, err := meter.Int64Counter(
 		"echo.routing.mode",
@@ -399,6 +439,8 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		AgentSpecsForwarded:        agentSpecsForwarded,
 		AgentSpecsFiltered:         agentSpecsFiltered,
 		RiskPolicyLookup:           riskPolicyLookup,
+		FixedRiskCalculation:       fixedRiskCalculation,
+		RiskPolicyRejected:         riskPolicyRejected,
 		HandshakeVersion:           handshakeVersion,
 		HandshakeStatus:            handshakeStatus,
 		HandshakeSymbolIssue:       handshakeSymbolIssue,
@@ -414,6 +456,8 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		LatencySlaveExecution:      latencySlaveExecution,
 		VolumeGuardSpecAge:         volumeGuardSpecAge,
 		HandshakeFeedbackLatency:   handshakeFeedbackLatency,
+		FixedRiskExposure:          fixedRiskExposure,
+		FixedRiskDistancePoints:    fixedRiskDistancePoints,
 		RoutingMode:                routingMode,     // i2
 		AccountLookup:              accountLookup,   // i2
 		SymbolsLookup:              symbolsLookup,   // i3
@@ -605,6 +649,36 @@ func (m *EchoMetrics) RecordRiskPolicyLookup(ctx context.Context, result string,
 	}
 	baseAttrs = append(baseAttrs, attrs...)
 	m.RiskPolicyLookup.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordFixedRiskCalculation registra ejecuciones del motor FIXED_RISK por resultado.
+// result: success | reject | fallback
+func (m *EchoMetrics) RecordFixedRiskCalculation(ctx context.Context, result string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("result", result),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.FixedRiskCalculation.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordRiskPolicyRejected registra rechazos de políticas de riesgo con su razón.
+func (m *EchoMetrics) RecordRiskPolicyRejected(ctx context.Context, reason string, attrs ...attribute.KeyValue) {
+	baseAttrs := []attribute.KeyValue{}
+	if reason != "" {
+		baseAttrs = append(baseAttrs, attribute.String("reason", reason))
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.RiskPolicyRejected.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordFixedRiskExposure registra la pérdida esperada calculada para FIXED_RISK.
+func (m *EchoMetrics) RecordFixedRiskExposure(ctx context.Context, amount float64, attrs ...attribute.KeyValue) {
+	m.FixedRiskExposure.Record(ctx, amount, metric.WithAttributes(attrs...))
+}
+
+// RecordFixedRiskDistancePoints registra la distancia en points entre precio y stop.
+func (m *EchoMetrics) RecordFixedRiskDistancePoints(ctx context.Context, points float64, attrs ...attribute.KeyValue) {
+	m.FixedRiskDistancePoints.Record(ctx, points, metric.WithAttributes(attrs...))
 }
 
 // RecordHandshakeVersion registra la evaluación de handshake por versión y estado global.

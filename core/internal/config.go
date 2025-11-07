@@ -63,6 +63,7 @@ type Config struct {
 type RiskConfig struct {
 	MissingPolicy string
 	CacheTTL      time.Duration
+	Engine        FixedRiskEngineConfig
 }
 
 // ProtocolConfig agrupa configuración de versionado de handshake.
@@ -73,6 +74,16 @@ type ProtocolConfig struct {
 	RequiredFeatures []string
 	RetryInterval    time.Duration
 	VersionRange     *handshake.VersionRange
+}
+
+// FixedRiskEngineConfig agrupa la configuración del motor FixedRisk.
+type FixedRiskEngineConfig struct {
+	QuoteMaxAge              time.Duration
+	MinDistancePoints        float64
+	MaxRiskDrift             float64
+	DefaultCurrency          string
+	EnableCurrencyFallback   bool
+	RejectOnMissingTickValue bool
 }
 
 // LoadConfig carga configuración desde ETCD.
@@ -131,6 +142,14 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		Risk: RiskConfig{
 			MissingPolicy: "reject",
 			CacheTTL:      5 * time.Second,
+			Engine: FixedRiskEngineConfig{
+				QuoteMaxAge:              750 * time.Millisecond,
+				MinDistancePoints:        5,
+				MaxRiskDrift:             0.02,
+				DefaultCurrency:          "USD",
+				EnableCurrencyFallback:   false,
+				RejectOnMissingTickValue: true,
+			},
 		},
 		Protocol: ProtocolConfig{
 			MinVersion:       handshake.ProtocolVersionV1,
@@ -261,6 +280,8 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		switch strings.ToLower(val) {
 		case "reject":
 			cfg.Risk.MissingPolicy = "reject"
+		case "warn":
+			cfg.Risk.MissingPolicy = "warn"
 		default:
 			return nil, fmt.Errorf("unsupported core/risk/missing_policy: %s", val)
 		}
@@ -268,6 +289,34 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/cache_ttl_ms", ""); err == nil && val != "" {
 		if ms, err := strconv.Atoi(val); err == nil {
 			cfg.Risk.CacheTTL = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/quote_max_age_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(val); err == nil {
+			cfg.Risk.Engine.QuoteMaxAge = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/min_distance_points", ""); err == nil && val != "" {
+		if points, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.Risk.Engine.MinDistancePoints = points
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/max_risk_drift_pct", ""); err == nil && val != "" {
+		if drift, err := strconv.ParseFloat(val, 64); err == nil {
+			cfg.Risk.Engine.MaxRiskDrift = drift
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/default_currency", ""); err == nil && val != "" {
+		cfg.Risk.Engine.DefaultCurrency = strings.ToUpper(strings.TrimSpace(val))
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/enable_currency_fallback", ""); err == nil && val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			cfg.Risk.Engine.EnableCurrencyFallback = enabled
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/risk/reject_on_missing_tick_value", ""); err == nil && val != "" {
+		if reject, err := strconv.ParseBool(val); err == nil {
+			cfg.Risk.Engine.RejectOnMissingTickValue = reject
 		}
 	}
 

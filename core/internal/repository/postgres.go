@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq" // Driver PostgreSQL
@@ -924,7 +925,7 @@ type postgresSymbolQuoteRepo struct {
 
 // ==========================================================================
 // postgresRiskPolicyRepo
-// ==========================================================================
+// ===========================================================================
 
 type postgresRiskPolicyRepo struct {
 	db *sql.DB
@@ -932,7 +933,7 @@ type postgresRiskPolicyRepo struct {
 
 func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID string) (*domain.RiskPolicy, error) {
 	query := `
-		SELECT risk_type, lot_size, version, updated_at, valid_until
+		SELECT risk_type, lot_size, config, risk_currency, risk_amount, version, updated_at, valid_until
 		FROM echo.account_strategy_risk_policy
 		WHERE account_id = $1 AND strategy_id = $2
 	`
@@ -940,14 +941,17 @@ func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID 
 	row := r.db.QueryRowContext(ctx, query, accountID, strategyID)
 
 	var (
-		riskType   string
-		lotSize    sql.NullFloat64
-		version    sql.NullInt64
-		updatedAt  time.Time
-		validUntil sql.NullTime
+		riskType     string
+		lotSize      sql.NullFloat64
+		configRaw    sql.NullString
+		riskCurrency sql.NullString
+		riskAmount   sql.NullFloat64
+		version      sql.NullInt64
+		updatedAt    time.Time
+		validUntil   sql.NullTime
 	)
 
-	if err := row.Scan(&riskType, &lotSize, &version, &updatedAt, &validUntil); err != nil {
+	if err := row.Scan(&riskType, &lotSize, &configRaw, &riskCurrency, &riskAmount, &version, &updatedAt, &validUntil); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -972,6 +976,27 @@ func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID 
 			return nil, fmt.Errorf("risk policy FIXED_LOT missing lot_size (account=%s, strategy=%s)", accountID, strategyID)
 		}
 		policy.FixedLot = &domain.FixedLotConfig{LotSize: lotSize.Float64}
+	case domain.RiskPolicyTypeFixedRisk:
+		var cfg *domain.FixedRiskConfig
+		if configRaw.Valid && strings.TrimSpace(configRaw.String) != "" {
+			parsed, err := domain.ParseFixedRiskConfig(json.RawMessage(configRaw.String))
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse fixed risk config: %w", err)
+			}
+			cfg = parsed
+		} else if riskAmount.Valid && riskCurrency.Valid {
+			cfg = &domain.FixedRiskConfig{
+				Amount:   riskAmount.Float64,
+				Currency: strings.ToUpper(strings.TrimSpace(riskCurrency.String)),
+			}
+		} else {
+			return nil, fmt.Errorf("risk policy FIXED_RISK missing configuration (account=%s, strategy=%s)", accountID, strategyID)
+		}
+
+		if cfg.Currency == "" && riskCurrency.Valid {
+			cfg.Currency = strings.ToUpper(strings.TrimSpace(riskCurrency.String))
+		}
+		policy.FixedRisk = cfg
 	default:
 		return nil, fmt.Errorf("unsupported risk policy type: %s", riskType)
 	}

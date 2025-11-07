@@ -23,7 +23,7 @@ La descripción completa del producto, responsabilidades por componente, contrat
 | i3 | Catálogo canónico y snapshots | `canonical_symbol ⇄ broker_symbol`, reportes 250 ms, persistencia en Postgres. | ✅ |
 | i4 | Especificaciones de broker & guardián de volumen | Caché/persistencia de specs, clamps previos a `ExecuteOrder`, políticas `FIXED_LOT` base. | ✅ |
 | i5 | Versionado de handshake y feedback | `protocol_version`, `SymbolRegistrationResult` Core→Agent→EA, validaciones tempranas y tooling CLI. | ✅ |
-| i6 | Sizing con riesgo fijo (Modo A) | Cálculo con distancia a SL y tick value, uso de políticas `FIXED_RISK`. | ⏳ |
+| i6 | Sizing con riesgo fijo (Modo A) | Cálculo con distancia a SL y tick value, uso de políticas `FIXED_RISK`. | ✅ |
 | i7 | Filtros de spread y desvío | Aplicar tolerancias por cuenta×símbolo antes de abrir. | ⏳ |
 | i8a | SL/TP con offset | Offsets configurables en apertura, fallback si broker rechaza. | ⏳ |
 | i8b | StopLevel-aware + modificación post-fill | Validar StopLevel y enviar `ModifyOrder` tras fill cuando aplique. | ⏳ |
@@ -47,6 +47,7 @@ La descripción completa del producto, responsabilidades por componente, contrat
 - ✅ i3 — Catálogo de símbolos y reportes de estado (ver RFC-004c).
 - ✅ i4 — Guardián de especificaciones y políticas `FIXED_LOT` centralizadas.
 - ✅ i5 — Handshake v2 completo (EAs actualizados, feedback consumido, CLI de re-evaluación operativa).
+- ✅ i6 — Motor FixedRisk con cálculo por riesgo monetario, cache de cuentas, métricas y seeds de configuración.
 
 ## Referencias
 

@@ -1,0 +1,24 @@
+{
+  "version": "1.0",
+  "defaults": {
+    "model": "gpt-5-codex-high",
+    "temperature": 0.2,
+    "max_output_tokens": 2000,
+    "flags": {
+      "strict_refs": true,
+      "no_fabrication": true,
+      "time_budget_s": 60
+    }
+  },
+  "principles": ["PR-ROB","PR-MOD","PR-ESC","PR-CLN","PR-SOLID","PR-KISS","PR-OBS","PR-BWC","PR-IDEMP","PR-RES","PR-SEC","PR-PERF"],
+  "agents": {
+    "arch_author": {"prompt": "/prompts/agent-templates/arch_author.md"},
+    "arch_reviewer": {"prompt": "/prompts/agent-templates/arch_reviewer.md"},
+    "dev_author": {"prompt": "/prompts/agent-templates/dev_author.md"},
+    "dev_reviewer": {"prompt": "/prompts/agent-templates/dev_reviewer.md"},
+    "qa_author": {"prompt": "/prompts/agent-templates/qa_author.md"},
+    "qa_reviewer": {"prompt": "/prompts/agent-templates/qa_reviewer.md"},
+    "gatekeeper": {"prompt": "/prompts/agent-templates/gatekeeper.md"}
+  }
+}
+

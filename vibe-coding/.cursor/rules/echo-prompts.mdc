@@ -1,0 +1,72 @@
+---
+alwaysApply: true
+---
+
+```yaml
+ALWAYS:
+  - "Repo root es echo/. Todas las rutas deben comenzar con echo/ y ser absolutas."
+  - "Usar PR-* como base de challenge. Cualquier objeción debe citar PR-* y evidencia archivo#sección."
+  - "Salida ESTRICTA en 2 bloques: 1) ```markdown iniciando con // path: echo/docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md 2) ```text con PROMPT_NEXT_AGENT. EXCEPCIÓN: si falta info, imprimir SOLO NEED-INFO."
+  - "Prohibido inventar: no_fabrication=on, strict_refs=on, cite_all=on."
+  - "Citar SIEMPRE con [echo/...#seccion]. Una cita fuera de echo/ o sin #seccion => NEED-INFO."
+  - "No generar código; solo contratos, interfaces públicas, observabilidad, planes."
+  - "Separar instrucciones y datos con delimitadores: <INSTRUCTIONS>, <CONTEXT>, <REQUEST>."
+  - "Si falta info o una ref no existe/leyó: emitir SOLO bloque NEED-INFO con preguntas cerradas."
+
+AUTO-ATTACHED:
+  - path: echo/docs/00-contexto-general.md
+  - path: echo/docs/01-arquitectura-y-roadmap.md
+  - path: echo/docs/rfcs/RFC-architecture.md
+  - path: echo/vibe-coding/docs/NEED-INFO.md
+  - path: echo/vibe-coding/prompts/common-principles.md
+
+MANUAL:
+  - note: "Adjunta RFC actual y artefactos de la iteración si existen."
+
+DEFAULTS:
+  arch_lock: true
+  time_budget_s: 120
+  max_output_tokens: 2200
+  coverage_min_unit: 0.80
+  coverage_min_integration: 0.60
+  slo_p95_ms: 80
+  err_rate_max: 0.003
+  cite_all: true
+  kebab_case_regex: "^[a-z0-9]+(-[a-z0-9]+)*$"
+
+GUARDS:
+  - "Validar RFC_NAME contra kebab_case_regex. Si falla => NEED-INFO."
+  - "Rechazar rutas relativas o fuera de echo/. Si ocurre => NEED-INFO."
+  - "ARCH_LOCK=true: prohibido cambiar topología; solo extensiones BWC. Si el diseño requiere cambio estructural => proponer alternativa compatible o cortar con NEED-INFO."
+  - "Toda afirmación normativa o de compatibilidad debe apuntar a evidencia [echo/...#seccion]. Sin evidencia => OBS/MAY como mínimo."
+
+PRE_FLIGHT:
+  - "Verificar existencia/lectura de todas las refs adjuntas."
+  - "En 'Refs cargadas', listar cada ruta absoluta y la PRIMERA LÍNEA de su contenido entre comillas."
+  - "Si una ref no existe o no se puede leer => NO imprimir RFC. Imprimir SOLO NEED-INFO con: ref faltante, ruta esperada, por qué es necesaria, preguntas cerradas."
+
+OUTPUT_CONTRACT:
+  - "Bloque 1: ```markdown, comienza con // path: echo/docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md y contiene comentarios de implementación breves."
+  - "Bloque 2: ```text con PROMPT_NEXT_AGENT para Arquitecto Revisor."
+  - "NEED-INFO: se imprime solo, sin RFC ni PROMPT_NEXT_AGENT."
+
+ON_MISSING_INFO:
+  - "Formato NEED-INFO:"
+  - "missing_refs: [echo/... esperado]"
+  - "preguntas_cerradas: ['¿X existe en echo/...? (sí/no)', '¿Ruta exacta? (cadena)']"
+  - "why_needed: 'qué decisión o sección bloquea'"
+
+OBSERVABILIDAD_CONVENCIONES:
+  - "Logs JSON: {app, iter, comp, op, corr_id, span_id, sev, msg}."
+  - "Métricas negocio/sistema: prefijo echo_, nombres snake_case, unidades en sufijo (_ms, _total, _ratio)."
+  - "Tracing: span names 'svc.op', atributos clave: app, iter, comp, op, result, error."
+
+MATRIZ_GOBERNANZA:
+  - "Incluir en el RFC matriz PR-* → evidencia (path#seccion) → impacto (BLOQ/MAY/MEN/INFO)."
+  - "Definir KPIs y SLOs con umbrales: p95 <= {{slo_p95_ms}} ms, err_rate <= {{err_rate_max}}."
+
+DO_NOTS:
+  - "No crear rutas fuera de echo/."
+  - "No asumir contratos externos sin evidencia citada."
+  - "No degradar BWC/Idempotencia sin plan de rollout/rollback."
+```

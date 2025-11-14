@@ -1,0 +1,15 @@
+service: echo-copier
+slos:
+  - name: orders-relay-latency-p95
+    objective: 0.95
+    threshold_ms: 80
+    window: 28d
+  - name: order-fail-rate
+    objective: 0.997
+    threshold: 0.003   # 0.3%
+    window: 28d
+  - name: worker-mem-footprint
+    objective: 0.95
+    threshold_mb: 600
+    window: 28d
+

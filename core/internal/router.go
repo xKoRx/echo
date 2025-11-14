@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xKoRx/echo/core/capabilities"
 	"github.com/xKoRx/echo/core/internal/riskengine"
 	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
@@ -54,6 +55,21 @@ type Router struct {
 	wg     sync.WaitGroup
 }
 
+type StopLevelContext struct {
+	Decision                 capabilities.StopLevelDecision
+	Reason                   string
+	AppliedSLOffsetPoints    int32
+	AppliedTPOffsetPoints    int32
+	ConfiguredSLOffsetPoints int32
+	ConfiguredTPOffsetPoints int32
+	StopLevelBreach          bool
+	EntryPrice               float64
+	SafeStopLossPrice        float64
+	TargetStopLossPrice      float64
+	SafeTakeProfitPrice      float64
+	TargetTakeProfitPrice    float64
+}
+
 // CommandContext contiene el contexto de un comando emitido (i1).
 //
 // Permite resolver slave_account_id y trade_id al recibir ExecutionResult o CloseResult.
@@ -62,6 +78,7 @@ type CommandContext struct {
 	SlaveAccountID string
 	CommandType    string // "execute_order" | "close_order"
 	CreatedAtMs    int64
+	StopLevel      *StopLevelContext
 }
 
 // routerMessage mensaje interno del router.
@@ -632,7 +649,6 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 		}
 
 		r.registerCommandID(commandID)
-		r.registerCommandContext(commandID, tradeID, slaveAccountID, "execute_order")
 
 		opts := &domain.TransformOptions{
 			LotSize:   lotSize,
@@ -641,11 +657,12 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			AccountID: slaveAccountID,
 		}
 
-		order := domain.TradeIntentToExecuteOrder(intent, opts)
-
 		ctxForOrder := ctxPolicy
 
-		brokerSymbol, info, found := r.core.symbolResolver.ResolveForAccount(ctx, slaveAccountID, canonicalSymbol)
+		targetSymbol := canonicalSymbol
+		var info *domain.AccountSymbolInfo
+
+		brokerSymbol, symbolInfo, found := r.core.symbolResolver.ResolveForAccount(ctx, slaveAccountID, canonicalSymbol)
 		if !found {
 			if r.core.canonicalValidator.UnknownAction() == UnknownActionReject {
 				r.core.telemetry.Warn(ctxForOrder, "Symbol mapping missing, order rejected (i3)",
@@ -659,7 +676,8 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 				attribute.String("canonical_symbol", canonicalSymbol),
 			)
 		} else {
-			order.Symbol = brokerSymbol
+			targetSymbol = brokerSymbol
+			info = symbolInfo
 			r.core.telemetry.Debug(ctxForOrder, "Symbol mapping applied (i3)",
 				attribute.String("account_id", slaveAccountID),
 				attribute.String("canonical", canonicalSymbol),
@@ -690,13 +708,72 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			}
 		}
 
-		if quote != nil {
-			r.adjustStopsAndTargets(ctxForOrder, order, intent, quote, info, spec, slaveAccountID)
-		} else {
-			r.core.telemetry.Debug(ctxForOrder, "No quote snapshot available for stop adjustment",
+		adjustableStops, err := r.core.riskPolicyService.GetAdjustableStops(ctxPolicy, slaveAccountID, canonicalSymbol)
+		if err != nil {
+			r.core.telemetry.Error(ctxForOrder, "Failed to load adjustable stops", err,
+				attribute.String("trade_id", tradeID),
 				attribute.String("account_id", slaveAccountID),
-				attribute.String("canonical_symbol", canonicalSymbol),
 			)
+			continue
+		}
+
+		var guardResult *capabilities.StopLevelGuardResult
+		if r.core.stopLevelGuard != nil {
+			guardResult, err = r.core.stopLevelGuard.Evaluate(ctxForOrder, &capabilities.StopLevelGuardRequest{
+				Intent:          intent,
+				Policy:          policy,
+				AdjustableStops: adjustableStops,
+				Quote:           quote,
+				SymbolInfo:      info,
+				SymbolSpec:      spec,
+				AccountID:       slaveAccountID,
+				StrategyID:      strategyID,
+			})
+			if err != nil {
+				r.core.telemetry.Error(ctxForOrder, "StopLevelGuard evaluation failed", err,
+					attribute.String("trade_id", tradeID),
+					attribute.String("account_id", slaveAccountID),
+				)
+				continue
+			}
+			if guardResult.Decision == capabilities.StopLevelDecisionRejectWithReason {
+				continue
+			}
+			if guardResult.StopLevelBreach && guardResult.AdjustableStops != nil {
+				opts.AdjustableStops = guardResult.AdjustableStops
+			}
+		} else if adjustableStops != nil {
+			point := resolvePoint(info, spec)
+			if point > 0 {
+				if adjustableStops.SLOffsetPoints != 0 {
+					opts.SLOffset = float64(adjustableStops.SLOffsetPoints) * point
+				}
+				if adjustableStops.TPOffsetPoints != 0 {
+					opts.TPOffset = float64(adjustableStops.TPOffsetPoints) * point
+				}
+				if opts.SLOffset != 0 || opts.TPOffset != 0 {
+					opts.ApplyOffsets = true
+				}
+			}
+		}
+
+		stopCtx := buildStopLevelContext(guardResult, adjustableStops)
+		r.registerCommandContext(commandID, tradeID, slaveAccountID, "execute_order", stopCtx)
+
+		order := domain.TradeIntentToExecuteOrder(intent, opts)
+		order.Symbol = targetSymbol
+
+		digits := 5
+		if info != nil && info.Digits > 0 {
+			digits = int(info.Digits)
+		} else if spec != nil && spec.General != nil && spec.General.Digits > 0 {
+			digits = int(spec.General.Digits)
+		}
+
+		if guardResult != nil {
+			applyGuardedStops(order, intent, guardResult, digits)
+		} else {
+			r.applyLegacyStops(ctxForOrder, order, intent, quote, info, spec, slaveAccountID, digits)
 		}
 
 		debugAttrs := []attribute.KeyValue{
@@ -748,7 +825,7 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 	return orders
 }
 
-func (r *Router) adjustStopsAndTargets(ctx context.Context, order *pb.ExecuteOrder, intent *pb.TradeIntent, quote *pb.SymbolQuoteSnapshot, info *domain.AccountSymbolInfo, spec *pb.SymbolSpecification, accountID string) {
+func (r *Router) applyLegacyStops(ctx context.Context, order *pb.ExecuteOrder, intent *pb.TradeIntent, quote *pb.SymbolQuoteSnapshot, info *domain.AccountSymbolInfo, spec *pb.SymbolSpecification, accountID string, digits int) {
 	if intent == nil || order == nil {
 		return
 	}
@@ -774,13 +851,6 @@ func (r *Router) adjustStopsAndTargets(ctx context.Context, order *pb.ExecuteOrd
 	entryPrice := quote.Ask
 	if intent.Side == pb.OrderSide_ORDER_SIDE_SELL {
 		entryPrice = quote.Bid
-	}
-
-	digits := 5
-	if info != nil && info.Digits > 0 {
-		digits = int(info.Digits)
-	} else if spec != nil && spec.General != nil && spec.General.Digits > 0 {
-		digits = int(spec.General.Digits)
 	}
 
 	point := 0.0
@@ -973,6 +1043,11 @@ func (r *Router) handleExecutionResult(ctx context.Context, agentID string, resu
 		ErrorMessage:   errMsg,
 		TimestampsMs:   timestampsMap,
 	}
+	if cmdCtx != nil && cmdCtx.StopLevel != nil {
+		execution.SLOffsetPoints = cmdCtx.StopLevel.AppliedSLOffsetPoints
+		execution.TPOffsetPoints = cmdCtx.StopLevel.AppliedTPOffsetPoints
+		execution.StopLevelBreach = cmdCtx.StopLevel.StopLevelBreach
+	}
 
 	// Persistir usando CorrelationService (también actualiza dedupe)
 	if err := r.core.correlationSvc.RecordExecution(ctx, execution); err != nil {
@@ -1068,7 +1143,7 @@ func (r *Router) handleTradeClose(ctx context.Context, agentID string, close *pb
 		closeOrderID := utils.GenerateUUIDv7()
 
 		// i1: Registrar contexto del CloseOrder para correlación
-		r.registerCommandContext(closeOrderID, tradeID, slaveAccountID, "close_order")
+		r.registerCommandContext(closeOrderID, tradeID, slaveAccountID, "close_order", nil)
 
 		// Resolver ticket exacto del slave (i1 - RFC-003)
 		ticket := ticketsBySlave[slaveAccountID]
@@ -1360,7 +1435,7 @@ func (r *Router) registerCommandID(commandID string) {
 // registerCommandContext registra el contexto de un comando emitido (i1).
 //
 // Permite resolver slave_account_id y trade_id al recibir ExecutionResult o CloseResult.
-func (r *Router) registerCommandContext(commandID, tradeID, slaveAccountID, commandType string) {
+func (r *Router) registerCommandContext(commandID, tradeID, slaveAccountID, commandType string, stopCtx *StopLevelContext) {
 	r.commandContextMu.Lock()
 	defer r.commandContextMu.Unlock()
 
@@ -1369,6 +1444,7 @@ func (r *Router) registerCommandContext(commandID, tradeID, slaveAccountID, comm
 		SlaveAccountID: slaveAccountID,
 		CommandType:    commandType,
 		CreatedAtMs:    utils.NowUnixMilli(),
+		StopLevel:      stopCtx,
 	}
 }
 
@@ -1563,5 +1639,55 @@ func (r *Router) broadcastCloseOrder(ctx context.Context, msg *pb.CoreMessage, o
 			attribute.Int("sent_count", sentCount),
 			attribute.Int("timeout_count", timeoutCount),
 		)
+	}
+}
+
+func buildStopLevelContext(result *capabilities.StopLevelGuardResult, adjustable *domain.AdjustableStops) *StopLevelContext {
+	if result == nil {
+		return nil
+	}
+
+	ctx := &StopLevelContext{
+		Decision:              result.Decision,
+		Reason:                result.Reason,
+		AppliedSLOffsetPoints: result.AppliedSLOffsetPts,
+		AppliedTPOffsetPoints: result.AppliedTPOffsetPts,
+		StopLevelBreach:       result.StopLevelBreach,
+		EntryPrice:            result.EntryPrice,
+		SafeStopLossPrice:     result.SafeStopLossPrice,
+		TargetStopLossPrice:   result.TargetStopLossPrice,
+		SafeTakeProfitPrice:   result.SafeTakeProfitPrice,
+		TargetTakeProfitPrice: result.TargetTakeProfitPrice,
+	}
+
+	sourceStops := adjustable
+	if result.AdjustableStops != nil {
+		sourceStops = result.AdjustableStops
+	}
+	if sourceStops != nil {
+		ctx.ConfiguredSLOffsetPoints = sourceStops.SLOffsetPoints
+		ctx.ConfiguredTPOffsetPoints = sourceStops.TPOffsetPoints
+	}
+
+	return ctx
+}
+
+func applyGuardedStops(order *pb.ExecuteOrder, intent *pb.TradeIntent, result *capabilities.StopLevelGuardResult, digits int) {
+	if order == nil || result == nil {
+		return
+	}
+
+	if result.SafeStopLossPrice > 0 {
+		sl := roundToDigits(result.SafeStopLossPrice, digits)
+		order.StopLoss = proto.Float64(sl)
+	} else if intent == nil || intent.StopLoss == nil || *intent.StopLoss == 0 {
+		order.StopLoss = nil
+	}
+
+	if result.SafeTakeProfitPrice > 0 {
+		tp := roundToDigits(result.SafeTakeProfitPrice, digits)
+		order.TakeProfit = proto.Float64(tp)
+	} else if intent == nil || intent.TakeProfit == nil || *intent.TakeProfit == 0 {
+		order.TakeProfit = nil
 	}
 }

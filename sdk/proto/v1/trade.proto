@@ -26,7 +26,6 @@ message TradeIntent {
   
   // Timestamps para latencia E2E (Issue #C1)
   TimestampMetadata timestamps = 20;
-
   // Identificador de estrategia (iteración 4)
   string strategy_id = 21;
 }
@@ -72,6 +71,9 @@ message ExecuteOrder {
   
   // Timestamps para latencia E2E (Issue #C1)
   TimestampMetadata timestamps = 20;
+  // Offsets ajustables para SL/TP enviados por Core al Agent
+  optional AdjustableStops adjustable_stops = 30;
+
 }
 
 // CloseOrder comando para cerrar una orden en slave

@@ -73,6 +73,7 @@ type EchoMetrics struct {
 	AgentHandshakeForwarded    metric.Int64Counter
 	AgentHandshakeBlocked      metric.Int64Counter
 	AgentHandshakeForwardError metric.Int64Counter
+	StopLevelRejections        metric.Int64Counter
 
 	// Histograms
 	LatencyE2E               metric.Float64Histogram
@@ -85,6 +86,7 @@ type EchoMetrics struct {
 	HandshakeFeedbackLatency metric.Float64Histogram
 	FixedRiskExposure        metric.Float64Histogram
 	FixedRiskDistancePoints  metric.Float64Histogram
+	OffsetApplyDuration      metric.Float64Histogram
 
 	// i2: Routing metrics
 	RoutingMode   metric.Int64Counter
@@ -212,6 +214,15 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		"echo.core.risk.policy_rejected_total",
 		metric.WithDescription("Políticas de riesgo rechazadas por motivo"),
 		metric.WithUnit("{reject}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	stopLevelRejections, err := meter.Int64Counter(
+		"echo.core.stop_level_rejections_total",
+		metric.WithDescription("Órdenes rechazadas por violar StopLevel antes del envío"),
+		metric.WithUnit("{order}"),
 	)
 	if err != nil {
 		return nil, err
@@ -371,6 +382,15 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	offsetApplyDuration, err := meter.Float64Histogram(
+		"echo.core.offset_apply_duration_ms",
+		metric.WithDescription("Latencia en aplicar offsets de StopLevel"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// i2: Routing metrics
 	routingMode, err := meter.Int64Counter(
 		"echo.routing.mode",
@@ -441,6 +461,7 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		RiskPolicyLookup:           riskPolicyLookup,
 		FixedRiskCalculation:       fixedRiskCalculation,
 		RiskPolicyRejected:         riskPolicyRejected,
+		StopLevelRejections:        stopLevelRejections,
 		HandshakeVersion:           handshakeVersion,
 		HandshakeStatus:            handshakeStatus,
 		HandshakeSymbolIssue:       handshakeSymbolIssue,
@@ -458,6 +479,7 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		HandshakeFeedbackLatency:   handshakeFeedbackLatency,
 		FixedRiskExposure:          fixedRiskExposure,
 		FixedRiskDistancePoints:    fixedRiskDistancePoints,
+		OffsetApplyDuration:        offsetApplyDuration,
 		RoutingMode:                routingMode,     // i2
 		AccountLookup:              accountLookup,   // i2
 		SymbolsLookup:              symbolsLookup,   // i3
@@ -622,6 +644,16 @@ func (m *EchoMetrics) RecordVolumeGuardSpecAge(ctx context.Context, ageMs float6
 	m.VolumeGuardSpecAge.Record(ctx, ageMs, metric.WithAttributes(attrs...))
 }
 
+// RecordStopLevelRejection contabiliza rechazos del guardián de StopLevel.
+func (m *EchoMetrics) RecordStopLevelRejection(ctx context.Context, attrs ...attribute.KeyValue) {
+	m.StopLevelRejections.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordOffsetApplyDuration registra la latencia de cálculo/aplicación de offsets.
+func (m *EchoMetrics) RecordOffsetApplyDuration(ctx context.Context, durationMs float64, attrs ...attribute.KeyValue) {
+	m.OffsetApplyDuration.Record(ctx, durationMs, metric.WithAttributes(attrs...))
+}
+
 // RecordAgentSpecsForwarded registra reportes de especificaciones enviados al Core.
 func (m *EchoMetrics) RecordAgentSpecsForwarded(ctx context.Context, accountID string, attrs ...attribute.KeyValue) {
 	baseAttrs := []attribute.KeyValue{
@@ -743,6 +775,11 @@ func (m *EchoMetrics) RecordAgentHandshakeForwardError(ctx context.Context, reas
 	}
 	baseAttrs = append(baseAttrs, attrs...)
 	m.AgentHandshakeForwardError.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordStopLevelRejections registra rechazos de órdenes a nivel de stop.
+func (m *EchoMetrics) RecordStopLevelRejections(ctx context.Context, attrs ...attribute.KeyValue) {
+	m.StopLevelRejections.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // RecordHandshakeReconcileSkipped registra re-evaluaciones omitidas por falta de cambios.

@@ -22,6 +22,10 @@ func (s *stubRiskPolicyService) Get(ctx context.Context, accountID, strategyID s
 	return s.policy, s.err
 }
 
+func (s *stubRiskPolicyService) GetAdjustableStops(ctx context.Context, accountID, symbol string) (*domain.AdjustableStops, error) {
+	return &domain.AdjustableStops{}, nil
+}
+
 func (s *stubRiskPolicyService) Invalidate(accountID, strategyID string) {}
 
 type stubHandshakeRepo struct {

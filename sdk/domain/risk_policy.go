@@ -46,5 +46,6 @@ type RiskPolicy struct {
 // RiskPolicyService encapsula la lógica de caché y lectura de políticas.
 type RiskPolicyService interface {
 	Get(ctx context.Context, accountID, strategyID string) (*RiskPolicy, error)
+	GetAdjustableStops(ctx context.Context, accountID, symbol string) (*AdjustableStops, error)
 	Invalidate(accountID, strategyID string)
 }

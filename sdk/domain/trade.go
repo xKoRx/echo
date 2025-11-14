@@ -259,6 +259,9 @@ type TransformOptions struct {
 
 	// SL catastrófico (si está configurado)
 	CatastrophicSL *float64
+
+	// AdjustableStops anexados al comando
+	AdjustableStops *AdjustableStops
 }
 
 // NewTransformOptions crea opciones con valores por defecto.

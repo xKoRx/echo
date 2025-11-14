@@ -66,3 +66,11 @@ message TimestampMetadata {
   int64 t7_order_filled_ms = 8;   // Slave EA recibe ticket/fill
 }
 
+
+// AdjustableStops encapsula offsets configurables de SL/TP y estado de validación.
+message AdjustableStops {
+  sint32 sl_offset_points = 1;
+  sint32 tp_offset_points = 2;
+  bool stop_level_breach = 3;
+  string reason = 4;
+}

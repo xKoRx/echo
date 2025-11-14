@@ -47,6 +47,12 @@ type Trade struct {
 	TakeProfit *float64 `json:"take_profit,omitempty" db:"take_profit"` // Opcional
 	Comment    *string  `json:"comment,omitempty" db:"comment"`         // Opcional
 
+	// Ajustes de stops
+	SLOffsetPoints     int32  `json:"sl_offset_points" db:"sl_offset_points"`
+	TPOffsetPoints     int32  `json:"tp_offset_points" db:"tp_offset_points"`
+	StopLevelBreach    bool   `json:"stop_level_breach" db:"stop_level_breach"`
+	PostModifyAttempts int32  `json:"post_modify_attempts" db:"post_modify_attempts"`
+
 	// Estado
 	Status  OrderStatus `json:"status" db:"status"`   // Estado actual
 	Attempt int32       `json:"attempt" db:"attempt"` // Número de intento
@@ -74,6 +80,12 @@ type Execution struct {
 	Success       bool     `json:"success" db:"success"`                         // true = fill, false = reject
 	ErrorCode     string   `json:"error_code" db:"error_code"`                   // Código de error
 	ErrorMessage  string   `json:"error_message" db:"error_message"`             // Mensaje de error
+
+	// Ajustes de stops
+	SLOffsetPoints     int32  `json:"sl_offset_points" db:"sl_offset_points"`
+	TPOffsetPoints     int32  `json:"tp_offset_points" db:"tp_offset_points"`
+	StopLevelBreach    bool   `json:"stop_level_breach" db:"stop_level_breach"`
+	PostModifyAttempts int32  `json:"post_modify_attempts" db:"post_modify_attempts"`
 
 	// Latencia E2E (timestamps t0..t7)
 	TimestampsMs map[string]int64 `json:"timestamps_ms" db:"timestamps_ms"` // JSONB con t0..t7

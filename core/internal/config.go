@@ -41,6 +41,7 @@ type Config struct {
 	VolumeGuard      *domain.VolumeGuardPolicy
 	Risk             RiskConfig
 	Protocol         ProtocolConfig
+	EnableStopLevelGuard bool
 
 	// PostgreSQL
 	PostgresHost        string // postgres/host
@@ -158,6 +159,7 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 			RequiredFeatures: []string{},
 			RetryInterval:    5 * time.Minute,
 		},
+		EnableStopLevelGuard: false,
 	}
 
 	// Cargar endpoints
@@ -425,6 +427,12 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		switch level {
 		case "DEBUG", "INFO", "WARN", "ERROR":
 			cfg.LogLevel = level
+		}
+	}
+
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/features/enable_stop_level_guard", ""); err == nil && val != "" {
+		if enabled, err := strconv.ParseBool(strings.TrimSpace(val)); err == nil {
+			cfg.EnableStopLevelGuard = enabled
 		}
 	}
 

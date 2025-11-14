@@ -65,6 +65,48 @@ func cloneTimestamps(ts *pb.TimestampMetadata) *pb.TimestampMetadata {
 	}
 }
 
+func adjustableStopsToJSON(stops *pb.AdjustableStops) map[string]interface{} {
+	if stops == nil {
+		return nil
+	}
+	result := map[string]interface{}{
+		"sl_offset_points": stops.SlOffsetPoints,
+		"tp_offset_points": stops.TpOffsetPoints,
+		"stop_level_breach": stops.StopLevelBreach,
+	}
+	if stops.Reason != "" {
+		result["reason"] = stops.Reason
+	}
+	return result
+}
+
+func adjustableStopsFromJSON(raw interface{}) *pb.AdjustableStops {
+	m, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	stops := &pb.AdjustableStops{}
+	if val, exists := m["sl_offset_points"]; exists {
+		stops.SlOffsetPoints = int32(utils.ExtractInt64(map[string]interface{}{"value": val}, "value"))
+	}
+	if val, exists := m["tp_offset_points"]; exists {
+		stops.TpOffsetPoints = int32(utils.ExtractInt64(map[string]interface{}{"value": val}, "value"))
+	}
+	if val, exists := m["stop_level_breach"]; exists {
+		if boolVal, ok := val.(bool); ok {
+			stops.StopLevelBreach = boolVal
+		} else {
+			stops.StopLevelBreach = utils.ExtractBool(map[string]interface{}{"value": val}, "value")
+		}
+	}
+	if val, exists := m["reason"]; exists {
+		if str, ok := val.(string); ok {
+			stops.Reason = str
+		}
+	}
+	return stops
+}
+
 // JSONToTradeIntent convierte un map JSON a TradeIntent proto.
 //
 // Formato JSON esperado (desde Master EA):
@@ -271,6 +313,12 @@ func JSONToExecuteOrder(m map[string]interface{}) (*pb.ExecuteOrder, error) {
 	// Timestamps (Issue #C1)
 	order.Timestamps = parseTimestamps(payload)
 
+	if rawStops, ok := payload["adjustable_stops"]; ok {
+		if stops := adjustableStopsFromJSON(rawStops); stops != nil {
+			order.AdjustableStops = stops
+		}
+	}
+
 	// Validar antes de retornar (Issue #A1)
 	if err := ValidateExecuteOrder(order); err != nil {
 		return nil, fmt.Errorf("validation failed: %w", err)
@@ -317,6 +365,10 @@ func ExecuteOrderToJSON(order *pb.ExecuteOrder) (map[string]interface{}, error) 
 	// Timestamps (Issue #C1)
 	if tsMap := timestampsToMap(order.Timestamps); tsMap != nil {
 		payload["timestamps"] = tsMap
+	}
+
+	if order.AdjustableStops != nil {
+		payload["adjustable_stops"] = adjustableStopsToJSON(order.AdjustableStops)
 	}
 
 	result := map[string]interface{}{
@@ -632,6 +684,10 @@ func TradeIntentToExecuteOrder(intent *pb.TradeIntent, opts *TransformOptions) *
 	// Comment opcional
 	if intent.Comment != nil {
 		order.Comment = intent.Comment
+	}
+
+	if opts.AdjustableStops != nil {
+		order.AdjustableStops = opts.AdjustableStops.ToProto()
 	}
 
 	return order

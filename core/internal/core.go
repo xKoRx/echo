@@ -12,11 +12,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xKoRx/echo/core/capabilities"
 	"github.com/xKoRx/echo/core/internal/repository"
 	"github.com/xKoRx/echo/core/internal/riskengine"
 	"github.com/xKoRx/echo/core/internal/volumeguard"
 	"github.com/xKoRx/echo/sdk/domain"
 	"github.com/xKoRx/echo/sdk/domain/handshake"
+	"github.com/xKoRx/echo/sdk/etcd"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
 	"github.com/xKoRx/echo/sdk/telemetry/metricbundle"
@@ -60,6 +62,9 @@ type Core struct {
 	// PostgreSQL
 	db *sql.DB
 
+	// ETCD client for runtime lookups
+	etcdClient *etcd.Client
+
 	// Repositories (i1)
 	repoFactory    domain.RepositoryFactory
 	correlationSvc domain.CorrelationService
@@ -78,6 +83,7 @@ type Core struct {
 	symbolQuoteService  *SymbolQuoteService
 	accountStateService *AccountStateService
 	riskEngine          *riskengine.FixedRiskEngine
+	stopLevelGuard      capabilities.StopLevelGuard
 
 	// Router/Processor
 	router *Router
@@ -139,10 +145,14 @@ func New(ctx context.Context) (*Core, error) {
 	coreCtx, cancel := context.WithCancel(ctx)
 
 	// 1. Cargar configuración desde ETCD
-	config, err := LoadConfig(coreCtx)
+	offsetClient, err := etcd.New(
+		etcd.WithApp("echo"),
+		etcd.WithEnv(config.Environment),
+		etcd.WithEndpointsFromEnv(),
+	)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to load config from ETCD: %w", err)
+		return nil, fmt.Errorf("failed to create etcd client: %w", err)
 	}
 
 	// 2. Conectar a PostgreSQL
@@ -222,7 +232,7 @@ func New(ctx context.Context) (*Core, error) {
 	symbolSpecService := NewSymbolSpecService(repoFactory.SymbolSpecRepository(), telClient, echoMetrics, config.CanonicalSymbols)
 	symbolQuoteService := NewSymbolQuoteService(repoFactory.SymbolQuoteRepository(), telClient)
 	accountStateService := NewAccountStateService(telClient)
-	riskPolicySvc := NewRiskPolicyService(repoFactory.RiskPolicyRepository(), config.Risk.CacheTTL, telClient, echoMetrics)
+	riskPolicySvc := NewRiskPolicyService(repoFactory.RiskPolicyRepository(), config.Risk.CacheTTL, telClient, echoMetrics, offsetClient)
 	volumeGuard := volumeguard.New(symbolSpecService, config.VolumeGuard, telClient, echoMetrics)
 	riskEngineCfg := riskengine.Config{
 		MaxQuoteAge:              config.Risk.Engine.QuoteMaxAge,
@@ -233,6 +243,12 @@ func New(ctx context.Context) (*Core, error) {
 		RejectOnMissingTickValue: config.Risk.Engine.RejectOnMissingTickValue,
 	}
 	fixedRiskEngine := riskengine.NewFixedRiskEngine(symbolSpecService, symbolQuoteService, accountStateService, &symbolInfoAdapter{resolver: symbolResolver}, volumeGuard, riskEngineCfg, telClient, echoMetrics)
+
+	var stopGuard capabilities.StopLevelGuard
+	if config.EnableStopLevelGuard {
+		stopGuard = NewStopLevelGuard(telClient, echoMetrics)
+	}
+
 	if rs, ok := riskPolicySvc.(*riskPolicyService); ok {
 		if err := rs.StartListener(coreCtx, config.PostgresConnStr()); err != nil {
 			telClient.Warn(coreCtx, "Failed to start risk policy listener",
@@ -270,6 +286,7 @@ func New(ctx context.Context) (*Core, error) {
 	core := &Core{
 		config:              config,
 		db:                  db,
+		etcdClient:          offsetClient,
 		repoFactory:         repoFactory,
 		correlationSvc:      correlationSvc,
 		dedupeService:       dedupeService,
@@ -281,6 +298,7 @@ func New(ctx context.Context) (*Core, error) {
 		symbolQuoteService:  symbolQuoteService,
 		accountStateService: accountStateService,
 		riskEngine:          fixedRiskEngine,
+		stopLevelGuard:      stopGuard,
 		agents:              make(map[string]*AgentConnection),
 		accountRegistry:     NewAccountRegistry(telClient), // NEW i2
 		telemetry:           telClient,
@@ -696,6 +714,14 @@ func (c *Core) Shutdown() error {
 			c.telemetry.Error(c.ctx, "Failed to close PostgreSQL connection", err)
 		} else {
 			c.telemetry.Info(c.ctx, "PostgreSQL connection closed")
+		}
+	}
+
+	if c.etcdClient != nil {
+		if err := c.etcdClient.Close(); err != nil {
+			c.telemetry.Warn(c.ctx, "Failed to close ETCD client", attribute.String("error", err.Error()))
+		} else {
+			c.telemetry.Info(c.ctx, "ETCD client closed")
 		}
 	}
 

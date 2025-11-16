@@ -66,6 +66,9 @@ type EchoMetrics struct {
 	RiskPolicyLookup           metric.Int64Counter
 	FixedRiskCalculation       metric.Int64Counter
 	RiskPolicyRejected         metric.Int64Counter
+	StopOffsetApplied          metric.Int64Counter
+	StopOffsetEdgeRejection    metric.Int64Counter
+	StopOffsetFallback         metric.Int64Counter
 	HandshakeVersion           metric.Int64Counter
 	HandshakeStatus            metric.Int64Counter
 	HandshakeSymbolIssue       metric.Int64Counter
@@ -85,6 +88,7 @@ type EchoMetrics struct {
 	HandshakeFeedbackLatency metric.Float64Histogram
 	FixedRiskExposure        metric.Float64Histogram
 	FixedRiskDistancePoints  metric.Float64Histogram
+	StopOffsetDistance       metric.Float64Histogram
 
 	// i2: Routing metrics
 	RoutingMode   metric.Int64Counter
@@ -212,6 +216,33 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		"echo.core.risk.policy_rejected_total",
 		metric.WithDescription("Políticas de riesgo rechazadas por motivo"),
 		metric.WithUnit("{reject}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	stopOffsetApplied, err := meter.Int64Counter(
+		"echo_core.stop_offset_applied_total",
+		metric.WithDescription("Offsets SL/TP aplicados/clampados por tipo"),
+		metric.WithUnit("{offset}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	stopOffsetEdgeRejection, err := meter.Int64Counter(
+		"echo_core.stop_offset_edge_rejections_total",
+		metric.WithDescription("Clamps obligatorios por StopLevel o distancia mínima"),
+		metric.WithUnit("{clamp}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	stopOffsetFallback, err := meter.Int64Counter(
+		"echo_core.stop_offset_fallback_total",
+		metric.WithDescription("Fallbacks solicitados ante ERROR_CODE_INVALID_STOPS"),
+		metric.WithUnit("{fallback}"),
 	)
 	if err != nil {
 		return nil, err
@@ -371,6 +402,16 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	stopOffsetDistance, err := meter.Float64Histogram(
+		"echo_core.stop_offset_distance_pips",
+		metric.WithDescription("Distancia final en pips tras aplicar offsets SL/TP"),
+		metric.WithUnit("pip"),
+		metric.WithExplicitBucketBoundaries(0, 1, 2, 5, 10, 20, 50, 100),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// i2: Routing metrics
 	routingMode, err := meter.Int64Counter(
 		"echo.routing.mode",
@@ -441,6 +482,9 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		RiskPolicyLookup:           riskPolicyLookup,
 		FixedRiskCalculation:       fixedRiskCalculation,
 		RiskPolicyRejected:         riskPolicyRejected,
+		StopOffsetApplied:          stopOffsetApplied,
+		StopOffsetEdgeRejection:    stopOffsetEdgeRejection,
+		StopOffsetFallback:         stopOffsetFallback,
 		HandshakeVersion:           handshakeVersion,
 		HandshakeStatus:            handshakeStatus,
 		HandshakeSymbolIssue:       handshakeSymbolIssue,
@@ -458,6 +502,7 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		HandshakeFeedbackLatency:   handshakeFeedbackLatency,
 		FixedRiskExposure:          fixedRiskExposure,
 		FixedRiskDistancePoints:    fixedRiskDistancePoints,
+		StopOffsetDistance:         stopOffsetDistance,
 		RoutingMode:                routingMode,     // i2
 		AccountLookup:              accountLookup,   // i2
 		SymbolsLookup:              symbolsLookup,   // i3
@@ -669,6 +714,56 @@ func (m *EchoMetrics) RecordRiskPolicyRejected(ctx context.Context, reason strin
 	}
 	baseAttrs = append(baseAttrs, attrs...)
 	m.RiskPolicyRejected.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordStopOffsetApplied registra el resultado del offset (applied/clamped/skipped) por tipo (sl/tp).
+func (m *EchoMetrics) RecordStopOffsetApplied(ctx context.Context, stopType, segment, result string) {
+	if m.StopOffsetApplied == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("type", stopType),
+		attribute.String("segment", segment),
+		attribute.String("result", result),
+	}
+	m.StopOffsetApplied.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordStopOffsetDistance registra la distancia final en pips tras aplicar offsets.
+func (m *EchoMetrics) RecordStopOffsetDistance(ctx context.Context, stopType, segment string, distance float64) {
+	if m.StopOffsetDistance == nil || distance <= 0 {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("type", stopType),
+		attribute.String("segment", segment),
+	}
+	m.StopOffsetDistance.Record(ctx, distance, metric.WithAttributes(attrs...))
+}
+
+// RecordStopOffsetEdgeRejection registra clamps obligatorios.
+func (m *EchoMetrics) RecordStopOffsetEdgeRejection(ctx context.Context, reason, segment string) {
+	if m.StopOffsetEdgeRejection == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("reason", reason),
+		attribute.String("segment", segment),
+	}
+	m.StopOffsetEdgeRejection.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordStopOffsetFallback registra el estado del fallback ante INVALID_STOPS.
+func (m *EchoMetrics) RecordStopOffsetFallback(ctx context.Context, stage, result, segment string) {
+	if m.StopOffsetFallback == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("stage", stage),
+		attribute.String("result", result),
+		attribute.String("segment", segment),
+	}
+	m.StopOffsetFallback.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // RecordFixedRiskExposure registra la pérdida esperada calculada para FIXED_RISK.

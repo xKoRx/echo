@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq" // Driver PostgreSQL
@@ -929,14 +930,27 @@ type postgresSymbolQuoteRepo struct {
 
 type postgresRiskPolicyRepo struct {
 	db *sql.DB
+
+	detectOffsetsOnce sync.Once
+	offsetColumns     bool
 }
 
 func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID string) (*domain.RiskPolicy, error) {
+	supportsOffsets := r.supportsOffsetColumns(ctx)
+
 	query := `
 		SELECT risk_type, lot_size, config, risk_currency, risk_amount, version, updated_at, valid_until
 		FROM echo.account_strategy_risk_policy
 		WHERE account_id = $1 AND strategy_id = $2
 	`
+	if supportsOffsets {
+		query = `
+			SELECT risk_type, lot_size, config, risk_currency, risk_amount,
+			       sl_offset_pips, tp_offset_pips, version, updated_at, valid_until
+			FROM echo.account_strategy_risk_policy
+			WHERE account_id = $1 AND strategy_id = $2
+		`
+	}
 
 	row := r.db.QueryRowContext(ctx, query, accountID, strategyID)
 
@@ -946,16 +960,25 @@ func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID 
 		configRaw    sql.NullString
 		riskCurrency sql.NullString
 		riskAmount   sql.NullFloat64
+		slOffset     sql.NullInt32
+		tpOffset     sql.NullInt32
 		version      sql.NullInt64
 		updatedAt    time.Time
 		validUntil   sql.NullTime
 	)
 
-	if err := row.Scan(&riskType, &lotSize, &configRaw, &riskCurrency, &riskAmount, &version, &updatedAt, &validUntil); err != nil {
-		if err == sql.ErrNoRows {
+	var scanErr error
+	if supportsOffsets {
+		scanErr = row.Scan(&riskType, &lotSize, &configRaw, &riskCurrency, &riskAmount, &slOffset, &tpOffset, &version, &updatedAt, &validUntil)
+	} else {
+		scanErr = row.Scan(&riskType, &lotSize, &configRaw, &riskCurrency, &riskAmount, &version, &updatedAt, &validUntil)
+	}
+
+	if scanErr != nil {
+		if scanErr == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to get risk policy: %w", err)
+		return nil, fmt.Errorf("failed to get risk policy: %w", scanErr)
 	}
 
 	policy := &domain.RiskPolicy{
@@ -1000,6 +1023,14 @@ func (r *postgresRiskPolicyRepo) Get(ctx context.Context, accountID, strategyID 
 	default:
 		return nil, fmt.Errorf("unsupported risk policy type: %s", riskType)
 	}
+
+	if slOffset.Valid {
+		policy.StopLossOffsetPips = slOffset.Int32
+	}
+	if tpOffset.Valid {
+		policy.TakeProfitOffsetPips = tpOffset.Int32
+	}
+	policy.RiskTier = normalizeRiskTier(extractRiskTierFromConfig(configRaw.String))
 
 	return policy, nil
 }
@@ -1141,4 +1172,55 @@ func (r *postgresSymbolRepo) InvalidateAccount(ctx context.Context, accountID st
 		return fmt.Errorf("failed to invalidate account mappings: %w", err)
 	}
 	return nil
+}
+
+func (r *postgresRiskPolicyRepo) supportsOffsetColumns(ctx context.Context) bool {
+	r.detectOffsetsOnce.Do(func() {
+		query := `
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'echo'
+			  AND table_name = 'account_strategy_risk_policy'
+			  AND column_name = 'sl_offset_pips'
+			LIMIT 1
+		`
+		var exists int
+		if err := r.db.QueryRowContext(ctx, query).Scan(&exists); err == nil && exists == 1 {
+			r.offsetColumns = true
+		}
+	})
+	return r.offsetColumns
+}
+
+func extractRiskTierFromConfig(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+
+	if value, ok := payload["risk_tier"].(string); ok {
+		return value
+	}
+
+	return ""
+}
+
+func normalizeRiskTier(value string) string {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "tier_1", "tier1":
+		return "tier_1"
+	case "tier_2", "tier2":
+		return "tier_2"
+	case "tier_3", "tier3":
+		return "tier_3"
+	case "global":
+		return "global"
+	default:
+		return "global"
+	}
 }

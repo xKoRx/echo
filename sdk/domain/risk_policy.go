@@ -38,6 +38,12 @@ type RiskPolicy struct {
 	Type       RiskPolicyType
 	FixedLot   *FixedLotConfig
 	FixedRisk  *FixedRiskConfig
+	// StopLossOffsetPips representa el offset configurado en pips para SL (puede ser negativo).
+	StopLossOffsetPips int32
+	// TakeProfitOffsetPips representa el offset configurado en pips para TP (puede ser negativo).
+	TakeProfitOffsetPips int32
+	// RiskTier identifica el segmento operativo (global, tier_1, tier_2, tier_3).
+	RiskTier   string
 	Version    int64
 	UpdatedAt  time.Time
 	ValidUntil *time.Time

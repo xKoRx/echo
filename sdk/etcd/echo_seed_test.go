@@ -82,11 +82,11 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		// Slave Accounts (i0: cuentas demo reales)
 		"core/slave_accounts": "2089126183,2089126186",
 
-		"core/canonical_symbols":      "XAUUSD,DAX", // XAUUSD,DAX,EURUSD,GBPUSD,USDCHF,USDJPY
-		"core/symbols/unknown_action": "reject",     // reject, warn, error
+		"core/canonical_symbols":      "XAUUSD,GDAXI", // XAUUSD,GDAXI,EURUSD,GBPUSD,USDCHF,USDJPY
+		"core/symbols/unknown_action": "reject",       // reject, warn, error
 
 		// Agent extras
-		"agent/canonical_symbols": "XAUUSD,DAX",
+		"agent/canonical_symbols": "XAUUSD,GDAXI",
 
 		// PostgreSQL
 		"postgres/host":           "192.168.31.220",

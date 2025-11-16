@@ -25,21 +25,22 @@ La descripción completa del producto, responsabilidades por componente, contrat
 | i5 | Versionado de handshake y feedback | `protocol_version`, `SymbolRegistrationResult` Core→Agent→EA, validaciones tempranas y tooling CLI. | ✅ |
 | i6 | Sizing con riesgo fijo (Modo A) | Cálculo con distancia a SL y tick value, uso de políticas `FIXED_RISK`. | ✅ |
 | i6b | Hardening multi-activo | Garantizar que master/slave usen precios y quotes por símbolo antes de ejecutar/cerrar órdenes. | ✅ |
-| i7 | Filtros de spread y desvío | Aplicar tolerancias por cuenta×símbolo antes de abrir. | ⏳ |
-| i8a | SL/TP con offset | Offsets configurables en apertura, fallback si broker rechaza. | ⏳ |
-| i8b | StopLevel-aware + modificación post-fill | Validar StopLevel y enviar `ModifyOrder` tras fill cuando aplique. | ⏳ |
-| i9 | Ventanas de no-ejecución | Calendarios que bloquean nuevas aperturas sin afectar cierres. | ⏳ |
-| i10 | SL catastrófico | Protección independiente del master, cierre forzado y telemetría. | ⏳ |
-| i11 | Espera de mejora (time-boxed) | Buscar mejor precio durante un intervalo breve sin incrementar latencia. | ⏳ |
-| i12 | Normalización de `error_code` | Diccionario único para logs, métricas y BD. | ⏳ |
-| i13a | Concurrencia por `trade_id` | Worker pool con orden garantizado y baja latencia. | ⏳ |
-| i13b | Backpressure y límites de cola | Buffers configurables, métricas de cola, rechazos controlados. | ⏳ |
-| i14 | Telemetría avanzada | Dashboards de funneles, histogramas de latencia, métricas de slippage/spread. | ⏳ |
-| i15 | Paquetización y operación | CLI/scripts, health checks, runbooks y automatización básica. | ⏳ |
-| i16 | Políticas operativas de trading | Límites globales (drawdown diario/total, apalancamiento, sizing máximo). | ⏳ |
-| i17 | Garantías de replicación determinista | End-to-end delivery con reintentos, quorum de acks y reconciliación automática de operaciones para evitar pérdidas. | ⏳ |
+| i7 | Filtros de spread y desvío | [Deprecado] Aplicar tolerancias por cuenta×símbolo antes de abrir. | ❌ |
+| i8a | SL/TP con offset | Offsets configurables en apertura; fallback reintenta `ExecuteOrder` con offsets 0 (sin `ModifyOrder`, reservado para i8b). | 🚧 |
+| i8b | StopLevel-aware + modificación post-fill | Validar StopLevel y enviar `ModifyOrder` tras fill cuando aplique. | 🚧 |
+| i9 | Ventanas de no-ejecución | [V2] Calendarios que bloquean nuevas operaciones. | ⏳ |
+| i10 | SL catastrófico | Protección independiente del master, cierre forzado y telemetría. | ❌ |
+| i11 | Espera de mejora (time-boxed) | Buscar mejor precio durante un intervalo breve sin incrementar latencia. | ❌ |
+| i12 | Normalización de `error_code` | Diccionario único para logs, métricas y BD. | ❌ |
+| i13a | Concurrencia por `trade_id` | [V1] Worker pool con orden garantizado y baja latencia. | ⏳ |
+| i13b | Backpressure y límites de cola | [V1] Buffers configurables, métricas de cola, rechazos controlados. | ⏳ |
+| i14 | Telemetría avanzada | [V1] Dashboards de funneles, histogramas de latencia, métricas de slippage/spread. | ⏳ |
+| i15 | Paquetización y operación | [V1] CLI/scripts, health checks, runbooks y automatización básica. | ❌ |
+| i16 | Políticas operativas de trading | [V2] Límites globales (drawdown diario/total, apalancamiento, sizing máximo). | ⏳ |
+| i17 | Garantías de replicación determinista | [V1] End-to-end delivery con reintentos, quorum de acks y reconciliación automática de operaciones para evitar pérdidas. | ⏳ |
 | TBD | Event store Mongo | Almacenamiento append-only para auditoría y análisis. | ⏳ |
 | TBD | SymbolMappings en Master | Master EA consume catálogo canónico y publica símbolos normalizados. | ⏳ |
+| TBD | Pipe Start | Los Agentes deben abrir los pipe solo cuando corresponda, o sea, solo cuando el cliente lo solicite, validando la existencia de configuración con core previamente. | ⏳ |
 
 ## Estado actual
 

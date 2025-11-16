@@ -62,7 +62,74 @@ type CommandContext struct {
 	SlaveAccountID string
 	CommandType    string // "execute_order" | "close_order"
 	CreatedAtMs    int64
+
+	StrategyID      string
+	CanonicalSymbol string
+	Segment         string
+	PolicyType      domain.RiskPolicyType
+
+	Intent    *pb.TradeIntent
+	LastOrder *pb.ExecuteOrder
+
+	FallbackAttempted bool
+	PendingFallback   bool
+
+	OriginalCommandID string
+	FallbackCommandID string
+
+	LastFallbackStage  string
+	LastFallbackResult string
 }
+
+type symbolPricingContext struct {
+	Digits        int
+	Point         float64
+	TickSize      float64
+	PipSize       float64
+	MinDistance   float64
+	StopLevelPips float64
+}
+
+type stopOffsetStats struct {
+	Segment string
+
+	ConfiguredSLPips int32
+	ConfiguredTPPips int32
+
+	MasterSLDistancePips float64
+	MasterTPDistancePips float64
+	TargetSLDistancePips float64
+	TargetTPDistancePips float64
+	FinalSLDistancePips  float64
+	FinalTPDistancePips  float64
+
+	StopLevelPips float64
+	PipSize       float64
+
+	SLResult string
+	TPResult string
+}
+
+type stopAdjustmentOutcome struct {
+	EntryPrice  float64
+	MinDistance float64
+
+	StopLossDistance   float64
+	TakeProfitDistance float64
+
+	StopLossClamped   bool
+	TakeProfitClamped bool
+	QuoteAvailable    bool
+}
+
+const (
+	fallbackStageAttempt1 = "attempt1"
+	fallbackStageAttempt2 = "attempt2"
+
+	fallbackResultRequested = "requested"
+	fallbackResultSuccess   = "success"
+	fallbackResultFailed    = "failed"
+)
 
 // routerMessage mensaje interno del router.
 type routerMessage struct {
@@ -434,6 +501,9 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 
 		ctxPolicy := telemetry.AppendEventAttrs(ctx, semconv.Echo.PolicyType.String(string(policy.Type)))
 		ctxPolicy = telemetry.AppendMetricAttrs(ctxPolicy, semconv.Echo.PolicyType.String(string(policy.Type)))
+		segment := normalizeSegment(policy.RiskTier)
+		ctxPolicy = telemetry.AppendEventAttrs(ctxPolicy, attribute.String("segment", segment))
+		ctxPolicy = telemetry.AppendMetricAttrs(ctxPolicy, attribute.String("segment", segment))
 
 		var (
 			lotSize                float64
@@ -632,7 +702,12 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 		}
 
 		r.registerCommandID(commandID)
-		r.registerCommandContext(commandID, tradeID, slaveAccountID, "execute_order")
+		cmdCtx := r.registerCommandContext(commandID, tradeID, slaveAccountID, "execute_order")
+		cmdCtx.StrategyID = strategyID
+		cmdCtx.CanonicalSymbol = canonicalSymbol
+		cmdCtx.Intent = intent
+		cmdCtx.PolicyType = policy.Type
+		cmdCtx.Segment = segment
 
 		opts := &domain.TransformOptions{
 			LotSize:   lotSize,
@@ -683,6 +758,8 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			}
 		}
 
+		pricing := newSymbolPricingContext(info, spec)
+
 		var quote *pb.SymbolQuoteSnapshot
 		if r.core.symbolQuoteService != nil {
 			if q, ok := r.core.symbolQuoteService.Get(slaveAccountID, canonicalSymbol); ok {
@@ -690,13 +767,11 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			}
 		}
 
-		if quote != nil {
-			r.adjustStopsAndTargets(ctxForOrder, order, intent, quote, info, spec, slaveAccountID)
-		} else {
-			r.core.telemetry.Debug(ctxForOrder, "No quote snapshot available for stop adjustment",
-				attribute.String("account_id", slaveAccountID),
-				attribute.String("canonical_symbol", canonicalSymbol),
-			)
+		stats := r.applyStopOffsets(ctxForOrder, order, intent, policy, pricing, slaveAccountID, segment)
+		adjustOutcome := r.adjustStopsAndTargets(ctxForOrder, order, intent, quote, info, spec, slaveAccountID, pricing, stats)
+		r.emitStopOffsetTelemetry(ctxForOrder, intent, order, stats, adjustOutcome, strategyID, slaveAccountID)
+		if cmdCtx != nil {
+			cmdCtx.LastOrder = proto.Clone(order).(*pb.ExecuteOrder)
 		}
 
 		debugAttrs := []attribute.KeyValue{
@@ -748,19 +823,22 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 	return orders
 }
 
-func (r *Router) adjustStopsAndTargets(ctx context.Context, order *pb.ExecuteOrder, intent *pb.TradeIntent, quote *pb.SymbolQuoteSnapshot, info *domain.AccountSymbolInfo, spec *pb.SymbolSpecification, accountID string) {
-	if intent == nil || order == nil {
-		return
+func (r *Router) adjustStopsAndTargets(ctx context.Context, order *pb.ExecuteOrder, intent *pb.TradeIntent, quote *pb.SymbolQuoteSnapshot, info *domain.AccountSymbolInfo, spec *pb.SymbolSpecification, accountID string, pricing symbolPricingContext, stats *stopOffsetStats) *stopAdjustmentOutcome {
+	outcome := &stopAdjustmentOutcome{
+		MinDistance: pricing.MinDistance,
 	}
 
-	// Fallback para mantener los valores originales si el ajuste no aplica
+	if intent == nil || order == nil {
+		return outcome
+	}
+
 	if order.StopLoss == nil && intent.StopLoss != nil {
-		origSL := intent.GetStopLoss()
-		order.StopLoss = proto.Float64(origSL)
+		sl := intent.GetStopLoss()
+		order.StopLoss = proto.Float64(sl)
 	}
 	if order.TakeProfit == nil && intent.TakeProfit != nil {
-		origTP := intent.GetTakeProfit()
-		order.TakeProfit = proto.Float64(origTP)
+		tp := intent.GetTakeProfit()
+		order.TakeProfit = proto.Float64(tp)
 	}
 
 	if quote == nil {
@@ -768,46 +846,53 @@ func (r *Router) adjustStopsAndTargets(ctx context.Context, order *pb.ExecuteOrd
 			attribute.String("account_id", accountID),
 			attribute.String("canonical_symbol", intent.Symbol),
 		)
-		return
+		return outcome
 	}
+
+	outcome.QuoteAvailable = true
 
 	entryPrice := quote.Ask
 	if intent.Side == pb.OrderSide_ORDER_SIDE_SELL {
 		entryPrice = quote.Bid
 	}
+	outcome.EntryPrice = entryPrice
 
-	digits := 5
-	if info != nil && info.Digits > 0 {
-		digits = int(info.Digits)
-	} else if spec != nil && spec.General != nil && spec.General.Digits > 0 {
-		digits = int(spec.General.Digits)
+	digits := pricing.Digits
+	if digits <= 0 {
+		digits = 5
 	}
 
-	point := 0.0
-	if info != nil {
+	point := pricing.Point
+	if point == 0 && info != nil {
 		point = info.Point
 	}
 
-	minDistance := computeMinDistance(point, spec)
+	minDistance := pricing.MinDistance
+	if minDistance <= 0 {
+		minDistance = computeMinDistance(point, spec)
+	}
+	outcome.MinDistance = minDistance
 
-	if intent.StopLoss != nil && *intent.StopLoss != 0 {
-		distance := computeStopDistance(intent.Side, intent.Price, *intent.StopLoss)
-		if distance <= 0 {
-			// Si distance no es válida, mantener SL original
-			if order.StopLoss == nil {
-				origSL := intent.GetStopLoss()
-				order.StopLoss = proto.Float64(origSL)
-			}
-			goto adjustTP
-		}
+	pipSize := pricing.PipSize
+	if pipSize <= 0 && stats != nil && stats.PipSize > 0 {
+		pipSize = stats.PipSize
+	}
+	if pipSize <= 0 {
+		pipSize = 0.0001
+	}
 
-		newSL := computeStopPrice(intent.Side, entryPrice, distance)
-		if minDistance > 0 && math.Abs(entryPrice-newSL) < minDistance {
-			if intent.Side == pb.OrderSide_ORDER_SIDE_BUY {
-				newSL = entryPrice - minDistance
-			} else {
-				newSL = entryPrice + minDistance
-			}
+	targetSLDistance := 0.0
+	if stats != nil && stats.TargetSLDistancePips > 0 && pipSize > 0 {
+		targetSLDistance = stats.TargetSLDistancePips * pipSize
+	} else if order.StopLoss != nil {
+		targetSLDistance = quoteDistanceToStop(intent.Side, entryPrice, order.GetStopLoss())
+	}
+
+	if targetSLDistance > 0 {
+		newSL := computeStopPrice(intent.Side, entryPrice, targetSLDistance)
+		if minDistance > 0 && targetSLDistance < minDistance {
+			newSL = computeStopPrice(intent.Side, entryPrice, minDistance)
+			outcome.StopLossClamped = true
 			r.core.telemetry.Debug(ctx, "StopLoss adjusted to satisfy stop level",
 				attribute.String("account_id", accountID),
 				attribute.Float64("min_distance", minDistance),
@@ -816,23 +901,24 @@ func (r *Router) adjustStopsAndTargets(ctx context.Context, order *pb.ExecuteOrd
 
 		rounded := roundToDigits(newSL, digits)
 		order.StopLoss = proto.Float64(rounded)
+		outcome.StopLossDistance = math.Abs(entryPrice - rounded)
 	}
 
-adjustTP:
-	if intent.TakeProfit != nil && *intent.TakeProfit != 0 {
-		distance := computeTakeProfitDistance(intent.Side, intent.Price, *intent.TakeProfit)
-		if distance <= 0 {
-			if order.TakeProfit == nil {
-				origTP := intent.GetTakeProfit()
-				order.TakeProfit = proto.Float64(origTP)
-			}
-			return
-		}
+	targetTPDistance := 0.0
+	if stats != nil && stats.TargetTPDistancePips > 0 && pipSize > 0 {
+		targetTPDistance = stats.TargetTPDistancePips * pipSize
+	} else if order.TakeProfit != nil {
+		targetTPDistance = quoteDistanceToTakeProfit(intent.Side, entryPrice, order.GetTakeProfit())
+	}
 
-		newTP := computeTakeProfitPrice(intent.Side, entryPrice, distance)
+	if targetTPDistance > 0 {
+		newTP := computeTakeProfitPrice(intent.Side, entryPrice, targetTPDistance)
 		rounded := roundToDigits(newTP, digits)
 		order.TakeProfit = proto.Float64(rounded)
+		outcome.TakeProfitDistance = math.Abs(entryPrice - rounded)
 	}
+
+	return outcome
 }
 
 func computeStopDistance(side pb.OrderSide, price, stop float64) float64 {
@@ -885,6 +971,26 @@ func roundToDigits(value float64, digits int) float64 {
 	}
 	factor := math.Pow10(digits)
 	return math.Round(value*factor) / factor
+}
+
+func quoteDistanceToStop(side pb.OrderSide, entryPrice, stopPrice float64) float64 {
+	if entryPrice <= 0 || stopPrice <= 0 {
+		return 0
+	}
+	if side == pb.OrderSide_ORDER_SIDE_BUY {
+		return entryPrice - stopPrice
+	}
+	return stopPrice - entryPrice
+}
+
+func quoteDistanceToTakeProfit(side pb.OrderSide, entryPrice, tpPrice float64) float64 {
+	if entryPrice <= 0 || tpPrice <= 0 {
+		return 0
+	}
+	if side == pb.OrderSide_ORDER_SIDE_BUY {
+		return tpPrice - entryPrice
+	}
+	return entryPrice - tpPrice
 }
 
 // handleExecutionResult procesa un ExecutionResult del Slave (i1).
@@ -944,6 +1050,19 @@ func (r *Router) handleExecutionResult(ctx context.Context, agentID string, resu
 			attribute.String("trade_id", finalTradeID),
 			attribute.String("slave_account_id", slaveAccountID),
 		)
+	}
+
+	needsFallback := !result.Success && result.ErrorCode == pb.ErrorCode_ERROR_CODE_INVALID_STOPS
+	if needsFallback && cmdCtx != nil {
+		if !cmdCtx.FallbackAttempted {
+			r.recordStopOffsetFallback(ctx, cmdCtx, fallbackStageAttempt1, fallbackResultRequested, commandID, "")
+			if r.retryExecuteOrderWithoutOffsets(ctx, cmdCtx, commandID) {
+				return
+			}
+			r.recordStopOffsetFallback(ctx, cmdCtx, fallbackStageAttempt1, fallbackResultFailed, commandID, "")
+		} else if cmdCtx.PendingFallback {
+			r.recordStopOffsetFallback(ctx, cmdCtx, fallbackStageAttempt2, fallbackResultFailed, cmdCtx.OriginalCommandID, cmdCtx.FallbackCommandID)
+		}
 	}
 
 	// Extraer error message si existe
@@ -1019,6 +1138,19 @@ func (r *Router) handleExecutionResult(ctx context.Context, agentID string, resu
 		semconv.Echo.Status.String(statusToString(result.Success)),
 		semconv.Echo.ErrorCode.String(result.ErrorCode.String()),
 	)
+
+	if cmdCtx != nil && cmdCtx.PendingFallback {
+		status := fallbackResultFailed
+		if result.Success {
+			status = fallbackResultSuccess
+		}
+		r.recordStopOffsetFallback(ctx, cmdCtx, fallbackStageAttempt2, status, cmdCtx.OriginalCommandID, cmdCtx.FallbackCommandID)
+		cmdCtx.PendingFallback = false
+	}
+
+	if cmdCtx == nil || !cmdCtx.PendingFallback {
+		r.deleteCommandContext(commandID)
+	}
 }
 
 // handleTradeClose procesa un TradeClose del Master.
@@ -1360,16 +1492,19 @@ func (r *Router) registerCommandID(commandID string) {
 // registerCommandContext registra el contexto de un comando emitido (i1).
 //
 // Permite resolver slave_account_id y trade_id al recibir ExecutionResult o CloseResult.
-func (r *Router) registerCommandContext(commandID, tradeID, slaveAccountID, commandType string) {
+func (r *Router) registerCommandContext(commandID, tradeID, slaveAccountID, commandType string) *CommandContext {
 	r.commandContextMu.Lock()
 	defer r.commandContextMu.Unlock()
 
-	r.commandContext[commandID] = &CommandContext{
-		TradeID:        tradeID,
-		SlaveAccountID: slaveAccountID,
-		CommandType:    commandType,
-		CreatedAtMs:    utils.NowUnixMilli(),
+	ctx := &CommandContext{
+		TradeID:           tradeID,
+		SlaveAccountID:    slaveAccountID,
+		CommandType:       commandType,
+		CreatedAtMs:       utils.NowUnixMilli(),
+		OriginalCommandID: commandID,
 	}
+	r.commandContext[commandID] = ctx
+	return ctx
 }
 
 // getCommandContext obtiene el contexto de un comando (i1).
@@ -1402,6 +1537,445 @@ func orderSideToDomain(side pb.OrderSide) domain.OrderSide {
 	default:
 		return "" // TODO: mejor manejo de error
 	}
+}
+
+func normalizeSegment(value string) string {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "tier_1", "tier1":
+		return "tier_1"
+	case "tier_2", "tier2":
+		return "tier_2"
+	case "tier_3", "tier3":
+		return "tier_3"
+	case "global":
+		return "global"
+	default:
+		return "global"
+	}
+}
+
+func newSymbolPricingContext(info *domain.AccountSymbolInfo, spec *pb.SymbolSpecification) symbolPricingContext {
+	ctx := symbolPricingContext{
+		Digits: 5,
+		Point:  0.0001,
+	}
+
+	if info != nil {
+		if info.Digits > 0 {
+			ctx.Digits = int(info.Digits)
+		}
+		if info.Point > 0 {
+			ctx.Point = info.Point
+		}
+		if info.TickSize > 0 {
+			ctx.TickSize = info.TickSize
+		}
+		if info.StopLevel > 0 && info.Point > 0 {
+			ctx.MinDistance = float64(info.StopLevel) * info.Point
+		}
+	}
+
+	pipMultiplier := 1
+	if ctx.Digits >= 3 {
+		pipMultiplier = 10
+	}
+	ctx.PipSize = ctx.Point * float64(pipMultiplier)
+	if ctx.PipSize == 0 && ctx.TickSize > 0 {
+		ctx.PipSize = ctx.TickSize
+	}
+	if ctx.PipSize == 0 {
+		ctx.PipSize = 0.0001
+	}
+
+	if ctx.MinDistance == 0 {
+		ctx.MinDistance = computeMinDistance(ctx.Point, spec)
+	}
+
+	if ctx.PipSize > 0 && ctx.MinDistance > 0 {
+		ctx.StopLevelPips = ctx.MinDistance / ctx.PipSize
+	}
+
+	return ctx
+}
+
+func computeStopOffsetTargets(intent *pb.TradeIntent, policy *domain.RiskPolicy, pricing symbolPricingContext, segment string) (*stopOffsetStats, *float64, *float64) {
+	stats := &stopOffsetStats{
+		Segment:              segment,
+		ConfiguredSLPips:     policy.StopLossOffsetPips,
+		ConfiguredTPPips:     policy.TakeProfitOffsetPips,
+		StopLevelPips:        pricing.StopLevelPips,
+		PipSize:              pricing.PipSize,
+		SLResult:             "skipped",
+		TPResult:             "skipped",
+		MasterSLDistancePips: 0,
+		MasterTPDistancePips: 0,
+		TargetSLDistancePips: 0,
+		TargetTPDistancePips: 0,
+	}
+
+	minTargetPips := pricing.StopLevelPips
+	if minTargetPips <= 0 {
+		minTargetPips = 1
+	}
+
+	if stats.PipSize <= 0 {
+		stats.PipSize = 0.0001
+	}
+
+	if intent == nil || stats.PipSize <= 0 {
+		return stats, nil, nil
+	}
+
+	var slTarget, tpTarget *float64
+
+	if intent.StopLoss != nil && *intent.StopLoss != 0 {
+		masterDistance := computeStopDistance(intent.Side, intent.Price, *intent.StopLoss)
+		if masterDistance > 0 {
+			stats.MasterSLDistancePips = masterDistance / stats.PipSize
+			stats.TargetSLDistancePips = stats.MasterSLDistancePips + float64(policy.StopLossOffsetPips)
+
+			if stats.TargetSLDistancePips <= float64(minTargetPips) {
+				stats.TargetSLDistancePips = float64(minTargetPips)
+				stats.SLResult = "clamped"
+			}
+
+			offsetPrice := stats.TargetSLDistancePips * stats.PipSize
+			slPrice := intent.Price
+			if intent.Side == pb.OrderSide_ORDER_SIDE_BUY {
+				slPrice = intent.Price - offsetPrice
+			} else {
+				slPrice = intent.Price + offsetPrice
+			}
+
+			if policy.StopLossOffsetPips == 0 {
+				slPrice = intent.GetStopLoss()
+			} else if stats.SLResult != "clamped" {
+				stats.SLResult = "applied"
+			}
+
+			slTarget = proto.Float64(slPrice)
+		}
+	}
+
+	if intent.TakeProfit != nil && *intent.TakeProfit != 0 {
+		masterDistance := computeTakeProfitDistance(intent.Side, intent.Price, *intent.TakeProfit)
+		if masterDistance > 0 {
+			stats.MasterTPDistancePips = masterDistance / stats.PipSize
+			stats.TargetTPDistancePips = stats.MasterTPDistancePips + float64(policy.TakeProfitOffsetPips)
+
+			if stats.TargetTPDistancePips <= float64(minTargetPips) {
+				stats.TargetTPDistancePips = float64(minTargetPips)
+				stats.TPResult = "clamped"
+			}
+
+			offsetPrice := stats.TargetTPDistancePips * stats.PipSize
+			tpPrice := intent.Price
+			if intent.Side == pb.OrderSide_ORDER_SIDE_BUY {
+				tpPrice = intent.Price + offsetPrice
+			} else {
+				tpPrice = intent.Price - offsetPrice
+			}
+
+			if policy.TakeProfitOffsetPips == 0 {
+				tpPrice = intent.GetTakeProfit()
+			} else if stats.TPResult != "clamped" {
+				stats.TPResult = "applied"
+			}
+
+			tpTarget = proto.Float64(tpPrice)
+		}
+	}
+
+	return stats, slTarget, tpTarget
+}
+
+func (r *Router) applyStopOffsets(ctx context.Context, order *pb.ExecuteOrder, intent *pb.TradeIntent, policy *domain.RiskPolicy, pricing symbolPricingContext, accountID, segment string) *stopOffsetStats {
+	stats, slTarget, tpTarget := computeStopOffsetTargets(intent, policy, pricing, segment)
+	if intent == nil || order == nil || pricing.PipSize <= 0 {
+		return stats
+	}
+
+	_, span := r.core.telemetry.StartSpan(ctx, "core.stop_offset.compute")
+	span.SetAttributes(
+		attribute.String("account_id", accountID),
+		attribute.String("segment", segment),
+		semconv.Echo.OrderSide.String(orderSideToString(intent.Side)),
+		attribute.Int64("sl_offset_pips", int64(policy.StopLossOffsetPips)),
+		attribute.Int64("tp_offset_pips", int64(policy.TakeProfitOffsetPips)),
+	)
+	defer span.End()
+
+	digits := pricing.Digits
+	if digits <= 0 {
+		digits = 5
+	}
+
+	if slTarget != nil {
+		order.StopLoss = proto.Float64(roundToDigits(*slTarget, digits))
+	}
+	if tpTarget != nil {
+		order.TakeProfit = proto.Float64(roundToDigits(*tpTarget, digits))
+	}
+
+	span.SetAttributes(
+		attribute.Float64("sl_master_pips", stats.MasterSLDistancePips),
+		attribute.Float64("sl_target_pips", stats.TargetSLDistancePips),
+		attribute.Float64("tp_master_pips", stats.MasterTPDistancePips),
+		attribute.Float64("tp_target_pips", stats.TargetTPDistancePips),
+	)
+
+	return stats
+}
+
+func (r *Router) emitStopOffsetTelemetry(ctx context.Context, intent *pb.TradeIntent, order *pb.ExecuteOrder, stats *stopOffsetStats, outcome *stopAdjustmentOutcome, strategyID, accountID string) {
+	if stats == nil {
+		return
+	}
+
+	if outcome != nil && stats.PipSize > 0 {
+		if outcome.StopLossDistance > 0 {
+			stats.FinalSLDistancePips = outcome.StopLossDistance / stats.PipSize
+		}
+		if outcome.TakeProfitDistance > 0 {
+			stats.FinalTPDistancePips = outcome.TakeProfitDistance / stats.PipSize
+		}
+		if outcome.StopLossClamped {
+			stats.SLResult = "clamped"
+		}
+		if outcome.TakeProfitClamped {
+			stats.TPResult = "clamped"
+		}
+	}
+
+	slPresent := intent != nil && intent.StopLoss != nil && *intent.StopLoss != 0
+	tpPresent := intent != nil && intent.TakeProfit != nil && *intent.TakeProfit != 0
+
+	slResult := classifyStopOffsetResult(stats.ConfiguredSLPips, slPresent, stats.SLResult, outcome != nil && outcome.StopLossClamped)
+	tpResult := classifyStopOffsetResult(stats.ConfiguredTPPips, tpPresent, stats.TPResult, outcome != nil && outcome.TakeProfitClamped)
+
+	r.core.echoMetrics.RecordStopOffsetApplied(ctx, "sl", stats.Segment, slResult)
+	r.core.echoMetrics.RecordStopOffsetApplied(ctx, "tp", stats.Segment, tpResult)
+	if stats.FinalSLDistancePips > 0 {
+		r.core.echoMetrics.RecordStopOffsetDistance(ctx, "sl", stats.Segment, stats.FinalSLDistancePips)
+	}
+	if stats.FinalTPDistancePips > 0 {
+		r.core.echoMetrics.RecordStopOffsetDistance(ctx, "tp", stats.Segment, stats.FinalTPDistancePips)
+	}
+	if slResult == "clamped" {
+		r.core.echoMetrics.RecordStopOffsetEdgeRejection(ctx, "stop_level", stats.Segment)
+	}
+	if tpResult == "clamped" {
+		r.core.echoMetrics.RecordStopOffsetEdgeRejection(ctx, "stop_level", stats.Segment)
+	}
+
+	sideValue := ""
+	if intent != nil {
+		sideValue = orderSideToString(intent.Side)
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("account_id", accountID),
+		attribute.String("strategy_id", strategyID),
+		attribute.String("segment", stats.Segment),
+		semconv.Echo.OrderSide.String(sideValue),
+		attribute.Int64("sl_offset_pips", int64(stats.ConfiguredSLPips)),
+		attribute.Int64("tp_offset_pips", int64(stats.ConfiguredTPPips)),
+		attribute.Float64("sl_distance_master_pips", stats.MasterSLDistancePips),
+		attribute.Float64("sl_distance_target_pips", stats.TargetSLDistancePips),
+		attribute.Float64("sl_distance_final_pips", stats.FinalSLDistancePips),
+		attribute.Float64("tp_distance_master_pips", stats.MasterTPDistancePips),
+		attribute.Float64("tp_distance_target_pips", stats.TargetTPDistancePips),
+		attribute.Float64("tp_distance_final_pips", stats.FinalTPDistancePips),
+		attribute.Float64("stop_level_pips", stats.StopLevelPips),
+		attribute.String("sl_result", slResult),
+		attribute.String("tp_result", tpResult),
+	}
+
+	r.core.telemetry.Info(ctx, "stop_offset_applied", attrs...)
+}
+
+func classifyStopOffsetResult(configured int32, hasLevel bool, current string, clamped bool) string {
+	if !hasLevel || configured == 0 {
+		return "skipped"
+	}
+	if clamped {
+		return "clamped"
+	}
+	if current == "" {
+		return "skipped"
+	}
+	return current
+}
+
+func (r *Router) retryExecuteOrderWithoutOffsets(ctx context.Context, cmdCtx *CommandContext, oldCommandID string) bool {
+	if cmdCtx == nil || cmdCtx.Intent == nil || cmdCtx.LastOrder == nil || cmdCtx.FallbackAttempted {
+		return false
+	}
+
+	ctx, span := r.core.telemetry.StartSpan(ctx, "core.stop_offset.fallback")
+	span.SetAttributes(
+		attribute.String("trade_id", cmdCtx.TradeID),
+		attribute.String("slave_account_id", cmdCtx.SlaveAccountID),
+		attribute.String("stage", fallbackStageAttempt2),
+	)
+	defer span.End()
+
+	fallbackOrder := proto.Clone(cmdCtx.LastOrder).(*pb.ExecuteOrder)
+	newCommandID := utils.GenerateUUIDv7()
+	fallbackOrder.CommandId = newCommandID
+	fallbackOrder.TimestampMs = utils.NowUnixMilli()
+	if fallbackOrder.Timestamps == nil {
+		fallbackOrder.Timestamps = &pb.TimestampMetadata{}
+	}
+	fallbackOrder.Timestamps.T3CoreSendMs = utils.NowUnixMilli()
+
+	if cmdCtx.Intent.StopLoss != nil {
+		sl := cmdCtx.Intent.GetStopLoss()
+		fallbackOrder.StopLoss = proto.Float64(sl)
+	} else {
+		fallbackOrder.StopLoss = nil
+	}
+	if cmdCtx.Intent.TakeProfit != nil {
+		tp := cmdCtx.Intent.GetTakeProfit()
+		fallbackOrder.TakeProfit = proto.Float64(tp)
+	} else {
+		fallbackOrder.TakeProfit = nil
+	}
+
+	var spec *pb.SymbolSpecification
+	if r.core.symbolSpecService != nil {
+		if specEntry, _, ok := r.core.symbolSpecService.GetSpecification(ctx, cmdCtx.SlaveAccountID, cmdCtx.CanonicalSymbol); ok {
+			spec = specEntry
+		}
+	}
+	_, accountInfo, _ := r.core.symbolResolver.ResolveForAccount(ctx, cmdCtx.SlaveAccountID, cmdCtx.CanonicalSymbol)
+	pricing := newSymbolPricingContext(accountInfo, spec)
+
+	var quote *pb.SymbolQuoteSnapshot
+	if r.core.symbolQuoteService != nil {
+		if q, ok := r.core.symbolQuoteService.Get(cmdCtx.SlaveAccountID, cmdCtx.CanonicalSymbol); ok {
+			quote = q
+		}
+	}
+
+	forceMinDistanceStops(fallbackOrder, cmdCtx.Intent, pricing, quote)
+	_ = r.adjustStopsAndTargets(ctx, fallbackOrder, cmdCtx.Intent, quote, accountInfo, spec, cmdCtx.SlaveAccountID, pricing, nil)
+
+	r.registerCommandID(newCommandID)
+	r.replaceCommandContext(oldCommandID, newCommandID, cmdCtx)
+
+	cmdCtx.LastOrder = proto.Clone(fallbackOrder).(*pb.ExecuteOrder)
+	cmdCtx.FallbackAttempted = true
+	cmdCtx.PendingFallback = true
+	cmdCtx.FallbackCommandID = newCommandID
+
+	msg := &pb.CoreMessage{
+		Payload: &pb.CoreMessage_ExecuteOrder{ExecuteOrder: fallbackOrder},
+	}
+
+	sent, selective := r.dispatchFallbackOrder(ctx, cmdCtx.SlaveAccountID, msg, fallbackOrder)
+	if !sent {
+		r.replaceCommandContext(newCommandID, oldCommandID, cmdCtx)
+		cmdCtx.FallbackAttempted = false
+		cmdCtx.PendingFallback = false
+		return false
+	}
+
+	attrs := []attribute.KeyValue{
+		semconv.Echo.TradeID.String(fallbackOrder.TradeId),
+		attribute.Int("sent_count", 1),
+	}
+	if selective {
+		attrs = append(attrs,
+			attribute.Int("selective_count", 1),
+			attribute.Int("broadcast_count", 0),
+		)
+	} else {
+		attrs = append(attrs,
+			attribute.Int("selective_count", 0),
+			attribute.Int("broadcast_count", 1),
+		)
+	}
+	r.core.echoMetrics.RecordOrderSent(ctx, attrs...)
+
+	r.recordStopOffsetFallback(ctx, cmdCtx, fallbackStageAttempt2, fallbackResultRequested, cmdCtx.OriginalCommandID, newCommandID)
+	span.SetAttributes(
+		attribute.String("result", fallbackResultRequested),
+		attribute.String("fallback_command_id", newCommandID),
+	)
+
+	return true
+}
+
+func (r *Router) replaceCommandContext(oldID, newID string, ctx *CommandContext) {
+	r.commandContextMu.Lock()
+	defer r.commandContextMu.Unlock()
+	delete(r.commandContext, oldID)
+	r.commandContext[newID] = ctx
+}
+
+func forceMinDistanceStops(order *pb.ExecuteOrder, intent *pb.TradeIntent, pricing symbolPricingContext, quote *pb.SymbolQuoteSnapshot) {
+	if intent == nil || order == nil || intent.StopLoss == nil || *intent.StopLoss == 0 {
+		return
+	}
+
+	entryPrice := intent.Price
+	if quote != nil {
+		entryPrice = quote.Ask
+		if intent.Side == pb.OrderSide_ORDER_SIDE_SELL {
+			entryPrice = quote.Bid
+		}
+	}
+
+	distance := pricing.MinDistance
+	if distance <= 0 {
+		distance = math.Abs(intent.Price - intent.GetStopLoss())
+	}
+	if distance <= 0 {
+		return
+	}
+
+	digits := pricing.Digits
+	if digits <= 0 {
+		digits = 5
+	}
+
+	var newSL float64
+	if intent.Side == pb.OrderSide_ORDER_SIDE_BUY {
+		newSL = entryPrice - distance
+	} else {
+		newSL = entryPrice + distance
+	}
+	order.StopLoss = proto.Float64(roundToDigits(newSL, digits))
+}
+
+func (r *Router) dispatchFallbackOrder(ctx context.Context, accountID string, msg *pb.CoreMessage, order *pb.ExecuteOrder) (bool, bool) {
+	ownerAgentID, found := r.core.accountRegistry.GetOwner(accountID)
+	if found {
+		if agent, ok := r.getAgent(ownerAgentID); ok {
+			if r.sendToAgent(ctx, agent, msg, order) {
+				r.recordRoutingMetric(ctx, "selective", true, order)
+				return true, true
+			}
+		} else {
+			r.core.telemetry.Warn(ctx, "Owner agent not connected for fallback, broadcasting",
+				attribute.String("target_account_id", accountID),
+				attribute.String("owner_agent_id", ownerAgentID),
+			)
+		}
+	}
+
+	sent := r.broadcastOrder(ctx, msg, order)
+	if sent > 0 {
+		r.recordRoutingMetric(ctx, "fallback_broadcast", false, order)
+		return true, false
+	}
+
+	r.core.telemetry.Error(ctx, "Failed to dispatch fallback ExecuteOrder", fmt.Errorf("no agents available"),
+		attribute.String("target_account_id", accountID),
+		attribute.String("command_id", order.CommandId),
+	)
+	return false, false
 }
 
 // getAgent retorna un Agent por ID (i2 helper).
@@ -1514,6 +2088,36 @@ func (r *Router) recordRoutingMetric(ctx context.Context, mode string, result bo
 		attribute.String("target_account_id", order.TargetAccountId),
 		attribute.String("trade_id", order.TradeId),
 	)
+}
+
+func (r *Router) recordStopOffsetFallback(ctx context.Context, cmdCtx *CommandContext, stage, result, originalCommandID, retryCommandID string) {
+	if r.core == nil || cmdCtx == nil {
+		return
+	}
+
+	cmdCtx.LastFallbackStage = stage
+	cmdCtx.LastFallbackResult = result
+
+	if r.core.echoMetrics != nil {
+		r.core.echoMetrics.RecordStopOffsetFallback(ctx, stage, result, cmdCtx.Segment)
+	}
+
+	if r.core.telemetry != nil {
+		attrs := []attribute.KeyValue{
+			attribute.String("trade_id", cmdCtx.TradeID),
+			attribute.String("slave_account_id", cmdCtx.SlaveAccountID),
+			attribute.String("segment", cmdCtx.Segment),
+			attribute.String("stage", stage),
+			attribute.String("result", result),
+		}
+		if originalCommandID != "" {
+			attrs = append(attrs, attribute.String("original_command_id", originalCommandID))
+		}
+		if retryCommandID != "" {
+			attrs = append(attrs, attribute.String("retry_command_id", retryCommandID))
+		}
+		r.core.telemetry.Info(ctx, "stop_offset_fallback", attrs...)
+	}
 }
 
 // broadcastCloseOrder envía un CloseOrder a todos los Agents (i2b fallback con timeout).

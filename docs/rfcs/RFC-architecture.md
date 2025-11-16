@@ -328,8 +328,6 @@ Estructura típica (`/echo/...`):
     max_slippage
     max_delay_ms
     copy_sl_tp
-    sl_offset
-    tp_offset
     catastrophic_sl
     risk_fixed                   → monto fijo (i6+)
   /windows/{account_id}/{symbol}/
@@ -338,6 +336,8 @@ Estructura típica (`/echo/...`):
     pre_buffer_sec
     post_buffer_sec
 ```
+
+> Nota: Los offsets `sl_offset_pips` y `tp_offset_pips` se almacenan exclusivamente en PostgreSQL (`account_strategy_risk_policy`, clave compuesta `account_id` + `strategy_id`). Está prohibido definir claves equivalentes en ETCD; cualquier cambio debe gestionarse desde la base de datos.
 
 ## 10. Money Management
 

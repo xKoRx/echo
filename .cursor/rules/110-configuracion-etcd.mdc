@@ -8,7 +8,7 @@ alwaysApply: true
 
 ## 🎯 Objetivo
 Centralizar y asegurar la configuración del sistema.  
-Todo desarrollo debe obtener variables de configuración desde **ETCD**, utilizando exclusivamente el **cliente oficial en `github.com/xKoRx/echo/sdk/etcd`**.
+Toda configuración de clientes, infraestructura, etc, desde **ETCD**, utilizando exclusivamente el **cliente oficial en `github.com/xKoRx/echo/sdk/etcd`**. Esto es SALVO las configuraciones de negocio que pueden estar en otras fuentes y también SALVO que el usuario diga lo contrario.
 
 ---
 

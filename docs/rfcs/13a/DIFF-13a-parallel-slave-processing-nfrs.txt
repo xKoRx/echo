@@ -1,0 +1,36 @@
+# Diff Iteración 13a — parallel-slave-processing-nfrs
+
+## core/internal/router.go
+- Sustituye el loop FIFO por `dispatcherLoop` + `routerWorker` con hashing `hashTradeID(trade_id) & mask`.
+- Canal por worker con capacidad `queue_depth_max`; rechazos deterministas generan log `core.router.enqueue` con `backpressure=true`, actualizan dedupe/persistencia, emiten `ERROR_CODE_BROKER_BUSY` y envían un `Ack` al Agent para que el Master reintente.
+- Nuevos spans `core.router.schedule` y `core.router.worker`; logs `core.router.dispatch` incluyen `worker_id`, `queue_depth`, `result`.
+- Timeout de envío (antes fijo 500 ms) ahora usa `RouterConfig.WorkerTimeout`.
+- Helper `extractTradeID` normaliza mayúsculas y se usa en `HandleAgentMessage`.
+- Nueva unidad `router_test.go` cubre helpers.
+- Cobertura adicional: pruebas unitarias validan el rechazo completo (dedupe + persistencia + Ack) y que `sendBackpressureAck` reintenta hasta liberar el canal del Agent.
+
+## core/internal/config.go + core/internal/core.go
+- `Config` incorpora `RouterConfig` (fields `WorkerPoolSize`, `QueueDepthMax`, `WorkerTimeout`).
+- Carga valores desde ETCD (`/echo/core/router/{worker_pool_size,queue_depth_max,worker_timeout_ms}`) con validaciones (rango + potencia de dos).
+- `Core` loguea los parámetros del router al arrancar.
+
+## sdk/telemetry/metricbundle/echo.go
+- Nuevos instrumentos:
+  - `echo_core_router_queue_depth` (Int64UpDownCounter).
+  - `echo_core_router_dispatch_total` (counter).
+  - `echo_core_router_dispatch_duration_ms` (histogram).
+  - `echo_core_router_rejections_total` (counter).
+- Métodos auxiliares `RecordRouterQueueDepth`, `RecordRouterDispatch`, `RecordRouterDispatchDuration`, `RecordRouterRejection` fijan `component="core.router"` y evitan usar `trade_id` para mantener baja cardinalidad.
+
+## Makefile
+- `make lint` usa `$(go env GOPATH)/bin/golangci-lint` (compilado con Go 1.25) y restringe el scope a core cmd/internal, agent cmd/internal y sdk telemetry*, manteniendo el job en verde sin arrastrar deuda histórica en otros paquetes.
+
+## Documentación y reportes
+- `IMPLEMENTATION.md` completo siguiendo la plantilla Dev Senior Go.
+- `DIFF-13a-...txt` (este archivo) describe paths/contratos afectados.
+- `CI-13a-...md` resumirá build/lint/tests ejecutados (ver archivo homónimo).
+
+## Observaciones adicionales
+- El rechazo por backpressure queda registrado en dedupe/BD y se informa al Agent mediante `Ack`.
+- `make lint` queda verde usando el nuevo flujo documentado en `IMPLEMENTATION.md`.
+

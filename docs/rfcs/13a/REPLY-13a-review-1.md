@@ -1,0 +1,6 @@
+| Hallazgo | Acción (Cambiar/Justificar) | PR-* | Sección corregida/enlazada |
+|----------|----------------------------|------|---------------------------|
+| GAP-DEV-001 — Configuración fuera de ETCD | Cambiar: se creó `§6.3` con tabla de claves `/echo/core/router/{worker_pool_size,queue_depth_max,worker_timeout_ms}`, validaciones y bootstrap obligatorio desde ETCD, eliminando la idea de constantes locales. | PR-ROB, PR-BWC, PR-SOLID | `echo/docs/rfcs/13a/RFC-13a-parallel-slave-processing-nfrs.md#63-configuración-flags-y-parámetros` |
+| GAP-DEV-002 — Falta de backpressure | Cambiar: `§5.1/§5.3/§5.4` ahora detallan colas finitas, `queue_depth_max`, rechazos deterministas (`ERROR_CODE_BROKER_BUSY`), métrica `echo_core_router_rejections_total` y runbook para ajustar ETCD. | PR-ROB, PR-RES, PR-ESC | `#51-visión-general`, `#53-flujos-principales`, `#54-reglas-de-negocio-y-casos-borde`, `#8-observabilidad-logs-métricas-trazas` |
+| ARQ-001 — Matriz PR-* incompleta | Cambiar: `§9` incorpora PR-MOD, PR-CLN, PR-SOLID, PR-KISS, PR-SEC y PR-PERF con evidencias específicas. | PR-CLN, PR-SOLID, PR-SEC, PR-PERF | `#9-matriz-pr-` |
+| PERF-001 — DoD sin metas | Cambiar: `§3` fija p95 ≤ 40 ms, límites de cola alineados a `queue_depth_max` y un ratio de éxito ≥99%, anclados a los SLO intra-host <100 ms. | PR-PERF, PR-ROB | `#3-objetivos-medibles-definition-of-done` |

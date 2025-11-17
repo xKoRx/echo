@@ -1,0 +1,4 @@
+| Hallazgo | Acción (Cambiar/Justificar) | PR-* | Sección corregida/enlazada |
+|----------|----------------------------|------|---------------------------|
+| ARQ-002 — Tabla de touchpoints desactualizada | Cambiar: la fila `echo/core/internal/config` ahora refleja que `worker_pool_size`, `queue_depth_max` y `worker_timeout_ms` se cargan desde ETCD en el bootstrap y requieren reinicio para aplicar cambios. | PR-MOD, PR-CLN | `echo/docs/rfcs/13a/RFC-13a-parallel-slave-processing-nfrs.md#52-componentes-afectados-touchpoints` |
+| OPS-001 — Runbook sin referencia a `queue_depth_max` | Cambiar: el runbook operativo usa umbral relativo (80 % de `queue_depth_max`) y explica cómo obtenerlo desde ETCD o métricas antes de escalar/reiniciar. | PR-ROB, PR-RES | `echo/docs/rfcs/13a/RFC-13a-parallel-slave-processing-nfrs.md#12-plan-de-rollout-bwc-y-operación` |

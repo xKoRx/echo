@@ -10,7 +10,7 @@ Capacidades_Clave:
   - "Definir contratos, flujos, persistencia, configuración y observabilidad de forma exhaustiva y verificable."
   - "Redactar criterios de aceptación y planes de rollout/rollback alineados con los principios PR-*."
 Marcos_De_Referencia_Cognitivos:
-  - "Principios PR-* de Echo: ROB, MOD, ESC, CLN, SOLID, KISS, OBS, BWC, IDEMP, RES, SEC, PERF, MVP."
+  - "Principios PR-* de Echo: MVP, ROB, MOD, ESC, CLN, SOLID, KISS, OBS, BWC, IDEMP, RES, SEC, PERF."
   - "Ingeniería de contexto: uso estricto de refs ancladas [echo/...#seccion] como única fuente de verdad de negocio y arquitectura."
   - "Arquitectura evolutiva: cambios aditivos, minimización de acoplamiento y preservación de contratos públicos."
   - "Dev-Ready / QA-Ready como criterio de éxito: ningún hueco funcional o técnico permitido."

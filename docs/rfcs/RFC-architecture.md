@@ -156,7 +156,7 @@ flowchart LR
 
 ### 5.1 Flujo de datos
 
-1. Master EA detecta fill (`t0`) y envía `TradeIntent`.
+1. Master EA detecta fill (`t0`), almacena el `TradeIntent` hasta recibir confirmación del Agent/Core y reintenta indefinidamente (cap 100 intentos por hop) para evitar pérdida de mensajes antes de continuar con el flujo.
 2. Agent añade `t1`, transforma a proto y envía al Core (`t2`).
 3. Core deduplica, valida políticas, registra en BD, crea `ExecuteOrder`, añade `t3`.
 4. Agent recibe orden (`t4`), enruta al owner, envía por Named Pipe.
@@ -231,7 +231,7 @@ Estos puntos se alinean con la visión original de i17 (delivery con reintentos,
 - EAs: MQL4/MQL5
 
 ### 7.2 Comunicación
-- Core ↔ Agent: gRPC bidi streaming (TLS opcional V1) con trace id compartido y keepalive (`time>=60s`, `timeout=20s`, `MinTime>=10s`).
+- Core ↔ Agent: gRPC bidi streaming (TLS opcional V1) con trace id compartido y keepalive (`time>=60s`, `timeout=20s`, `MinTime>=10s`), más heartbeats ajustados a un intervalo seguro de 1–5 s para sostener acks sin inundar clientes.
 - Agent ↔ EAs: Named Pipes Windows (JSON line-delimited). DLL x86/x64 según terminal.
 - Config API (futuro): REST read-only vía grpc-gateway (GraphQL NTH solo lectura).
 
@@ -348,6 +348,10 @@ Estructura típica (`/echo/...`):
 ```
 
 > Nota: Los offsets `sl_offset_pips` y `tp_offset_pips` se almacenan exclusivamente en PostgreSQL (`account_strategy_risk_policy`, clave compuesta `account_id` + `strategy_id`). Está prohibido definir claves equivalentes en ETCD; cualquier cambio debe gestionarse desde la base de datos.
+>
+> **Separación de responsabilidades (i17):** ETCD queda limitado a parámetros globales de infraestructura (timeouts de delivery, backoff, rutas de transporte). Toda configuración de negocio dependiente de cuenta o estrategia debe residir en PostgreSQL y difundirse mediante caches del Core/Agent. Mezclar dominios violaría el aislamiento modular documentado en esta arquitectura.
+
+> Regla de separación de configuraciones: ETCD queda reservado para parámetros globales de infraestructura (timeouts de transporte, límites de backpressure, endpoints, toggles operativos del binario). Toda configuración de negocio dependiente de cuentas o estrategias (p.ej. offsets, políticas de riesgo, calendarios) vive únicamente en PostgreSQL y se propaga vía cachés internas; mezclar estos ámbitos rompe el aislamiento entre módulos.
 
 ## 10. Money Management
 

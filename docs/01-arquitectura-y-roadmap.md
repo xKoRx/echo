@@ -37,7 +37,8 @@ La descripción completa del producto, responsabilidades por componente, contrat
 | i14 | Telemetría avanzada | [V1] Dashboards de funneles, histogramas de latencia, métricas de slippage/spread. | ⏳ |
 | i15 | Paquetización y operación | [V1] CLI/scripts, health checks, runbooks y automatización básica. | ❌ |
 | i16 | Políticas operativas de trading | [V2] Límites globales (drawdown diario/total, apalancamiento, sizing máximo). | ⏳ |
-| i17 | Garantías de replicación determinista | [V1] End-to-end delivery con reintentos, quorum de acks y reconciliación automática de operaciones para evitar pérdidas. | ⏳ |
+| i17 | Garantías de replicación determinista | [V1] End-to-end delivery con retries ilimitados (cap 100 intentos por hop con backoff), journal en Core/Agent y reconciliador que prioriza **cero pérdida de mensajes** aun sacrificando latencia; histéresis explícita queda fuera de alcance. | ⏳ |
+| i18 | Histéresis y control operativo de backpressure | [V2] Ventanas >5 s/80 % para rechazos controlados, afinamiento de límites dinámicos y tooling (CLI, diagnósticos manuales) una vez estabilizado el delivery lossless. | ⏳ |
 | TBD | Event store Mongo | Almacenamiento append-only para auditoría y análisis. | ⏳ |
 | TBD | SymbolMappings en Master | Master EA consume catálogo canónico y publica símbolos normalizados. | ⏳ |
 | TBD | Pipe Start | Los Agentes deben abrir los pipe solo cuando corresponda, o sea, solo cuando el cliente lo solicite, validando la existencia de configuración con core previamente. | ⏳ |
@@ -69,7 +70,10 @@ La descripción completa del producto, responsabilidades por componente, contrat
   - Reconexiones simultáneas Master/Slaves sin rehidratar cache → router en `UNSPECIFIED`.
 - **Propuesta**:
   - Implementar **journal de comandos** en Core: cada `ExecuteOrder`/`CloseOrder` se marca `pending` y exige ack del Agent.
-  - En Agent, mantener un **ack ledger** y reintentar escritura al Named Pipe hasta confirmación del EA (pong correlacionado o heartbeat extendido).
-  - Incorporar **reconciliador de órdenes**: master reporta `TradeIntent` y slaves reportan `ExecutionResult`; un cron verifica faltantes y reinyecta órdenes.
-  - Telemetría dedicada (`echo.replicator.*`) + alertas cuando la ventana entre intent y ejecución supere N ms.
-  - CLI de auditoría (`echo-core-cli replicator reconcile`) para reemitir operaciones específicas.
+  - En Agent, mantener un **ack ledger** y reintentar escritura al Named Pipe hasta confirmación del EA (pong correlacionado o heartbeat extendido); Masters también deben retener `TradeIntent` hasta que el Core confirme recepción.
+  - Incorporar **reconciliador de órdenes**: master reporta `TradeIntent` y slaves reportan `ExecutionResult`; un cron verifica faltantes y reinyecta órdenes (incluye `CloseOrder`). La histéresis de rechazo se traslada a i18 / V2.
+  - Retries forzados: cada hop ejecuta hasta 100 intentos con backoff exponencial; `omit with comment` sigue vigente pero ahora genera log, span y métrica.
+  - Telemetría dedicada (`echo.replicator.*`) + alertas cuando la ventana entre intent y ejecución supere N ms; documentar que en V1 se prioriza consistencia sobre latencia y no se habilitan feature flags, rollouts graduales ni pipelines CI adicionales.
+  - Ajustar heartbeats gRPC a 1–5 s para evitar saturación del cliente mientras se mantienen acks vivos.
+  - Herramientas CLI (reconciliación manual) se posponen a i18; i17 se enfoca en mecanismos internos automáticos.
+  - Iteración 100 % no funcional: no cambia lógica de trading ni políticas de negocio; solo añade garantías técnicas de entrega end-to-end.

@@ -62,3 +62,6 @@ No se detectaron hallazgos nuevos; los issues de iter 2 fueron resueltos.
   - `echo/docs/templates/rfc.md` — "`---`"
 
 
+
+
+

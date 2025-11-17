@@ -776,7 +776,9 @@ func (r *postgresSymbolRepo) UpsertAccountMapping(ctx context.Context, accountID
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		_ = tx.Rollback()
+	}()
 
 	// Upsert cada mapping con idempotencia temporal
 	for _, m := range mappings {

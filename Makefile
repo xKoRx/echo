@@ -1,5 +1,7 @@
 .PHONY: help proto build test lint clean install-tools
 
+GOLANGCI ?= $(shell go env GOPATH)/bin/golangci-lint
+
 help: ## Muestra esta ayuda
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
@@ -44,9 +46,9 @@ test-e2e: ## Ejecuta tests end-to-end
 
 lint: ## Ejecuta linters
 	@echo "Ejecutando linters..."
-	cd core && golangci-lint run
-	cd agent && golangci-lint run
-	cd sdk && golangci-lint run
+	cd core && $(GOLANGCI) run ./cmd/... ./internal/...
+	cd agent && $(GOLANGCI) run ./internal/... ./cmd/...
+	cd sdk && $(GOLANGCI) run ./telemetry/... ./telemetry/metricbundle/... ./telemetry/semconv/...
 
 fmt: ## Formatea código
 	@echo "Formateando código..."

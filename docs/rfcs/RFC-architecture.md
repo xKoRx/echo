@@ -170,7 +170,7 @@ flowchart LR
 1. Validar ventanas y políticas por cuenta.
 2. Verificar spread/desvío vs parámetros.
 3. Si pasa filtros, enviar orden de mercado con lot calculado.
-4. SL/TP opcionales con offset; si StopLevel impide, modificar post-fill.
+4. SL/TP opcionales con offset (`sl_offset_pips/tp_offset_pips` en `account_strategy_risk_policy`): el Core calcula distancias en pips, las clampa contra el StopLevel y, si el broker responde `ERROR_CODE_INVALID_STOPS`, reenvía un segundo `ExecuteOrder` sin offsets; la modificación post-fill (`ModifyOrder`) queda reservada para i8b.
 5. Si falla alguna política, `omit with comment` (hasta que se habilite reintento).
 
 **Cierre**
@@ -200,19 +200,29 @@ flowchart LR
 | Versionado de handshake & feedback | `protocol_version`, `SymbolRegistrationResult` Core→Agent→EA, validaciones tempranas. | i5 | ✅ |
 | Sizing con riesgo fijo (Modo A) | Distancia SL × tick value; clamps min/max lot con motor centralizado. | i6 | ✅ |
 | Filtros de spread y desvío | Evaluación de tolerancias por cuenta×símbolo. | i7 | ⏳ |
-| SL/TP con offset | Aplicar offsets configurables en apertura. | i8a | ⏳ |
+| SL/TP con offset | Offsets en Core con clamps a StopLevel y fallback sin offsets ante `INVALID_STOPS`. | i8a | ✅ |
 | StopLevel-aware + modify post-fill | Validar StopLevel y ajustar tras fill. | i8b | ⏳ |
 | Ventanas de no ejecución | Calendarios por cuenta/símbolo. | i9 | ⏳ |
-| SL catastrófico | Protección independiente del master. | i10 | ⏳ |
+| SL catastrófico | Protección independiente del master. | i10 | ❌ |
 | Espera de mejora (time-boxed) | Buscar mejor precio en ventana acotada. | i11 | ⏳ |
 | Normalización de `error_code` | Diccionario único logs/BD/métricas. | i12 | ⏳ |
 | Concurrencia por `trade_id` | Worker pool ordenado sin bloqueos. | i13a | ⏳ |
 | Backpressure y límites de cola | Buffers configurables + métricas. | i13b | ⏳ |
 | Telemetría avanzada | Dashboards de funneles, slippage, latencias. | i14 | ⏳ |
-| Paquetización & operación | CLI/scripts, health checks, runbooks. | i15 | ⏳ |
+| Paquetización & operación | CLI/scripts, health checks, runbooks. | i15 | ❌ |
 | Políticas operativas (DD, apalancamiento) | Límites globales por cuenta. | i16 | ⏳ |
 | Eventos crudos en MongoDB | Event store append-only. | TBD | ⏳ |
 | SymbolMappings en Master | Master EA consume catálogo canónico y publica símbolos ya normalizados. | TBD | ⏳ |
+
+### 6.1 Próxima iteración (i17 — Garantías de replicación end-to-end)
+
+El roadmap actualizado (`docs/01-arquitectura-y-roadmap.md`) fija i17 como la siguiente iteración prioritaria de V1. Su alcance crece para cubrir la resiliencia pendiente del router paralelo y eliminar pérdidas de mensajes:
+
+- **Journal + reintentos confiables.** El Core debe registrar cada `ExecuteOrder`/`CloseOrder` como `pending` hasta recibir `Ack` del Agent, reintentando envío cuando `sendToAgent` agota `worker_timeout_ms` en lugar de descartar el comando (issue observado en `core/internal/router.go` líneas 2387–2419).
+- **Backpressure consistente.** Los rechazos deben respetar la ventana >5 s/80 % definida en el RFC-13a: hoy `processCh` descarta al llenarse (líneas 229–255) y cada worker rechaza inmediatamente al primer overflow. i17 debe unificar el manejo (rechazo controlado + `Ack`) y exponer métricas/alertas que permitan operar esos límites.
+- **Reconciliación y watchdog de entrega.** Integrar el ledger/ack del Agent con un reconciliador que detecte huecos (por ejemplo, intents aceptados sin ejecución) para reinyectar órdenes y evitar pérdidas silenciosas.
+
+Estos puntos se alinean con la visión original de i17 (delivery con reintentos, quorum de acks y reconciliación de operaciones) y preparan la base para cargas mayores (post V1) sin requerir high frequency trading.
 
 ## 7. Stack Tecnológico
 
@@ -350,6 +360,7 @@ Estructura típica (`/echo/...`):
 
 - Métricas mínimas activas: latencias por hop, `orders_success_total`, `orders_rejected_total`, `agent_heartbeat`.
 - Métricas nuevas por iteración: `echo.specs.*`, `echo.risk.*`, `echo.backpressure.*`.
+- Métricas/telemetría i8a: `echo_core.stop_offset_applied_total`, `echo_core.stop_offset_distance_pips`, `echo_core.stop_offset_edge_rejections_total` y `echo_core.stop_offset_fallback_total`, además de logs `stop_offset_applied|fallback` y spans `core.stop_offset.compute` / `core.stop_offset.fallback`.
 - Logs JSON homogéneos (sin `fmt.Println`). Atributos comunes inicializados en `core/cmd/echo-core/main.go` (`bootstrapTelemetry`).
 - Trazas jerárquicas: `core.handle_trade_intent`, `core.volume_guard`, `core.risk_policy.get`, `agent.handle_symbol_spec_report`, etc.
 - KPIs: p95 E2E < 1000 ms, ratio copia exitosa > 99%, monitoreo de slippage y spread.

@@ -44,8 +44,8 @@ Un copiador replica en una o varias cuentas seguidoras (slaves) las operaciones 
 2) SL/TP desincronizados y StopLevel
 - Problema: el slave puede tocar SL/TP que el master no toca; StopLevel del broker puede impedir setear niveles en la apertura.
 - Soluciones:
-  - Modo configurable: con SL/TP copiados (con offset) o sin SL/TP locales. En el segundo caso, el cierre ocurre solo por señal del master. SL catastrófico (i9) actúa como protección de contingencia independiente del master en ambos modos.
-  - Validación de StopLevel y fallback a modificación post-fill cuando aplique (i7b).
+  - ✅ i8a — Offsets configurables por cuenta×estrategia (`account_strategy_risk_policy.sl_offset_pips/tp_offset_pips`), aplicados en el Core con clamps al StopLevel y fallback inmediato que reenvía `ExecuteOrder` sin offsets ante `ERROR_CODE_INVALID_STOPS`.
+  - 🚧 i8b — Validación de StopLevel posterior al fill mediante `ModifyOrder`, pendiente para cubrir brokers que exigen insertar SL/TP después de la ejecución.
 
 3) Missed trades y rechazos
 - Problema: el slave no entra por precio fuera de tolerancia, spread alto o error transitorio.
@@ -99,7 +99,7 @@ Un copiador replica en una o varias cuentas seguidoras (slaves) las operaciones 
 1. Órdenes a mercado: replicación de entradas y cierres del master a múltiples slaves. (Desde i0)
 2. Hedged only: solo cuentas hedged, incluido MT5. (Desde i0)
 3. MagicNumber replicado: sin cambios en el slave. (Desde i0)
-4. SL/TP opcionales con offset y respeto a StopLevel, con fallback de modificación post-fill. (i7a/i7b)
+4. SL/TP opcionales con offset aplicado desde el Core y fallback determinista ante StopLevel (`stop_offset_*`, i8a ✅); `ModifyOrder` post-fill sigue en roadmap (i8b 🚧).
 5. Tolerancias: desvío máximo (pips/points), filtro de spread y delay máximo de ejecución. (i6)
 6. Ventanas de no-ejecución: bloquean nuevas entradas; no bloquean cierres; cancelación de pendientes heredadas donde aplique; sin reinserción automática. (i8)
 7. SL catastrófico configurable por cuenta/estrategia como protección de contingencia. (i9)

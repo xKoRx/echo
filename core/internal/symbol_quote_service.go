@@ -8,6 +8,7 @@ import (
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
 	"github.com/xKoRx/echo/sdk/telemetry"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/protobuf/proto"
 )
 
 type quoteCacheEntry struct {
@@ -99,6 +100,13 @@ func (s *SymbolQuoteService) Invalidate(accountID string) {
 }
 
 func protoCloneQuote(snapshot *pb.SymbolQuoteSnapshot) *pb.SymbolQuoteSnapshot {
-	cloned := *snapshot
-	return &cloned
+	if snapshot == nil {
+		return nil
+	}
+	cloned := proto.Clone(snapshot)
+	quote, ok := cloned.(*pb.SymbolQuoteSnapshot)
+	if !ok {
+		return nil
+	}
+	return quote
 }

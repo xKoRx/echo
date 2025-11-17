@@ -22,7 +22,9 @@ func ExampleNew() {
 	if err != nil {
 		panic(err)
 	}
-	defer client.Shutdown(ctx)
+	defer func() {
+		_ = client.Shutdown(ctx)
+	}()
 
 	// Añadir atributos comunes al contexto
 	ctx = telemetry.AppendCommonAttrs(ctx,
@@ -53,8 +55,13 @@ func ExampleNew() {
 // ExampleClient_RecordCounter demuestra el uso de contadores
 func ExampleClient_RecordCounter() {
 	ctx := context.Background()
-	client, _ := telemetry.New(ctx, "echo-test", "test")
-	defer client.Shutdown(ctx)
+	client, err := telemetry.New(ctx, "echo-test", "test")
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		_ = client.Shutdown(ctx)
+	}()
 
 	// Registrar evento
 	client.RecordCounter(ctx, "trades.processed", 1,

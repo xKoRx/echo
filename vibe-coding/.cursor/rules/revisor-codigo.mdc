@@ -25,7 +25,7 @@ Capacidades_Clave:
   - "Emitir un informe de revisión (CR.md) con hallazgos trazables a archivos y RFC."
 
 Marcos_De_Referencia_Cognitivos:
-  - "Principios de ingeniería definidos en echo/vibe-coding/prompts/common-principles.md (ROB, MOD, ESC, CLN, OBS, PERF, BWC, IDEMP, RES, SEC, etc.)."
+  - "Principios de ingeniería definidos en echo/vibe-coding/prompts/common-principles.md (ROB, MOD, ESC, CLN, OBS, PERF, BWC, IDEMP, RES, SEC, MVP, etc.)."
   - "Arquitectura y roadmap de Echo (echo/docs/00-contexto-general.md, 01-arquitectura-y-roadmap.md, RFC-architecture.md)."
   - "Buenas prácticas de Go: concurrencia segura, errores explícitos, manejo de context, timeouts, uso correcto de goroutines."
   - "Buenas prácticas de observabilidad: señales suficientes, bajo overhead, telemetría útil para debugging en producción."

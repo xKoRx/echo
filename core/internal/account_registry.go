@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -58,7 +59,7 @@ func (r *AccountRegistry) RegisterAccount(agentID string, accountID string, pipe
 	if existing, exists := r.accountToOwner[accountID]; exists {
 		if existing.AgentID != agentID {
 			// Conflicto de ownership: la cuenta estaba en otro Agent
-			r.telemetry.Warn(nil, "Account ownership conflict (i2)",
+			r.telemetry.Warn(context.TODO(), "Account ownership conflict (i2)",
 				attribute.String("account_id", accountID),
 				attribute.String("previous_agent", existing.AgentID),
 				attribute.String("new_agent", agentID),
@@ -72,7 +73,7 @@ func (r *AccountRegistry) RegisterAccount(agentID string, accountID string, pipe
 			if pipeRole != "" {
 				existing.PipeRole = pipeRole
 			}
-			r.telemetry.Info(nil, "Account re-registered to same Agent (i2)",
+			r.telemetry.Info(context.TODO(), "Account re-registered to same Agent (i2)",
 				attribute.String("account_id", accountID),
 				attribute.String("agent_id", agentID),
 			)
@@ -92,7 +93,7 @@ func (r *AccountRegistry) RegisterAccount(agentID string, accountID string, pipe
 	// Añadir a índice inverso
 	r.agentToAccounts[agentID] = append(r.agentToAccounts[agentID], accountID)
 
-	r.telemetry.Info(nil, "Account registered to Agent (i2)",
+	r.telemetry.Info(context.TODO(), "Account registered to Agent (i2)",
 		attribute.String("agent_id", agentID),
 		attribute.String("account_id", accountID),
 		attribute.String("pipe_role", pipeRole),
@@ -108,7 +109,7 @@ func (r *AccountRegistry) UnregisterAccount(accountID string) {
 
 	record, exists := r.accountToOwner[accountID]
 	if !exists {
-		r.telemetry.Warn(nil, "Attempted to unregister non-existent account (i2)",
+		r.telemetry.Warn(context.TODO(), "Attempted to unregister non-existent account (i2)",
 			attribute.String("account_id", accountID),
 		)
 		return
@@ -122,7 +123,7 @@ func (r *AccountRegistry) UnregisterAccount(accountID string) {
 	// Eliminar del índice inverso
 	r.removeAccountFromAgent(agentID, accountID)
 
-	r.telemetry.Info(nil, "Account unregistered from Agent (i2)",
+	r.telemetry.Info(context.TODO(), "Account unregistered from Agent (i2)",
 		attribute.String("agent_id", agentID),
 		attribute.String("account_id", accountID),
 	)
@@ -145,7 +146,7 @@ func (r *AccountRegistry) UnregisterAgent(agentID string) {
 	}
 	delete(r.agentToAccounts, agentID)
 
-	r.telemetry.Info(nil, "Agent unregistered, all accounts released (i2)",
+	r.telemetry.Info(context.TODO(), "Agent unregistered, all accounts released (i2)",
 		attribute.String("agent_id", agentID),
 		attribute.Int("accounts_count", len(accounts)),
 	)
@@ -216,4 +217,3 @@ func (r *AccountRegistry) removeAccountFromAgent(agentID string, accountID strin
 		delete(r.agentToAccounts, agentID)
 	}
 }
-

@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"strings"
 	"sync"
@@ -35,9 +36,15 @@ import (
 type Router struct {
 	core *Core
 
-	// Canal de procesamiento secuencial
-	// TODO i0: procesamiento secuencial, i1: concurrente
+	// Canal de ingestión principal
 	processCh chan *routerMessage
+
+	// Worker pool
+	workers        []*routerWorker
+	workerPoolSize int
+	workerMask     uint32
+	queueDepthMax  int
+	workerTimeout  time.Duration
 
 	// Issue #A2: Dedupe de command_id para idempotencia
 	commandDedupe   map[string]int64 // command_id → timestamp_ms
@@ -52,6 +59,12 @@ type Router struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+type routerWorker struct {
+	id     int
+	router *Router
+	queue  chan *routerMessage
 }
 
 // CommandContext contiene el contexto de un comando emitido (i1).
@@ -136,30 +149,72 @@ type routerMessage struct {
 	ctx      context.Context
 	agentID  string
 	agentMsg *pb.AgentMessage
+	tradeID  string
+	workerID int
+	enqueued time.Time
 }
+
+const routerComponentValue = "core.router"
 
 // NewRouter crea un nuevo router.
 func NewRouter(core *Core) *Router {
 	ctx, cancel := context.WithCancel(core.ctx)
+	workerPoolSize := core.config.Router.WorkerPoolSize
+	if workerPoolSize <= 0 {
+		workerPoolSize = 4
+	}
+	queueDepth := core.config.Router.QueueDepthMax
+	if queueDepth <= 0 {
+		queueDepth = 8
+	}
 
-	return &Router{
+	workers := make([]*routerWorker, workerPoolSize)
+	for i := 0; i < workerPoolSize; i++ {
+		workers[i] = &routerWorker{
+			id:     i,
+			router: nil, // asignar después de crear Router para evitar ciclo
+			queue:  make(chan *routerMessage, queueDepth),
+		}
+	}
+
+	router := &Router{
 		core:             core,
-		processCh:        make(chan *routerMessage, 1000), // Buffer generoso
-		commandDedupe:    make(map[string]int64),          // Issue #A2
+		processCh:        make(chan *routerMessage, 1000),
+		workers:          workers,
+		workerPoolSize:   workerPoolSize,
+		workerMask:       uint32(workerPoolSize - 1),
+		queueDepthMax:    queueDepth,
+		workerTimeout:    core.config.Router.WorkerTimeout,
+		commandDedupe:    make(map[string]int64),
 		commandDedupeMu:  sync.RWMutex{},
-		commandContext:   make(map[string]*CommandContext), // i1: Índice de correlación
+		commandContext:   make(map[string]*CommandContext),
 		commandContextMu: sync.RWMutex{},
 		ctx:              ctx,
 		cancel:           cancel,
 	}
+
+	for _, worker := range router.workers {
+		worker.router = router
+	}
+
+	return router
 }
 
 // Start inicia el router (loop de procesamiento).
 func (r *Router) Start() error {
-	r.wg.Add(1)
-	go r.processLoop()
+	for _, worker := range r.workers {
+		r.wg.Add(1)
+		go worker.run(&r.wg)
+	}
 
-	r.core.telemetry.Info(r.ctx, "Router started")
+	r.wg.Add(1)
+	go r.dispatcherLoop()
+
+	r.core.telemetry.Info(r.ctx, "Router started",
+		attribute.Int("worker_pool_size", r.workerPoolSize),
+		attribute.Int("queue_depth_max", r.queueDepthMax),
+		attribute.String("worker_timeout", r.workerTimeout.String()),
+	)
 	return nil
 }
 
@@ -175,11 +230,14 @@ func (r *Router) Stop() {
 //
 // No-blocking: usa canal buffered.
 func (r *Router) HandleAgentMessage(ctx context.Context, agentID string, msg *pb.AgentMessage) {
+	tradeID := r.extractTradeID(msg)
+
 	select {
 	case r.processCh <- &routerMessage{
 		ctx:      ctx,
 		agentID:  agentID,
 		agentMsg: msg,
+		tradeID:  tradeID,
 	}:
 		// Encolado exitoso
 
@@ -197,11 +255,33 @@ func (r *Router) HandleAgentMessage(ctx context.Context, agentID string, msg *pb
 	}
 }
 
-// processLoop procesa mensajes secuencialmente (FIFO).
-//
-// TODO i0: procesamiento secuencial.
-// TODO i1: procesamiento concurrente con locks por trade_id.
-func (r *Router) processLoop() {
+func (r *Router) extractTradeID(msg *pb.AgentMessage) string {
+	if msg == nil || msg.Payload == nil {
+		return ""
+	}
+
+	switch payload := msg.Payload.(type) {
+	case *pb.AgentMessage_TradeIntent:
+		if payload.TradeIntent == nil {
+			return ""
+		}
+		return strings.ToLower(payload.TradeIntent.GetTradeId())
+	case *pb.AgentMessage_ExecutionResult:
+		if payload.ExecutionResult == nil {
+			return ""
+		}
+		return strings.ToLower(payload.ExecutionResult.GetTradeId())
+	case *pb.AgentMessage_TradeClose:
+		if payload.TradeClose == nil {
+			return ""
+		}
+		return strings.ToLower(payload.TradeClose.GetTradeId())
+	default:
+		return ""
+	}
+}
+
+func (r *Router) dispatcherLoop() {
 	defer r.wg.Done()
 
 	for {
@@ -211,12 +291,338 @@ func (r *Router) processLoop() {
 				return // Canal cerrado
 			}
 
-			r.processMessage(msg)
+			r.dispatchMessage(msg)
 
 		case <-r.ctx.Done():
 			return
 		}
 	}
+}
+
+func (r *Router) dispatchMessage(msg *routerMessage) {
+	if msg == nil {
+		return
+	}
+
+	if msg.tradeID == "" {
+		r.processMessage(msg)
+		return
+	}
+
+	worker := r.selectWorker(msg.tradeID)
+	if worker == nil {
+		r.core.telemetry.Warn(msg.ctx, "No workers available for router message",
+			semconv.Echo.TradeID.String(msg.tradeID),
+		)
+		r.processMessage(msg)
+		return
+	}
+
+	msg.workerID = worker.id
+	msg.enqueued = time.Now()
+
+	if r.enqueueWorker(worker, msg) {
+		return
+	}
+
+	r.handleQueueRejection(msg)
+}
+
+func (r *Router) selectWorker(tradeID string) *routerWorker {
+	if len(r.workers) == 0 {
+		return nil
+	}
+
+	hash := hashTradeID(tradeID)
+	index := 0
+	if r.workerMask != 0 {
+		index = int(hash & r.workerMask)
+	} else {
+		index = int(hash % uint32(len(r.workers)))
+	}
+
+	return r.workers[index]
+}
+
+func (r *Router) enqueueWorker(worker *routerWorker, msg *routerMessage) bool {
+	ctx, span := r.core.telemetry.StartSpan(msg.ctx, "core.router.schedule")
+	span.SetAttributes(
+		attribute.Int("worker_id", worker.id),
+		semconv.Echo.TradeID.String(msg.tradeID),
+	)
+	defer span.End()
+
+	select {
+	case worker.queue <- msg:
+		r.recordQueueDepthDelta(ctx, worker.id, 1)
+		r.core.telemetry.Info(ctx, "core.router.enqueue",
+			attribute.Int("worker_id", worker.id),
+			semconv.Echo.Component.String(routerComponentValue),
+			semconv.Echo.TradeID.String(msg.tradeID),
+			attribute.Int("queue_depth", len(worker.queue)),
+		)
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Router) handleQueueRejection(msg *routerMessage) {
+	queueDepth := r.currentQueueDepth(msg.workerID)
+	attrs := []attribute.KeyValue{
+		semconv.Echo.Component.String(routerComponentValue),
+		attribute.Bool("backpressure", true),
+		attribute.Int("worker_id", msg.workerID),
+		attribute.Int("queue_depth", queueDepth),
+	}
+	if msg.tradeID != "" {
+		attrs = append(attrs, semconv.Echo.TradeID.String(msg.tradeID))
+	}
+
+	r.core.telemetry.Warn(msg.ctx, "Router queue full, backpressure engaged", attrs...)
+	if r.core.echoMetrics != nil {
+		r.core.echoMetrics.RecordRouterRejection(msg.ctx, msg.workerID, "queue_full")
+	}
+
+	switch payload := msg.agentMsg.Payload.(type) {
+	case *pb.AgentMessage_TradeIntent:
+		r.rejectTradeIntentBackpressure(msg, payload.TradeIntent, queueDepth)
+	default:
+		// Para otros mensajes, procesar inline para evitar pérdidas.
+		r.processMessage(msg)
+	}
+}
+
+func (w *routerWorker) run(wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		select {
+		case msg, ok := <-w.queue:
+			if !ok {
+				return
+			}
+			w.router.handleWorkerMessage(w, msg)
+		case <-w.router.ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *Router) handleWorkerMessage(worker *routerWorker, msg *routerMessage) {
+	ctx := msg.ctx
+	r.recordQueueDepthDelta(ctx, worker.id, -1)
+
+	start := msg.enqueued
+	if start.IsZero() {
+		start = time.Now()
+	}
+
+	ctx, span := r.core.telemetry.StartSpan(ctx, "core.router.worker")
+	span.SetAttributes(
+		attribute.Int("worker_id", worker.id),
+		semconv.Echo.TradeID.String(msg.tradeID),
+	)
+	defer span.End()
+
+	result := "success"
+	queueDepthSnapshot := len(worker.queue)
+	defer func() {
+		latency := float64(time.Since(start).Milliseconds())
+		if latency < 0 {
+			latency = 0
+		}
+		if r.core.echoMetrics != nil {
+			r.core.echoMetrics.RecordRouterDispatchDuration(ctx, worker.id, latency)
+			r.core.echoMetrics.RecordRouterDispatch(ctx, worker.id, result)
+		}
+		r.core.telemetry.Info(ctx, "core.router.dispatch",
+			attribute.Int("worker_id", worker.id),
+			semconv.Echo.TradeID.String(msg.tradeID),
+			attribute.Int("queue_depth", queueDepthSnapshot),
+			attribute.String("result", result),
+		)
+	}()
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			result = "panic"
+			r.core.telemetry.Error(ctx, "Router worker panic", fmt.Errorf("%v", rec),
+				attribute.Int("worker_id", worker.id),
+				semconv.Echo.TradeID.String(msg.tradeID),
+			)
+		}
+	}()
+
+	r.processMessage(msg)
+}
+
+func (r *Router) recordQueueDepthDelta(ctx context.Context, workerID int, delta int64) {
+	if r.core.echoMetrics == nil {
+		return
+	}
+
+	attrs := []attribute.KeyValue{
+		semconv.Echo.Component.String(routerComponentValue),
+	}
+	r.core.echoMetrics.RecordRouterQueueDepth(ctx, workerID, delta, attrs...)
+}
+
+func (r *Router) currentQueueDepth(workerID int) int {
+	if workerID < 0 || workerID >= len(r.workers) {
+		return 0
+	}
+	return len(r.workers[workerID].queue)
+}
+
+func (r *Router) rejectTradeIntentBackpressure(msg *routerMessage, intent *pb.TradeIntent, queueDepth int) {
+	if intent == nil {
+		return
+	}
+
+	ctx := msg.ctx
+	tradeID := strings.ToLower(intent.GetTradeId())
+	if tradeID == "" {
+		tradeID = utils.GenerateUUIDv7()
+	}
+
+	if err := r.core.dedupeService.Add(ctx, tradeID, domain.OrderStatusPending); err != nil {
+		if _, ok := err.(*DedupeError); !ok {
+			r.core.telemetry.Error(ctx, "Failed to register trade in dedupe for backpressure", err,
+				semconv.Echo.TradeID.String(tradeID),
+			)
+		}
+	}
+
+	if err := r.core.dedupeService.UpdateStatus(ctx, tradeID, domain.OrderStatusRejected); err != nil {
+		r.core.telemetry.Warn(ctx, "Failed to mark trade as rejected after backpressure",
+			attribute.String("error", err.Error()),
+			semconv.Echo.TradeID.String(tradeID),
+		)
+	}
+
+	r.persistRejectedTrade(ctx, intent, tradeID)
+
+	r.core.telemetry.Warn(ctx, "TradeIntent rejected due to router backpressure",
+		semconv.Echo.Component.String(routerComponentValue),
+		semconv.Echo.TradeID.String(tradeID),
+		semconv.Echo.ErrorCode.String(pb.ErrorCode_ERROR_CODE_BROKER_BUSY.String()),
+		attribute.Bool("backpressure", true),
+		attribute.Int("worker_id", msg.workerID),
+		attribute.Int("queue_depth", queueDepth),
+	)
+
+	r.sendBackpressureAck(ctx, msg.agentID, tradeID, queueDepth, msg.workerID)
+}
+
+func (r *Router) persistRejectedTrade(ctx context.Context, intent *pb.TradeIntent, tradeID string) {
+	if intent == nil || r.core.repoFactory == nil {
+		return
+	}
+
+	attempt := int32(0)
+	if intent.Attempt != nil {
+		attempt = intent.GetAttempt()
+	}
+
+	trade := &domain.Trade{
+		TradeID:         tradeID,
+		SourceMasterID:  intent.ClientId,
+		MasterAccountID: intent.ClientId,
+		MasterTicket:    intent.Ticket,
+		MagicNumber:     intent.MagicNumber,
+		Symbol:          intent.Symbol,
+		Side:            orderSideToDomain(intent.Side),
+		LotSize:         intent.LotSize,
+		Price:           intent.Price,
+		StopLoss:        intent.StopLoss,
+		TakeProfit:      intent.TakeProfit,
+		Comment:         intent.Comment,
+		Status:          domain.OrderStatusRejected,
+		Attempt:         attempt,
+		OpenedAtMs:      intent.TimestampMs,
+	}
+
+	if err := r.core.repoFactory.TradeRepository().Create(ctx, trade); err != nil {
+		r.core.telemetry.Warn(ctx, "Failed to persist rejected trade due to backpressure",
+			semconv.Echo.TradeID.String(tradeID),
+			attribute.String("error", err.Error()),
+		)
+	}
+}
+
+func (r *Router) sendBackpressureAck(ctx context.Context, agentID, tradeID string, queueDepth, workerID int) {
+	if agentID == "" {
+		return
+	}
+
+	agent, ok := r.getAgent(agentID)
+	if !ok || agent == nil {
+		r.core.telemetry.Warn(ctx, "Agent not connected for backpressure ack",
+			attribute.String("agent_id", agentID),
+			semconv.Echo.TradeID.String(tradeID),
+		)
+		return
+	}
+
+	ack := &pb.CoreMessage{
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.CoreMessage_Ack{
+			Ack: &pb.Ack{
+				MessageId: tradeID,
+				Success:   false,
+				Error:     proto.String(pb.ErrorCode_ERROR_CODE_BROKER_BUSY.String()),
+			},
+		},
+	}
+
+	interval := r.workerTimeout
+	if interval <= 0 {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case agent.SendCh <- ack:
+			r.core.telemetry.Info(ctx, "Backpressure ack sent to agent",
+				attribute.String("agent_id", agentID),
+				semconv.Echo.Component.String(routerComponentValue),
+				semconv.Echo.TradeID.String(tradeID),
+				attribute.Bool("backpressure", true),
+				attribute.Int("worker_id", workerID),
+				attribute.Int("queue_depth", queueDepth),
+			)
+			return
+		case <-ctx.Done():
+			r.core.telemetry.Warn(ctx, "Context cancelled while sending backpressure ack",
+				attribute.String("agent_id", agentID),
+				semconv.Echo.TradeID.String(tradeID),
+			)
+			return
+		case <-r.ctx.Done():
+			r.core.telemetry.Warn(ctx, "Router context cancelled while sending backpressure ack",
+				attribute.String("agent_id", agentID),
+				semconv.Echo.TradeID.String(tradeID),
+			)
+			return
+		case <-ticker.C:
+			r.core.telemetry.Warn(ctx, "Agent channel busy, retrying backpressure ack",
+				attribute.String("agent_id", agentID),
+				semconv.Echo.TradeID.String(tradeID),
+				attribute.Bool("backpressure", true),
+				attribute.Int("worker_id", workerID),
+				attribute.Int("queue_depth", queueDepth),
+			)
+		}
+	}
+}
+
+func hashTradeID(value string) uint32 {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(value))
+	return hasher.Sum32()
 }
 
 // processMessage procesa un mensaje según su tipo.
@@ -607,12 +1013,6 @@ func (r *Router) createExecuteOrders(ctx context.Context, intent *pb.TradeIntent
 			commissionPerLotResult = riskResult.CommissionPerLot
 			commissionRateResult = riskResult.CommissionRate
 			commissionFixedResult = riskResult.CommissionFixedPerLot
-			policyAttrs = append(policyAttrs,
-				attribute.Float64("commission_fixed_per_lot_result", riskResult.CommissionFixedPerLot),
-				semconv.Echo.RiskCommissionPerLot.Float64(riskResult.CommissionPerLot),
-				semconv.Echo.RiskCommissionTotal.Float64(riskResult.CommissionTotal),
-				semconv.Echo.RiskCommissionRate.Float64(riskResult.CommissionRate),
-			)
 			ctxPolicy = telemetry.AppendEventAttrs(ctxPolicy,
 				semconv.Echo.RiskDecision.String(string(riskResult.Decision)),
 				attribute.Float64("expected_loss", expectedLoss),
@@ -1640,7 +2040,7 @@ func computeStopOffsetTargets(intent *pb.TradeIntent, policy *domain.RiskPolicy,
 			}
 
 			offsetPrice := stats.TargetSLDistancePips * stats.PipSize
-			slPrice := intent.Price
+			var slPrice float64
 			if intent.Side == pb.OrderSide_ORDER_SIDE_BUY {
 				slPrice = intent.Price - offsetPrice
 			} else {
@@ -1669,7 +2069,7 @@ func computeStopOffsetTargets(intent *pb.TradeIntent, policy *domain.RiskPolicy,
 			}
 
 			offsetPrice := stats.TargetTPDistancePips * stats.PipSize
-			tpPrice := intent.Price
+			var tpPrice float64
 			if intent.Side == pb.OrderSide_ORDER_SIDE_BUY {
 				tpPrice = intent.Price + offsetPrice
 			} else {
@@ -1987,8 +2387,8 @@ func (r *Router) getAgent(agentID string) (*AgentConnection, bool) {
 //
 // Retorna true si el envío fue exitoso.
 func (r *Router) sendToAgent(ctx context.Context, agent *AgentConnection, msg *pb.CoreMessage, order *pb.ExecuteOrder) bool {
-	// i2b: Timeout de 500ms para evitar bloqueos indefinidos
-	timeout := time.NewTimer(500 * time.Millisecond)
+	// i2b/i13a: Timeout configurable por worker para evitar bloqueos indefinidos
+	timeout := time.NewTimer(r.workerTimeout)
 	defer timeout.Stop()
 
 	select {
@@ -2034,8 +2434,8 @@ func (r *Router) broadcastOrder(ctx context.Context, msg *pb.CoreMessage, order 
 	timeoutCount := 0
 
 	for _, agent := range agents {
-		// i2b: Timeout de 500ms por Agent para evitar bloqueos acumulados
-		timeout := time.NewTimer(500 * time.Millisecond)
+		// i2b/i13a: Timeout configurable por Agent para evitar bloqueos acumulados
+		timeout := time.NewTimer(r.workerTimeout)
 
 		select {
 		case agent.SendCh <- msg:
@@ -2132,8 +2532,8 @@ func (r *Router) broadcastCloseOrder(ctx context.Context, msg *pb.CoreMessage, o
 	timeoutCount := 0
 
 	for _, agent := range agents {
-		// i2b: Timeout de 500ms por Agent para evitar bloqueos acumulados
-		timeout := time.NewTimer(500 * time.Millisecond)
+		// i2b/i13a: Timeout configurable
+		timeout := time.NewTimer(r.workerTimeout)
 
 		select {
 		case agent.SendCh <- msg:

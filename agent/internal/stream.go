@@ -393,20 +393,6 @@ func (a *Agent) logSentMessage(msg *pb.AgentMessage) {
 	}
 }
 
-// generateAgentID genera un ID único para el Agent basado en hostname.
-//
-// Issue #C7: Usa hostname del sistema para identificación predecible y única.
-func generateAgentID() (string, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("failed to get hostname: %w", err)
-	}
-	// Añadir sufijo UUID para evitar colisiones si corren múltiples Agents en el mismo host
-	// Conserva el hostname para trazabilidad
-	suffix := utils.GenerateUUIDv7()
-	return fmt.Sprintf("agent_%s-%s", hostname, suffix), nil
-}
-
 // NEW i2: sendAgentHello envía el handshake inicial (solo metadata).
 func (a *Agent) sendAgentHello() error {
 	hostname, _ := os.Hostname() // Excepción permitida por reglas

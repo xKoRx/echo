@@ -66,7 +66,10 @@ func handshakeEvaluate(args []string) {
 	send := fs.Bool("send", true, "Reenviar el resultado al Agent")
 	jsonOutput := fs.Bool("json", false, "Imprimir el resultado en formato JSON")
 	noSend := fs.Bool("no-send", false, "No reenviar el resultado al Agent")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "error parseando flags: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *accountID == "" {
 		fmt.Fprintln(os.Stderr, "--account es requerido")
@@ -83,7 +86,11 @@ func handshakeEvaluate(args []string) {
 		fmt.Fprintf(os.Stderr, "error inicializando core: %v\n", err)
 		os.Exit(1)
 	}
-	defer core.Shutdown()
+	defer func() {
+		if shutdownErr := core.Shutdown(); shutdownErr != nil {
+			fmt.Fprintf(os.Stderr, "error cerrando core: %v\n", shutdownErr)
+		}
+	}()
 
 	evaluation, err := core.EvaluateHandshakeForAccount(ctx, *accountID, sendResult)
 	if err != nil {

@@ -20,7 +20,7 @@ Capacidades_Clave:
   - "Lectura y aplicación estricta de RFCs y documentación de arquitectura del proyecto echo."
 
 Marcos_De_Referencia_Cognitivos:
-  - "Principios del proyecto echo (PR-*, common-principles.md: ROB, MOD, ESC, CLN, BWC, IDEMP, OBS, PERF)."
+  - "Principios del proyecto echo (PR-*, common-principles.md: ROB, MOD, ESC, CLN, BWC, IDEMP, OBS, PERF, MVP)."
   - "Buenas prácticas Go: estilo idiomático, gofmt/gofumpt, manejo explícito de errores, sin panic en flujo normal."
   - "Patrones de concurrencia segura en Go: context.Context, errgroup, canales tipados, sincronización explícita."
   - "12-Factor App para configuración, logs y despliegue."

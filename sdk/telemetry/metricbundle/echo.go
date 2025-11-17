@@ -76,6 +76,10 @@ type EchoMetrics struct {
 	AgentHandshakeForwarded    metric.Int64Counter
 	AgentHandshakeBlocked      metric.Int64Counter
 	AgentHandshakeForwardError metric.Int64Counter
+	RouterQueueDepth           metric.Int64UpDownCounter
+	RouterDispatch             metric.Int64Counter
+	RouterDispatchDuration     metric.Float64Histogram
+	RouterRejections           metric.Int64Counter
 
 	// Histograms
 	LatencyE2E               metric.Float64Histogram
@@ -100,6 +104,8 @@ type EchoMetrics struct {
 	SymbolsValidate metric.Int64Counter // echo.symbols.validate (ok/reject)
 	SymbolsLoaded   metric.Int64Counter // echo.symbols.loaded (source=etcd/postgres/agent_report)
 }
+
+const routerComponentName = "core.router"
 
 // NewEchoMetrics crea un nuevo bundle de métricas Echo.
 func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
@@ -412,6 +418,42 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	routerQueueDepth, err := meter.Int64UpDownCounter(
+		"echo_core_router_queue_depth",
+		metric.WithDescription("Mensajes pendientes en la cola del worker del router"),
+		metric.WithUnit("{message}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	routerDispatch, err := meter.Int64Counter(
+		"echo_core_router_dispatch_total",
+		metric.WithDescription("Procesamientos del router por resultado y worker"),
+		metric.WithUnit("{dispatch}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	routerDispatchDuration, err := meter.Float64Histogram(
+		"echo_core_router_dispatch_duration_ms",
+		metric.WithDescription("Tiempo desde el enqueue hasta que el worker procesa el mensaje"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	routerRejections, err := meter.Int64Counter(
+		"echo_core_router_rejections_total",
+		metric.WithDescription("Rechazos del router por backpressure"),
+		metric.WithUnit("{rejection}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// i2: Routing metrics
 	routingMode, err := meter.Int64Counter(
 		"echo.routing.mode",
@@ -503,6 +545,10 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		FixedRiskExposure:          fixedRiskExposure,
 		FixedRiskDistancePoints:    fixedRiskDistancePoints,
 		StopOffsetDistance:         stopOffsetDistance,
+		RouterQueueDepth:           routerQueueDepth,
+		RouterDispatch:             routerDispatch,
+		RouterDispatchDuration:     routerDispatchDuration,
+		RouterRejections:           routerRejections,
 		RoutingMode:                routingMode,     // i2
 		AccountLookup:              accountLookup,   // i2
 		SymbolsLookup:              symbolsLookup,   // i3
@@ -851,4 +897,60 @@ func (m *EchoMetrics) RecordHandshakeReconcileSkipped(ctx context.Context, attrs
 // RecordHandshakeFeedbackLatency registra la latencia total del feedback handshake.
 func (m *EchoMetrics) RecordHandshakeFeedbackLatency(ctx context.Context, latencyMs float64, attrs ...attribute.KeyValue) {
 	m.HandshakeFeedbackLatency.Record(ctx, latencyMs, metric.WithAttributes(attrs...))
+}
+
+// RecordRouterQueueDepth ajusta el tamaño de la cola por worker.
+func (m *EchoMetrics) RecordRouterQueueDepth(ctx context.Context, workerID int, delta int64, attrs ...attribute.KeyValue) {
+	if m.RouterQueueDepth == nil {
+		return
+	}
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("component", routerComponentName),
+		attribute.Int("worker_id", workerID),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.RouterQueueDepth.Add(ctx, delta, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordRouterDispatch registra el resultado del procesamiento del worker.
+func (m *EchoMetrics) RecordRouterDispatch(ctx context.Context, workerID int, result string, attrs ...attribute.KeyValue) {
+	if m.RouterDispatch == nil {
+		return
+	}
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("component", routerComponentName),
+		attribute.Int("worker_id", workerID),
+		attribute.String("result", result),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.RouterDispatch.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordRouterDispatchDuration registra la latencia de cola+ejecución.
+func (m *EchoMetrics) RecordRouterDispatchDuration(ctx context.Context, workerID int, durationMs float64, attrs ...attribute.KeyValue) {
+	if m.RouterDispatchDuration == nil {
+		return
+	}
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("component", routerComponentName),
+		attribute.Int("worker_id", workerID),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.RouterDispatchDuration.Record(ctx, durationMs, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordRouterRejection registra rechazos por backpressure.
+func (m *EchoMetrics) RecordRouterRejection(ctx context.Context, workerID int, reason string, attrs ...attribute.KeyValue) {
+	if m.RouterRejections == nil {
+		return
+	}
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("component", routerComponentName),
+		attribute.Int("worker_id", workerID),
+	}
+	if reason != "" {
+		baseAttrs = append(baseAttrs, attribute.String("reason", reason))
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+	m.RouterRejections.Add(ctx, 1, metric.WithAttributes(baseAttrs...))
 }

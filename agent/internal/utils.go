@@ -3,16 +3,8 @@ package internal
 import (
 	"fmt"
 
-	"github.com/xKoRx/echo/sdk/utils"
 	"go.opentelemetry.io/otel/attribute"
 )
-
-// nowUnixMilli retorna el timestamp actual en milisegundos.
-//
-// Wrapper sobre utils.NowUnixMilli() de la SDK.
-func nowUnixMilli() int64 {
-	return utils.NowUnixMilli()
-}
 
 // mapToAttrs convierte un map[string]interface{} a atributos OTEL.
 //

@@ -201,7 +201,10 @@ func New(ctx context.Context) (*Core, error) {
 	echoMetrics := telClient.EchoMetrics()
 	if echoMetrics == nil {
 		cancel()
-		telClient.Shutdown(coreCtx)
+		if shutdownErr := telClient.Shutdown(coreCtx); shutdownErr != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to get EchoMetrics bundle: %w", shutdownErr)
+		}
 		db.Close()
 		return nil, fmt.Errorf("failed to get EchoMetrics bundle")
 	}
@@ -333,6 +336,9 @@ func New(ctx context.Context) (*Core, error) {
 		attribute.String("postgres_host", config.PostgresHost),
 		attribute.String("postgres_database", config.PostgresDatabase),
 		attribute.String("log_level", config.LogLevel),
+		attribute.Int("router_worker_pool_size", config.Router.WorkerPoolSize),
+		attribute.Int("router_queue_depth_max", config.Router.QueueDepthMax),
+		attribute.String("router_worker_timeout", config.Router.WorkerTimeout.String()),
 	)
 
 	return core, nil

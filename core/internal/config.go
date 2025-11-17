@@ -41,6 +41,7 @@ type Config struct {
 	VolumeGuard      *domain.VolumeGuardPolicy
 	Risk             RiskConfig
 	Protocol         ProtocolConfig
+	Router           RouterConfig
 
 	// PostgreSQL
 	PostgresHost        string // postgres/host
@@ -57,6 +58,13 @@ type Config struct {
 	ServiceVersion string // telemetry/service_version
 	Environment    string // telemetry/environment
 	LogLevel       string // core/log_level (DEBUG|INFO|WARN|ERROR)
+}
+
+// RouterConfig agrupa parámetros del worker pool del router.
+type RouterConfig struct {
+	WorkerPoolSize int
+	QueueDepthMax  int
+	WorkerTimeout  time.Duration
 }
 
 // RiskConfig agrupa configuración del servicio de políticas de riesgo.
@@ -157,6 +165,11 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 			BlockedVersions:  []int{},
 			RequiredFeatures: []string{},
 			RetryInterval:    5 * time.Minute,
+		},
+		Router: RouterConfig{
+			WorkerPoolSize: 4,
+			QueueDepthMax:  8,
+			WorkerTimeout:  50 * time.Millisecond,
 		},
 	}
 
@@ -320,6 +333,29 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		}
 	}
 
+	// i13a: Router worker pool
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/router/worker_pool_size", ""); err == nil && val != "" {
+		if size, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.Router.WorkerPoolSize = size
+		} else {
+			return nil, fmt.Errorf("invalid core/router/worker_pool_size: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/router/queue_depth_max", ""); err == nil && val != "" {
+		if depth, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.Router.QueueDepthMax = depth
+		} else {
+			return nil, fmt.Errorf("invalid core/router/queue_depth_max: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/router/worker_timeout_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.Router.WorkerTimeout = time.Duration(ms) * time.Millisecond
+		} else {
+			return nil, fmt.Errorf("invalid core/router/worker_timeout_ms: %w", err)
+		}
+	}
+
 	// Protocol versioning (i5)
 	protocolMin := cfg.Protocol.MinVersion
 	protocolMax := cfg.Protocol.MaxVersion
@@ -465,6 +501,22 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	if cfg.Protocol.RequiredFeatures == nil {
 		cfg.Protocol.RequiredFeatures = []string{}
 	}
+	if cfg.Router.WorkerPoolSize < 2 || cfg.Router.WorkerPoolSize > 32 {
+		return nil, fmt.Errorf("core/router/worker_pool_size must be between 2 and 32")
+	}
+	if !isPowerOfTwo(cfg.Router.WorkerPoolSize) {
+		return nil, fmt.Errorf("core/router/worker_pool_size must be a power of two")
+	}
+	if cfg.Router.QueueDepthMax < 4 || cfg.Router.QueueDepthMax > 128 {
+		return nil, fmt.Errorf("core/router/queue_depth_max must be between 4 and 128")
+	}
+	if cfg.Router.WorkerTimeout <= 0 {
+		cfg.Router.WorkerTimeout = 50 * time.Millisecond
+	}
+	timeoutMs := cfg.Router.WorkerTimeout / time.Millisecond
+	if timeoutMs < 20 || timeoutMs > 200 {
+		return nil, fmt.Errorf("core/router/worker_timeout_ms must be between 20 and 200")
+	}
 
 	return cfg, nil
 }
@@ -486,4 +538,8 @@ func (c *Config) PostgresConnStr() string {
 		c.PostgresPort,
 		c.PostgresDatabase,
 	)
+}
+
+func isPowerOfTwo(value int) bool {
+	return value > 0 && (value&(value-1)) == 0
 }

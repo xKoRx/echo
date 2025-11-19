@@ -115,6 +115,42 @@ message ExecutionResult {
   TimestampMetadata timestamps = 20;
 }
 
+// TradeIntentAckResult representa el resultado del ack del Intent.
+enum TradeIntentAckResult {
+  TRADE_INTENT_ACK_RESULT_UNSPECIFIED = 0;
+  TRADE_INTENT_ACK_RESULT_OK = 1;
+  TRADE_INTENT_ACK_RESULT_RETRY = 2;
+  TRADE_INTENT_ACK_RESULT_FAILED = 3;
+}
+
+// TradeIntentAck confirma que el Agent recibió/registró el intent del Master.
+message TradeIntentAck {
+  string trade_id = 1;
+  string command_id = 2;
+  uint32 attempt = 3;
+  TradeIntentAckResult result = 4;
+  ErrorCode error_code = 5;
+  string error_message = 6;
+  int64 observed_at_ms = 7;
+}
+
+// PipeDeliveryAckResult representa el resultado del ack del pipe Slave.
+enum PipeDeliveryAckResult {
+  PIPE_DELIVERY_ACK_RESULT_UNSPECIFIED = 0;
+  PIPE_DELIVERY_ACK_RESULT_OK = 1;
+  PIPE_DELIVERY_ACK_RESULT_RETRY = 2;
+  PIPE_DELIVERY_ACK_RESULT_FAILED = 3;
+}
+
+// PipeDeliveryAck confirma que el Slave EA recibió el comando antes de ejecutarlo.
+message PipeDeliveryAck {
+  string command_id = 1;
+  string target_account_id = 2;
+  PipeDeliveryAckResult result = 3;
+  string error_message = 4;
+  int64 observed_at_ms = 5;
+}
+
 // AccountInfo información de cuenta reportada por cliente
 message AccountInfo {
   string account_id = 1;         // Identificador de cuenta

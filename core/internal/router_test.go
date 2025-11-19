@@ -324,6 +324,10 @@ func (f *testRepoFactory) RiskPolicyRepository() domain.RiskPolicyRepository { r
 func (f *testRepoFactory) HandshakeRepository() domain.HandshakeEvaluationRepository {
 	return nil
 }
+func (f *testRepoFactory) DeliveryJournalRepository() domain.DeliveryJournalRepository { return nil }
+func (f *testRepoFactory) DeliveryRetryEventRepository() domain.DeliveryRetryEventRepository {
+	return nil
+}
 
 func newTestEchoMetrics(t *testing.T) *metricbundle.EchoMetrics {
 	t.Helper()

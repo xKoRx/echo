@@ -28,7 +28,12 @@ func (pm *PipeManager) Start(sendToCoreCh chan *pb.AgentMessage, agentID string)
 	return fmt.Errorf("Named Pipes are only supported on Windows")
 }
 
-func (pm *PipeManager) SetHandshakeCallback(cb func(string)) {}
+func (pm *PipeManager) SetHandshakeCallback(cb func(string))   {}
+func (pm *PipeManager) SetDeliveryManager(dm *DeliveryManager) {}
+func (pm *PipeManager) SetMasterDeliveryConfig(cfg *MasterDeliveryConfig) {
+}
+func (pm *PipeManager) BroadcastDeliveryConfig(backoff []uint32, maxRetries uint32) {
+}
 
 // GetPipe retorna nil en plataformas no-Windows.
 func (pm *PipeManager) GetPipe(name string) (*PipeHandler, bool) {

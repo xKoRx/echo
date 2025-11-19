@@ -1,12 +1,12 @@
-# echo/vibe-coding/prompts/dev-senior-go.request.md
+<ROL>
+   debes tomar exclusivamente la personalidad descrita en vibe-coding/.cursor/rules/dev-senior-go.mdc
+<ROL>
 
 <CONTEXT>
-  @echo/vibe-coding/personas/dev-senior-go.mdc
-
-  # Docs base de Echo (mínimo estos tres)
-  @echo/docs/00-contexto-general.md
-  @echo/docs/01-arquitectura-y-roadmap.md
-  @echo/docs/rfcs/RFC-architecture.md
+  docs/00-contexto-general.md
+  docs/01-arquitectura-y-roadmap.md
+  docs/rfcs/RFC-architecture.md
+  vibe-coding/prompts/common-principles.md
 
   # RFC de la iteración (fuente de verdad funcional)
   @{{RFC_PATH}}
@@ -16,12 +16,12 @@
   # Vars de tarea (instanciar antes de invocar)
   ITERATION_SLUG      = {{ITERATION_SLUG}}      # p.ej. i8(a+b)
   RFC_NAME            = {{RFC_NAME}}            # slug kebab del RFC
-  RFC_PATH            = echo/docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
+  RFC_PATH            = docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
 
-  IMPLEMENTATION_PATH = echo/docs/rfcs/{{ITERATION_SLUG}}/IMPLEMENTATION.md
-  DIFF_PATH           = echo/docs/rfcs/{{ITERATION_SLUG}}/DIFF-{{ITERATION_SLUG}}-{{RFC_NAME}}.txt
-  CI_REPORT_PATH      = echo/docs/rfcs/{{ITERATION_SLUG}}/CI-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
-  CR_PATH             = echo/docs/rfcs/{{ITERATION_SLUG}}/CR-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
+  IMPLEMENTATION_PATH = docs/rfcs/{{ITERATION_SLUG}}/IMPLEMENTATION.md
+  DIFF_PATH           = docs/rfcs/{{ITERATION_SLUG}}/DIFF-{{ITERATION_SLUG}}-{{RFC_NAME}}.txt
+  CI_REPORT_PATH      = docs/rfcs/{{ITERATION_SLUG}}/CI-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
+  CR_PATH             = docs/rfcs/{{ITERATION_SLUG}}/CR-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
 
   MAX_DOC_LINES       = 250                     # límite “duro” por documento texto de la iteración
 
@@ -118,7 +118,7 @@
       - performance (si hay paths sensibles)
 
   Instrucciones:
-    1) Ejecuta tu flujo usando echo/vibe-coding/prompts/revisor-codigo.request.md
+    1) Ejecuta tu flujo usando vibe-coding/prompts/revisor-codigo.request.md
        con las vars de ruta y configuración indicadas arriba.
     2) Valida exclusivamente contra el RFC aprobado y los estándares técnicos de Echo.
   <<<PROMPT_NEXT_AGENT_END

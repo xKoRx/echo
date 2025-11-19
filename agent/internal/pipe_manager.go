@@ -46,6 +46,8 @@ type PipeManager struct {
 	config      *Config
 	telemetry   *telemetry.Client
 	echoMetrics *metricbundle.EchoMetrics
+	delivery    *DeliveryManager
+	deliveryCfg *MasterDeliveryConfig
 
 	// Pipes activos
 	pipes   map[string]*PipeHandler // key: pipe name (ej: "echo_master_12345")
@@ -89,6 +91,28 @@ func NewPipeManager(ctx context.Context, config *Config, tel *telemetry.Client, 
 
 func (pm *PipeManager) SetHandshakeCallback(cb func(string)) {
 	pm.onHandshake = cb
+}
+
+func (pm *PipeManager) SetDeliveryManager(dm *DeliveryManager) {
+	pm.delivery = dm
+}
+
+func (pm *PipeManager) SetMasterDeliveryConfig(cfg *MasterDeliveryConfig) {
+	pm.deliveryCfg = cfg
+}
+
+func (pm *PipeManager) BroadcastDeliveryConfig(backoff []uint32, maxRetries uint32) {
+	if len(backoff) == 0 && maxRetries == 0 {
+		return
+	}
+	pm.pipesMu.RLock()
+	defer pm.pipesMu.RUnlock()
+	for _, handler := range pm.pipes {
+		if handler == nil || handler.role != "master" {
+			continue
+		}
+		handler.sendDeliveryConfig(backoff, maxRetries)
+	}
 }
 
 // Start inicia la gestión de pipes.
@@ -158,6 +182,8 @@ func (pm *PipeManager) createPipe(name, role, accountID string) error {
 		allowLegacy:        pm.allowLegacy,
 		protocolMinVersion: pm.protocolMinVersion,
 		protocolMaxVersion: pm.protocolMaxVersion,
+		delivery:           pm.delivery,
+		deliveryConfig:     pm.deliveryCfg,
 	}
 
 	// Registrar pipe
@@ -246,6 +272,9 @@ type PipeHandler struct {
 	ctx    context.Context
 	closed bool
 	mu     sync.Mutex
+
+	delivery       *DeliveryManager
+	deliveryConfig *MasterDeliveryConfig
 
 	// Cache local para filtrar reportes repetidos
 	lastSpecReportMs int64
@@ -473,15 +502,46 @@ func (h *PipeHandler) handleMasterMessage(msgMap map[string]interface{}) error {
 
 // handleTradeIntent procesa un TradeIntent del Master EA.
 func (h *PipeHandler) handleTradeIntent(msgMap map[string]interface{}) error {
+	payloadMap, _ := msgMap["payload"].(map[string]interface{})
+	rawTradeID := utils.ExtractString(payloadMap, "trade_id")
+	rawAttempt := extractAttemptFromPayload(payloadMap)
+	commandID := utils.ExtractString(payloadMap, "command_id")
+	if commandID == "" {
+		commandID = rawTradeID
+	}
+	accountID := utils.ExtractString(payloadMap, "account_id")
+	bufferDepth := utils.ExtractInt64(payloadMap, "buffer_depth")
+	spanCtx, span := h.telemetry.StartSpan(h.ctx, "ea.intent.buffer")
+	span.SetAttributes(
+		semconv.Echo.TradeID.String(rawTradeID),
+		attribute.String("command_id", commandID),
+		attribute.String("account_id", accountID),
+		attribute.Int64("buffer_depth", bufferDepth),
+	)
+	defer span.End()
+	if bufferDepth > 0 && h.echoMetrics != nil {
+		attrs := []attribute.KeyValue{
+			semconv.Echo.AccountID.String(accountID),
+		}
+		if h.agentID != "" {
+			attrs = append(attrs, attribute.String("agent_id", h.agentID))
+		}
+		h.echoMetrics.RecordTradeIntentBufferDepth(h.ctx, float64(bufferDepth), attrs...)
+	}
+
 	// Issue #M1: Agregar timestamp t1 (Agent recv from pipe)
 	t1 := utils.NowUnixMilli()
 
 	// Transformar JSON → Proto usando SDK
 	protoIntent, err := domain.JSONToTradeIntentWithWhitelist(msgMap, h.canonicalSymbols)
 	if err != nil {
+		h.telemetry.RecordError(spanCtx, err)
+		h.sendTradeIntentAck(rawTradeID, commandID, rawAttempt, pb.TradeIntentAckResult_TRADE_INTENT_ACK_RESULT_FAILED, err)
 		return fmt.Errorf("failed to parse trade_intent: %w", err)
 	}
-
+	span.SetAttributes(
+		attribute.Int("attempt", int(tradeIntentAttempt(protoIntent, rawAttempt))),
+	)
 	// Issue #M1: Popular timestamp t1 en el proto
 	if protoIntent.Timestamps != nil {
 		protoIntent.Timestamps.T1AgentRecvMs = t1
@@ -520,7 +580,24 @@ func (h *PipeHandler) handleTradeIntent(msgMap map[string]interface{}) error {
 		h.logInfo("TradeIntent forwarded to Core", map[string]interface{}{
 			"trade_id": protoIntent.TradeId,
 		})
+		span.SetAttributes(attribute.String("result", "forwarded"))
+		h.sendTradeIntentAck(
+			protoIntent.TradeId,
+			commandID,
+			tradeIntentAttempt(protoIntent, rawAttempt),
+			pb.TradeIntentAckResult_TRADE_INTENT_ACK_RESULT_OK,
+			nil,
+		)
 	case <-h.ctx.Done():
+		errCtx := fmt.Errorf("context cancelled while forwarding trade_intent")
+		h.telemetry.RecordError(spanCtx, errCtx)
+		h.sendTradeIntentAck(
+			protoIntent.TradeId,
+			commandID,
+			tradeIntentAttempt(protoIntent, rawAttempt),
+			pb.TradeIntentAckResult_TRADE_INTENT_ACK_RESULT_FAILED,
+			h.ctx.Err(),
+		)
 		return h.ctx.Err()
 	}
 
@@ -585,6 +662,9 @@ func (h *PipeHandler) handleSlaveMessage(msgMap map[string]interface{}) error {
 	case "close_result":
 		return h.handleCloseResult(msgMap)
 
+	case "pipe_delivery_ack":
+		return h.handlePipeDeliveryAck(msgMap)
+
 	default:
 		h.logWarn("Unknown message type from slave", map[string]interface{}{
 			"type":      msgType,
@@ -620,6 +700,9 @@ func (h *PipeHandler) handleExecutionResult(msgMap map[string]interface{}) error
 		h.logInfo("ExecutionResult forwarded to Core", map[string]interface{}{
 			"command_id": protoResult.CommandId,
 		})
+		if h.delivery != nil {
+			h.delivery.HandleExecutionResult(protoResult)
+		}
 	case <-h.ctx.Done():
 		return h.ctx.Err()
 	}
@@ -653,9 +736,31 @@ func (h *PipeHandler) handleCloseResult(msgMap map[string]interface{}) error {
 		h.logInfo("CloseResult forwarded to Core", map[string]interface{}{
 			"command_id": protoResult.CommandId,
 		})
+		if h.delivery != nil {
+			h.delivery.HandleExecutionResult(protoResult)
+		}
 	case <-h.ctx.Done():
 		return h.ctx.Err()
 	}
+
+	return nil
+}
+
+func (h *PipeHandler) handlePipeDeliveryAck(msgMap map[string]interface{}) error {
+	if h.delivery == nil {
+		return nil
+	}
+
+	ack, err := domain.JSONToPipeDeliveryAck(msgMap)
+	if err != nil {
+		return fmt.Errorf("failed to parse pipe_delivery_ack: %w", err)
+	}
+
+	h.delivery.HandlePipeDeliveryAck(ack)
+	h.logDebug("PipeDeliveryAck forwarded to delivery manager", map[string]interface{}{
+		"command_id": ack.CommandId,
+		"result":     ack.Result.String(),
+	})
 
 	return nil
 }
@@ -821,6 +926,10 @@ func (h *PipeHandler) handleHandshake(msgMap map[string]interface{}) error {
 		})
 	case <-h.ctx.Done():
 		return h.ctx.Err()
+	}
+
+	if h.role == "master" {
+		h.sendDeliveryConfigSnapshot()
 	}
 
 	return nil
@@ -1248,6 +1357,17 @@ func normalizeEnumValue(v string) string {
 	return n
 }
 
+func uint32SliceToAny(values []uint32) []interface{} {
+	if len(values) == 0 {
+		return nil
+	}
+	items := make([]interface{}, len(values))
+	for i, v := range values {
+		items[i] = v
+	}
+	return items
+}
+
 // handlePing procesa un ping del EA y responde con pong.
 //
 // i2b: Implementación de ping/pong para liveness checking.
@@ -1372,6 +1492,120 @@ func (h *PipeHandler) WriteSymbolRegistrationResult(result *pb.SymbolRegistratio
 	}
 
 	return nil
+}
+
+func (h *PipeHandler) writeJSONMessage(message map[string]interface{}) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closed {
+		return fmt.Errorf("pipe is closed")
+	}
+
+	writer := ipc.NewJSONWriter(h.server)
+	if err := writer.WriteMessage(message); err != nil {
+		return fmt.Errorf("write JSON message: %w", err)
+	}
+	return nil
+}
+
+func (h *PipeHandler) sendTradeIntentAck(tradeID, commandID string, attempt uint32, result pb.TradeIntentAckResult, cause error) {
+	if h.role != "master" || tradeID == "" {
+		return
+	}
+
+	ack := &pb.TradeIntentAck{
+		TradeId:      tradeID,
+		CommandId:    commandID,
+		Attempt:      attempt,
+		Result:       result,
+		ObservedAtMs: utils.NowUnixMilli(),
+	}
+	if cause != nil {
+		ack.ErrorMessage = cause.Error()
+	}
+
+	message, err := domain.TradeIntentAckToJSON(ack)
+	if err != nil {
+		h.telemetry.Error(h.ctx, "Failed to marshal TradeIntentAck", err,
+			semconv.Echo.TradeID.String(tradeID),
+		)
+		return
+	}
+
+	if err := h.writeJSONMessage(message); err != nil {
+		h.telemetry.Error(h.ctx, "Failed to send TradeIntentAck", err,
+			semconv.Echo.TradeID.String(tradeID),
+		)
+	}
+}
+
+func (h *PipeHandler) sendDeliveryConfigSnapshot() {
+	if h.deliveryConfig == nil || h.role != "master" {
+		return
+	}
+	backoff, maxRetries := h.deliveryConfig.Snapshot()
+	if len(backoff) == 0 && maxRetries == 0 {
+		return
+	}
+	h.sendDeliveryConfig(backoff, maxRetries)
+}
+
+func (h *PipeHandler) sendDeliveryConfig(backoff []uint32, maxRetries uint32) {
+	if h.role != "master" {
+		return
+	}
+	payload := map[string]interface{}{
+		"timestamp_ms": utils.NowUnixMilli(),
+	}
+	if len(backoff) > 0 {
+		payload["retry_backoff_ms"] = uint32SliceToAny(backoff)
+	}
+	if maxRetries > 0 {
+		payload["max_retries"] = maxRetries
+	}
+	if len(payload) == 1 { // only timestamp present
+		return
+	}
+	message := map[string]interface{}{
+		"type":    "delivery_config",
+		"payload": payload,
+	}
+	if err := h.writeJSONMessage(message); err != nil {
+		h.telemetry.Warn(h.ctx, "Failed to push delivery config to Master EA",
+			attribute.String("pipe_name", h.name),
+			attribute.String("account_id", h.accountID),
+			attribute.String("error", err.Error()),
+		)
+		return
+	}
+	h.telemetry.Info(h.ctx, "Delivery config propagated to Master EA",
+		attribute.String("pipe_name", h.name),
+		attribute.String("account_id", h.accountID),
+		attribute.Int("backoff_len", len(backoff)),
+		attribute.Int64("max_retries", int64(maxRetries)),
+	)
+}
+
+func tradeIntentAttempt(intent *pb.TradeIntent, fallback uint32) uint32 {
+	if intent != nil && intent.Attempt != nil && *intent.Attempt > 0 {
+		return uint32(*intent.Attempt)
+	}
+	if fallback == 0 {
+		return 1
+	}
+	return fallback
+}
+
+func extractAttemptFromPayload(payload map[string]interface{}) uint32 {
+	if payload == nil {
+		return 1
+	}
+	val := utils.ExtractInt64(payload, "attempt")
+	if val <= 0 {
+		return 1
+	}
+	return uint32(val)
 }
 
 // Close cierra el handler.

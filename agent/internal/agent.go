@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/xKoRx/echo/sdk/domain/handshake"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
@@ -37,6 +38,9 @@ type Agent struct {
 	// Telemetría
 	telemetry   *telemetry.Client
 	echoMetrics *metricbundle.EchoMetrics
+	delivery    *DeliveryManager
+	// Snapshot de configuración de delivery para masters
+	masterDeliveryConfig *MasterDeliveryConfig
 
 	// Lifecycle
 	ctx    context.Context
@@ -90,16 +94,32 @@ func New(ctx context.Context) (*Agent, error) {
 		return nil, fmt.Errorf("failed to get EchoMetrics bundle")
 	}
 
-	agent := &Agent{
-		config:           config,
-		sendToCoreCh:     make(chan *pb.AgentMessage, config.SendQueueSize),
-		telemetry:        telClient,
-		echoMetrics:      echoMetrics,
-		ctx:              agentCtx,
-		cancel:           cancel,
-		handshakeStatus:  make(map[string]handshake.RegistrationStatus),
-		lastEvaluationID: make(map[string]string),
+	initialBackoff := durationsToUint32(config.Delivery.RetryBackoff)
+	maxRetries := config.Delivery.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 100
 	}
+	masterDeliveryConfig := NewMasterDeliveryConfig(initialBackoff, uint32(maxRetries))
+
+	agent := &Agent{
+		config:               config,
+		sendToCoreCh:         make(chan *pb.AgentMessage, config.SendQueueSize),
+		telemetry:            telClient,
+		echoMetrics:          echoMetrics,
+		ctx:                  agentCtx,
+		cancel:               cancel,
+		handshakeStatus:      make(map[string]handshake.RegistrationStatus),
+		lastEvaluationID:     make(map[string]string),
+		masterDeliveryConfig: masterDeliveryConfig,
+	}
+
+	delivery, err := NewDeliveryManager(agentCtx, config, telClient, agent.sendToCoreCh)
+	if err != nil {
+		cancel()
+		_ = telClient.Shutdown(agentCtx)
+		return nil, fmt.Errorf("failed to init delivery manager: %w", err)
+	}
+	agent.delivery = delivery
 
 	return agent, nil
 }
@@ -141,6 +161,16 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("failed to create pipe manager: %w", err)
 	}
 	pipeManager.SetHandshakeCallback(a.markHandshakePending)
+	if a.delivery != nil {
+		pipeManager.SetDeliveryManager(a.delivery)
+		a.delivery.SetPipeLookup(func(accountID string) (*PipeHandler, bool) {
+			pipeName := fmt.Sprintf("%sslave_%s", a.config.PipePrefix, accountID)
+			return pipeManager.GetPipe(pipeName)
+		})
+	}
+	if a.masterDeliveryConfig != nil {
+		pipeManager.SetMasterDeliveryConfig(a.masterDeliveryConfig)
+	}
 	a.pipeManager = pipeManager
 
 	// 4. Iniciar gestión de pipes (bloquea hasta ctx.Done)
@@ -177,6 +207,10 @@ func (a *Agent) Shutdown() error {
 		_ = a.pipeManager.Close()
 	}
 
+	if a.delivery != nil {
+		a.delivery.Close()
+	}
+
 	// 3. Cerrar gRPC
 	if a.coreClient != nil {
 		_ = a.coreClient.Close()
@@ -202,6 +236,19 @@ func (a *Agent) Shutdown() error {
 func (a *Agent) logInfo(message string, fields map[string]interface{}) {
 	attrs := mapToAttrs(fields)
 	a.telemetry.Info(a.ctx, message, attrs...)
+}
+
+func (a *Agent) recordPipeDeliveryLatency(accountID, result string, duration time.Duration) {
+	if a.echoMetrics == nil {
+		return
+	}
+	a.echoMetrics.RecordAgentPipeDeliveryLatency(
+		a.ctx,
+		a.config.AgentID,
+		accountID,
+		result,
+		duration,
+	)
 }
 
 func (a *Agent) logDebug(message string, fields map[string]interface{}) {
@@ -273,6 +320,35 @@ func (a *Agent) clearLastEvaluationID(accountID string) {
 	a.evaluationMu.Lock()
 	delete(a.lastEvaluationID, accountID)
 	a.evaluationMu.Unlock()
+}
+
+func (a *Agent) updateMasterDeliveryConfig(hb *pb.DeliveryHeartbeat) {
+	if hb == nil || a.masterDeliveryConfig == nil {
+		return
+	}
+	var backoff []uint32
+	if len(hb.RetryBackoffMs) > 0 {
+		backoff = append([]uint32(nil), hb.RetryBackoffMs...)
+	}
+	maxRetries := uint32(hb.MaxRetries)
+	if a.masterDeliveryConfig.Update(backoff, maxRetries) && a.pipeManager != nil {
+		snapshotBackoff, snapshotMax := a.masterDeliveryConfig.Snapshot()
+		a.pipeManager.BroadcastDeliveryConfig(snapshotBackoff, snapshotMax)
+	}
+}
+
+func durationsToUint32(values []time.Duration) []uint32 {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]uint32, 0, len(values))
+	for _, d := range values {
+		if d <= 0 {
+			continue
+		}
+		result = append(result, uint32(d.Milliseconds()))
+	}
+	return result
 }
 
 // logWarn loggea un mensaje WARN.

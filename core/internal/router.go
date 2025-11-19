@@ -468,6 +468,25 @@ func (r *Router) recordQueueDepthDelta(ctx context.Context, workerID int, delta 
 	r.core.echoMetrics.RecordRouterQueueDepth(ctx, workerID, delta, attrs...)
 }
 
+func (r *Router) handleDeliveryScheduleFailure(ctx context.Context, tradeID, accountID, commandID string, failure error) {
+	attrs := []attribute.KeyValue{
+		semconv.Echo.TradeID.String(tradeID),
+		attribute.String("target_account_id", accountID),
+	}
+	if commandID != "" {
+		attrs = append(attrs, semconv.Echo.CommandID.String(commandID))
+	}
+
+	r.core.telemetry.Error(ctx, "Delivery scheduling failed",
+		failure,
+		attrs...,
+	)
+
+	if r.core.echoMetrics != nil {
+		r.core.echoMetrics.RecordDeliveryRetry(ctx, "journal", "failed", attrs...)
+	}
+}
+
 func (r *Router) currentQueueDepth(workerID int) int {
 	if workerID < 0 || workerID >= len(r.workers) {
 		return 0
@@ -648,6 +667,15 @@ func (r *Router) processMessage(msg *routerMessage) {
 	case *pb.AgentMessage_StateSnapshot:
 		r.handleStateSnapshot(msg.ctx, msg.agentID, payload.StateSnapshot)
 
+	case *pb.AgentMessage_CommandAck:
+		if r.core.deliveryService != nil {
+			if err := r.core.deliveryService.HandleCommandAck(msg.ctx, msg.agentID, payload.CommandAck); err != nil {
+				r.core.telemetry.Error(msg.ctx, "Failed to process CommandAck", err,
+					attribute.String("agent_id", msg.agentID),
+				)
+			}
+		}
+
 	default:
 		r.core.telemetry.Warn(r.ctx, "Unknown AgentMessage type",
 			attribute.String("agent_id", msg.agentID),
@@ -776,10 +804,6 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 			order.Timestamps.T3CoreSendMs = utils.NowUnixMilli()
 		}
 
-		msg := &pb.CoreMessage{
-			Payload: &pb.CoreMessage_ExecuteOrder{ExecuteOrder: order},
-		}
-
 		// i2: Lookup owner en registry
 		targetAccountID := order.TargetAccountId
 		ownerAgentID, found := r.core.accountRegistry.GetOwner(targetAccountID)
@@ -795,37 +819,29 @@ func (r *Router) handleTradeIntent(ctx context.Context, agentID string, intent *
 			)
 		}
 
-		if found {
-			// Routing selectivo
-			agent, agentExists := r.getAgent(ownerAgentID)
-			if agentExists {
-				if r.sendToAgent(ctx, agent, msg, order) {
-					sentCount++
-					selectiveCount++
-					r.recordRoutingMetric(ctx, "selective", true, order)
-				}
-			} else {
-				// Owner registrado pero desconectado → fallback broadcast
-				r.core.telemetry.Warn(ctx, "Owner agent not connected, falling back to broadcast (i2)",
-					attribute.String("target_account_id", targetAccountID),
-					attribute.String("owner_agent_id", ownerAgentID),
-				)
-				if r.broadcastOrder(ctx, msg, order) > 0 {
-					sentCount++
-					broadcastCount++
-					r.recordRoutingMetric(ctx, "fallback_broadcast", false, order)
-				}
+		delivered := false
+		if r.core.deliveryService != nil {
+			if err := r.core.deliveryService.ScheduleExecuteOrder(ctx, ownerAgentID, order); err != nil {
+				r.handleDeliveryScheduleFailure(ctx, tradeID, targetAccountID, order.GetCommandId(), err)
+				return
 			}
+			delivered = true
+			selectiveCount++
+			r.recordRoutingMetric(ctx, "selective", found, order)
 		} else {
-			// No hay owner registrado → fallback broadcast
-			r.core.telemetry.Warn(ctx, "No owner registered for account, falling back to broadcast (i2)",
-				attribute.String("target_account_id", targetAccountID),
-			)
-			if r.broadcastOrder(ctx, msg, order) > 0 {
-				sentCount++
-				broadcastCount++
-				r.recordRoutingMetric(ctx, "fallback_broadcast", false, order)
+			msg := &pb.CoreMessage{
+				Payload: &pb.CoreMessage_ExecuteOrder{ExecuteOrder: order},
 			}
+			delivered = r.dispatchExecuteOrderLegacy(ctx, ownerAgentID, msg, order, targetAccountID, found)
+			if delivered && found {
+				selectiveCount++
+			} else if delivered {
+				broadcastCount++
+			}
+		}
+
+		if delivered {
+			sentCount++
 		}
 	}
 
@@ -1658,43 +1674,47 @@ func (r *Router) handleTradeClose(ctx context.Context, agentID string, close *pb
 
 		ownerAgentID, found := r.core.accountRegistry.GetOwner(slaveAccountID)
 
-		if found {
-			// Routing selectivo
-			agent, agentExists := r.getAgent(ownerAgentID)
-			if agentExists {
-				select {
-				case agent.SendCh <- msg:
-					totalSent++
-					r.core.telemetry.Info(ctx, "CloseOrder sent to Agent (selective i2)",
-						attribute.String("close_order_id", closeOrderID),
-						attribute.String("agent_id", ownerAgentID),
-						attribute.String("target_account_id", slaveAccountID),
-						attribute.String("symbol", close.Symbol),
-						attribute.Int64("magic_number", close.MagicNumber),
-					)
-
-				case <-ctx.Done():
-					r.core.telemetry.Error(ctx, "Context cancelled while sending CloseOrder", ctx.Err(),
-						attribute.String("close_order_id", closeOrderID),
-						attribute.String("target_account_id", slaveAccountID),
-					)
-					return
+		delivered := false
+		if r.core.deliveryService != nil {
+			if err := r.core.deliveryService.ScheduleCloseOrder(ctx, ownerAgentID, closeOrder); err != nil {
+				r.handleDeliveryScheduleFailure(ctx, tradeID, slaveAccountID, closeOrderID, err)
+				return
+			}
+			delivered = true
+		} else {
+			// Legacy fallback
+			if found {
+				agent, agentExists := r.getAgent(ownerAgentID)
+				if agentExists {
+					select {
+					case agent.SendCh <- msg:
+						delivered = true
+						r.core.telemetry.Info(ctx, "CloseOrder sent to Agent (selective i2)",
+							attribute.String("close_order_id", closeOrderID),
+							attribute.String("agent_id", ownerAgentID),
+							attribute.String("target_account_id", slaveAccountID),
+							attribute.String("symbol", close.Symbol),
+							attribute.Int64("magic_number", close.MagicNumber),
+						)
+					case <-ctx.Done():
+						r.core.telemetry.Error(ctx, "Context cancelled while sending CloseOrder", ctx.Err(),
+							attribute.String("close_order_id", closeOrderID),
+							attribute.String("target_account_id", slaveAccountID),
+						)
+						return
+					}
 				}
-			} else {
-				// Owner registrado pero desconectado → fallback broadcast
-				r.core.telemetry.Warn(ctx, "Owner agent not connected for CloseOrder, falling back to broadcast (i2)",
+			}
+			if !delivered {
+				r.core.telemetry.Warn(ctx, "CloseOrder fallback broadcast (legacy)",
 					attribute.String("target_account_id", slaveAccountID),
-					attribute.String("owner_agent_id", ownerAgentID),
 				)
 				r.broadcastCloseOrder(ctx, msg, closeOrder, slaveAccountID)
-				totalSent++
+				delivered = true
 			}
-		} else {
-			// No hay owner registrado → fallback broadcast
-			r.core.telemetry.Warn(ctx, "No owner registered for account in CloseOrder, falling back to broadcast (i2)",
-				attribute.String("target_account_id", slaveAccountID),
-			)
-			r.broadcastCloseOrder(ctx, msg, closeOrder, slaveAccountID)
+		}
+
+		if delivered {
 			totalSent++
 		}
 	}
@@ -2472,6 +2492,28 @@ func (r *Router) broadcastOrder(ctx context.Context, msg *pb.CoreMessage, order 
 	}
 
 	return sentCount
+}
+
+func (r *Router) dispatchExecuteOrderLegacy(ctx context.Context, ownerAgentID string, msg *pb.CoreMessage, order *pb.ExecuteOrder, accountID string, hasOwner bool) bool {
+	if hasOwner {
+		if agent, ok := r.getAgent(ownerAgentID); ok {
+			if r.sendToAgent(ctx, agent, msg, order) {
+				r.recordRoutingMetric(ctx, "selective", true, order)
+				return true
+			}
+		} else {
+			r.core.telemetry.Warn(ctx, "Owner agent not connected, falling back to broadcast (legacy)",
+				attribute.String("target_account_id", accountID),
+				attribute.String("owner_agent_id", ownerAgentID),
+			)
+		}
+	}
+
+	if r.broadcastOrder(ctx, msg, order) > 0 {
+		r.recordRoutingMetric(ctx, "fallback_broadcast", false, order)
+		return true
+	}
+	return false
 }
 
 // recordRoutingMetric registra métrica de routing (i2).

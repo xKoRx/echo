@@ -44,7 +44,7 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		"agent/flush_force":         "false", // Desactivado por defecto (i1)
 		"agent/send_queue_size":     "100",
 		"agent/reconnect_backoff_s": "5",
-		"agent/log_level":           "WARN", // INFO, DEBUG, WARN, ERROR
+		"agent/log_level":           "DEBUG", // INFO, DEBUG, WARN, ERROR
 
 		// gRPC KeepAlive Server (RFC-003 sección 7)
 		"grpc/keepalive/time_s":     "60",
@@ -61,7 +61,7 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		"core/default_lot_size":                  "0.10",   // i0 hardcoded, se mantiene en i1 (deprecated i4)
 		"core/dedupe_ttl_minutes":                "60",     // 1 hora
 		"core/symbol_whitelist":                  "XAUUSD", // i0: solo XAUUSD
-		"core/log_level":                         "WARN",   // INFO, DEBUG, WARN, ERROR
+		"core/log_level":                         "DEBUG",  // INFO, DEBUG, WARN, ERROR
 		"core/specs/default_lot":                 "0.10",
 		"core/specs/missing_policy":              "reject",
 		"core/specs/max_age_ms":                  "10000",
@@ -75,9 +75,10 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		"core/risk/enable_currency_fallback":     "false",
 		"core/risk/reject_on_missing_tick_value": "true",
 		"core/protocol/min_version":              "1",
-		"core/protocol/max_version":              "2",
+		"core/protocol/max_version":              "3",
 		"core/protocol/required_features":        "spec_report/v1,quotes/250ms,spec_report/tickvalue",
 		"core/protocol/retry_interval_ms":        "600000",
+		"core/delivery/heartbeat_interval_ms":    "1000",
 
 		// Slave Accounts (i0: cuentas demo reales)
 		"core/slave_accounts": "2089126183,2089126186",
@@ -104,9 +105,11 @@ func TestSeedEchoConfig_Development(t *testing.T) {
 		"telemetry/environment":     "development",
 
 		// Agent protocolo
-		"agent/protocol/min_version":  "1",
-		"agent/protocol/max_version":  "2",
-		"agent/protocol/allow_legacy": "true",
+		"agent/protocol/min_version":    "1",
+		"agent/protocol/max_version":    "3",
+		"agent/protocol/allow_legacy":   "true",
+		"agent/delivery/ack_timeout_ms": "150",
+		"agent/delivery/max_retries":    "100",
 
 		// Policies (por cuenta - ejemplo)
 		// TODO i2+: mover a DB con ETCD watches

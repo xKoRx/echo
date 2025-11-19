@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/xKoRx/echo/sdk/domain/handshake"
 	pb "github.com/xKoRx/echo/sdk/pb/v1"
@@ -140,9 +141,18 @@ func (a *Agent) routeCoreMessage(msg *pb.CoreMessage) error {
 	case *pb.CoreMessage_SymbolRegistrationResult:
 		return a.routeSymbolRegistrationResult(payload.SymbolRegistrationResult)
 
+	case *pb.CoreMessage_CoreHello:
+		a.handleCoreHello(payload.CoreHello)
+		return nil
+
+	case *pb.CoreMessage_DeliveryHeartbeat:
+		a.handleDeliveryHeartbeat(payload.DeliveryHeartbeat)
+		return nil
+
 	default:
 		a.logWarn("Unknown message type from Core", map[string]interface{}{
-			"type": fmt.Sprintf("%T", payload),
+			"type":    fmt.Sprintf("%T", payload),
+			"raw_msg": msg.String(),
 		})
 		return nil
 	}
@@ -200,9 +210,25 @@ func (a *Agent) routeExecuteOrder(order *pb.ExecuteOrder) error {
 		return fmt.Errorf("pipe not found: %s (target: %s)", pipeName, order.TargetClientId)
 	}
 
+	if a.delivery != nil {
+		if err := a.delivery.HandleExecuteOrder(order); err != nil {
+			return fmt.Errorf("delivery register execute: %w", err)
+		}
+	}
+
 	// Escribir al pipe (transforma Proto → JSON internamente)
+	start := time.Now()
 	if err := handler.WriteMessage(order); err != nil {
+		if a.delivery != nil {
+			a.delivery.HandlePipeResult(order.CommandId, false, err)
+		}
+		a.recordPipeDeliveryLatency(accountID, "error", time.Since(start))
 		return fmt.Errorf("failed to write to pipe: %w", err)
+	}
+	a.recordPipeDeliveryLatency(accountID, "ok", time.Since(start))
+
+	if a.delivery != nil {
+		a.delivery.HandlePipeResult(order.CommandId, true, nil)
 	}
 
 	// Registrar métrica
@@ -268,9 +294,25 @@ func (a *Agent) routeCloseOrder(order *pb.CloseOrder) error {
 		return fmt.Errorf("pipe not found: %s (target: %s)", pipeName, order.TargetClientId)
 	}
 
+	if a.delivery != nil {
+		if err := a.delivery.HandleCloseOrder(order); err != nil {
+			return fmt.Errorf("delivery register close: %w", err)
+		}
+	}
+
 	// Escribir al pipe (transforma Proto → JSON internamente)
+	start := time.Now()
 	if err := handler.WriteMessage(order); err != nil {
+		if a.delivery != nil {
+			a.delivery.HandlePipeResult(order.CommandId, false, err)
+		}
+		a.recordPipeDeliveryLatency(accountID, "error", time.Since(start))
 		return fmt.Errorf("failed to write CloseOrder to pipe: %w", err)
+	}
+	a.recordPipeDeliveryLatency(accountID, "ok", time.Since(start))
+
+	if a.delivery != nil {
+		a.delivery.HandlePipeResult(order.CommandId, true, nil)
 	}
 
 	a.logInfo("CloseOrder dispatched to Slave", map[string]interface{}{
@@ -362,6 +404,28 @@ func handshakeStatusString(status handshake.RegistrationStatus) string {
 	}
 }
 
+func (a *Agent) handleCoreHello(hello *pb.CoreHello) {
+	if hello == nil {
+		return
+	}
+	a.logInfo("CoreHello received", map[string]interface{}{
+		"required_protocol_version": hello.RequiredProtocolVersion,
+		"lossless_required":         hello.LosslessRequired,
+		"service_version":           hello.ServiceVersion,
+		"compat_mode":               hello.CompatModeActive,
+	})
+}
+
+func (a *Agent) handleDeliveryHeartbeat(hb *pb.DeliveryHeartbeat) {
+	if hb == nil {
+		return
+	}
+	if a.delivery != nil {
+		a.delivery.UpdateConfig(hb)
+	}
+	a.updateMasterDeliveryConfig(hb)
+}
+
 // logSentMessage loggea un mensaje enviado al Core según su tipo.
 func (a *Agent) logSentMessage(msg *pb.AgentMessage) {
 	switch payload := msg.Payload.(type) {
@@ -404,6 +468,8 @@ func (a *Agent) sendAgentHello() error {
 		Os:       runtime.GOOS,
 		Symbols:  make(map[string]*pb.SymbolInfo), // TODO i3: reportar símbolos
 		// NO incluye owned_accounts ni connected_clients (deprecated i2)
+		ProtocolVersion:          uint32(a.config.ProtocolMaxVersion),
+		SupportsLosslessDelivery: true,
 	}
 
 	msg := &pb.AgentMessage{

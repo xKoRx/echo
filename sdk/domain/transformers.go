@@ -97,20 +97,20 @@ func JSONToTradeIntent(m map[string]interface{}) (*pb.TradeIntent, error) {
 // Si la whitelist está vacía se usa el fallback histórico `[]string{"XAUUSD"}` para mantener compatibilidad.
 func JSONToTradeIntentWithWhitelist(m map[string]interface{}, whitelist []string) (*pb.TradeIntent, error) {
 	intent, err := buildTradeIntentFromJSON(m)
- 	if err != nil {
- 		return nil, err
- 	}
+	if err != nil {
+		return nil, err
+	}
 
- 	effective := whitelist
- 	if len(effective) == 0 {
- 		effective = []string{"XAUUSD"}
- 	}
+	effective := whitelist
+	if len(effective) == 0 {
+		effective = []string{"XAUUSD"}
+	}
 
- 	if err := ValidateTradeIntent(intent, effective); err != nil {
- 		return nil, fmt.Errorf("validation failed: %w", err)
- 	}
+	if err := ValidateTradeIntent(intent, effective); err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
+	}
 
- 	return intent, nil
+	return intent, nil
 }
 
 func buildTradeIntentFromJSON(m map[string]interface{}) (*pb.TradeIntent, error) {
@@ -226,6 +226,55 @@ func TradeIntentToJSON(intent *pb.TradeIntent) (map[string]interface{}, error) {
 	}
 
 	return result, nil
+}
+
+// TradeIntentAckToJSON convierte un TradeIntentAck proto a JSON map listo para pipes master.
+func TradeIntentAckToJSON(ack *pb.TradeIntentAck) (map[string]interface{}, error) {
+	if ack == nil {
+		return nil, NewError(ErrMissingRequiredField, "TradeIntentAck is nil")
+	}
+
+	attempt := ack.Attempt
+	if attempt == 0 {
+		attempt = 1
+	}
+
+	payload := map[string]interface{}{
+		"trade_id": ack.TradeId,
+		"attempt":  attempt,
+		"result":   tradeIntentAckResultToString(ack.Result),
+	}
+
+	if ack.CommandId != "" {
+		payload["command_id"] = ack.CommandId
+	}
+	if ack.ObservedAtMs > 0 {
+		payload["observed_at_ms"] = ack.ObservedAtMs
+	}
+	if ack.ErrorCode != pb.ErrorCode_ERROR_CODE_UNSPECIFIED {
+		payload["error_code"] = protoErrorCodeToString(ack.ErrorCode)
+	}
+	if ack.ErrorMessage != "" {
+		payload["error_message"] = ack.ErrorMessage
+	}
+
+	return map[string]interface{}{
+		"type":    "trade_intent_ack",
+		"payload": payload,
+	}, nil
+}
+
+func tradeIntentAckResultToString(result pb.TradeIntentAckResult) string {
+	switch result {
+	case pb.TradeIntentAckResult_TRADE_INTENT_ACK_RESULT_OK:
+		return "OK"
+	case pb.TradeIntentAckResult_TRADE_INTENT_ACK_RESULT_RETRY:
+		return "RETRY"
+	case pb.TradeIntentAckResult_TRADE_INTENT_ACK_RESULT_FAILED:
+		return "FAILED"
+	default:
+		return "UNSPECIFIED"
+	}
 }
 
 // JSONToExecuteOrder convierte un map JSON a ExecuteOrder proto.
@@ -464,6 +513,37 @@ func ExecutionResultToJSON(result *pb.ExecutionResult) (map[string]interface{}, 
 		"type":    "execution_result",
 		"payload": payload,
 	}, nil
+}
+
+// JSONToPipeDeliveryAck convierte un map JSON (pipe_delivery_ack) a PipeDeliveryAck proto.
+func JSONToPipeDeliveryAck(m map[string]interface{}) (*pb.PipeDeliveryAck, error) {
+	payload, ok := m["payload"].(map[string]interface{})
+	if !ok {
+		return nil, NewError(ErrMissingRequiredField, "payload not found")
+	}
+
+	ack := &pb.PipeDeliveryAck{
+		CommandId:       utils.ExtractString(payload, "command_id"),
+		TargetAccountId: utils.ExtractString(payload, "target_account_id"),
+		ObservedAtMs:    utils.ExtractInt64(payload, "observed_at_ms"),
+	}
+
+	switch strings.ToUpper(strings.TrimSpace(utils.ExtractString(payload, "result"))) {
+	case "OK":
+		ack.Result = pb.PipeDeliveryAckResult_PIPE_DELIVERY_ACK_RESULT_OK
+	case "RETRY":
+		ack.Result = pb.PipeDeliveryAckResult_PIPE_DELIVERY_ACK_RESULT_RETRY
+	case "FAILED":
+		ack.Result = pb.PipeDeliveryAckResult_PIPE_DELIVERY_ACK_RESULT_FAILED
+	default:
+		ack.Result = pb.PipeDeliveryAckResult_PIPE_DELIVERY_ACK_RESULT_UNSPECIFIED
+	}
+
+	if errMsg := utils.ExtractString(payload, "error_message"); errMsg != "" {
+		ack.ErrorMessage = errMsg
+	}
+
+	return ack, nil
 }
 
 // JSONToTradeClose convierte un map JSON a TradeClose proto.

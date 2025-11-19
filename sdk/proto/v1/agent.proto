@@ -3,6 +3,7 @@ syntax = "proto3";
 package echo.v1;
 
 import "v1/trade.proto";
+import "v1/common.proto";
 
 option go_package = "github.com/xKoRx/echo/sdk/pb/v1;echov1";
 
@@ -33,6 +34,7 @@ message AgentMessage {
     AccountSymbolsReport account_symbols_report = 19; // NEW i3
     SymbolSpecReport symbol_spec_report = 20;         // NEW i3+ specs
     SymbolQuoteSnapshot symbol_quote_snapshot = 21;   // NEW i3+ quotes
+    CommandAck command_ack = 22;                      // NEW i17 delivery ledger
   }
 }
 
@@ -47,6 +49,8 @@ message CoreMessage {
     ConfigUpdate config_update = 13;
     Ack ack = 14;
     SymbolRegistrationResult symbol_registration_result = 15; // NEW i5
+    CoreHello core_hello = 16;                      // NEW i17
+    DeliveryHeartbeat delivery_heartbeat = 17;      // NEW i17
   }
 }
 
@@ -122,6 +126,52 @@ message AgentHello {
   repeated string owned_accounts = 6 [deprecated = true];
   // symbols deprecated i3 (reservado, no se usa en i3; reporte per-account via AccountSymbolsReport)
   map<string, SymbolInfo> symbols = 7 [deprecated = true];
+  uint32 protocol_version = 8;              // NEW i17: versión negociada local del Agent
+  bool supports_lossless_delivery = 9;      // NEW i17: indica si soporta ledger/acks end-to-end
+}
+
+// CoreHello respuesta inmediata del Core tras AgentHello (i17).
+message CoreHello {
+  uint32 required_protocol_version = 1;
+  bool lossless_required = 2;
+  string service_version = 3;
+  bool compat_mode_active = 4;
+}
+
+// AckStage etapas del ledger end-to-end (i17).
+enum AckStage {
+  ACK_STAGE_UNSPECIFIED = 0;
+  ACK_STAGE_CORE_ACCEPTED = 1;
+  ACK_STAGE_AGENT_BUFFERED = 2;
+  ACK_STAGE_PIPE_DELIVERED = 3;
+  ACK_STAGE_EA_CONFIRMED = 4;
+}
+
+// AckResult resultado de la transición por etapa (i17).
+enum AckResult {
+  ACK_RESULT_UNSPECIFIED = 0;
+  ACK_RESULT_PENDING = 1;
+  ACK_RESULT_OK = 2;
+  ACK_RESULT_FAILED = 3;
+}
+
+// CommandAck transporta los acks de entrega desde Agent hacia Core (i17).
+message CommandAck {
+  string command_id = 1;
+  AckStage stage = 2;
+  AckResult result = 3;
+  uint32 attempt = 4;
+  int64 observed_at_ms = 5;
+  ErrorCode error_code = 6;
+  string error_message = 7;
+}
+
+// DeliveryHeartbeat sincroniza parámetros globales de retries/heartbeat (i17).
+message DeliveryHeartbeat {
+  uint32 heartbeat_interval_ms = 1;
+  repeated uint32 retry_backoff_ms = 2;
+  uint32 max_retries = 3;
+  uint32 ack_timeout_ms = 4;
 }
 
 // AccountConnected notifica al Core que una cuenta se conectó al Agent (i2).

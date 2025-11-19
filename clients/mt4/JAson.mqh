@@ -294,7 +294,7 @@ private:
                case 'r': result += "\r"; break;
                case '\\': result += "\\"; break;
                case '\"': result += "\""; break;
-               default: result += CharToStr(escaped); break;
+               default: result += CharToString((ushort)escaped); break;
             }
             pos++;
          }
@@ -306,7 +306,7 @@ private:
          }
          else
          {
-            result += CharToStr(ch);
+            result += CharToString((ushort)ch);
             pos++;
          }
       }

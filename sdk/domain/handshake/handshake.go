@@ -19,6 +19,8 @@ const (
 	ProtocolVersionV1 = 1
 	// ProtocolVersionV2 representa la versión introducida en i5.
 	ProtocolVersionV2 = 2
+	// ProtocolVersionV3 representa la versión introducida en i17 (End-to-End Lossless Retry).
+	ProtocolVersionV3 = 3
 )
 
 var (

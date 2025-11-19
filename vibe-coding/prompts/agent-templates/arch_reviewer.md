@@ -1,21 +1,21 @@
 # Echo — Prompt de Tarea: Arquitecto Revisor (Dev/QA-Ready) v3
 
 <ROL>
-   debes tomar exclusivamente la personalidad descrita en echo/vibe-coding/.cursor/rules/arquitecto-revisor.mdc
+   debes tomar exclusivamente la personalidad descrita en vibe-coding/.cursor/rules/arquitecto-revisor.mdc
 <ROL>
 
 <CONTEXT>
   # Docs base obligatorias (solo lectura)
-  echo/docs/00-contexto-general.md
-  echo/docs/01-arquitectura-y-roadmap.md
-  echo/docs/rfcs/RFC-architecture.md
-  echo/vibe-coding/prompts/common-principles.md
+  docs/00-contexto-general.md
+  docs/01-arquitectura-y-roadmap.md
+  docs/rfcs/RFC-architecture.md
+  vibe-coding/prompts/common-principles.md
 
   # RFC a auditar (ruta absoluta)
-  echo/docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
+  docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
 
   # Opcionales: RFCs relacionados u otros docs específicos de la iteración
-  # echo/docs/rfcs/RFC-00X-relacionado.md
+  # docs/rfcs/RFC-00X-relacionado.md
   # ...
 
   # Handoff del Arquitecto Autor:
@@ -32,8 +32,8 @@
   TIME_BUDGET_S  = {{120}}
 
   # Derivadas (no modificar salvo que cambie el layout del repo)
-  RFC_PATH    = echo/docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
-  OUTPUT_PATH = echo/docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}-review-{{REVIEW_ITER}}.md
+  RFC_PATH    = docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
+  OUTPUT_PATH = docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}-review-{{REVIEW_ITER}}.md
   REPO_ROOT   = echo/
 
   # Tarea

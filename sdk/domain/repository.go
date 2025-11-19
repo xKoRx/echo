@@ -187,6 +187,8 @@ type RepositoryFactory interface {
 	SymbolQuoteRepository() SymbolQuoteRepository
 	RiskPolicyRepository() RiskPolicyRepository
 	HandshakeRepository() HandshakeEvaluationRepository
+	DeliveryJournalRepository() DeliveryJournalRepository
+	DeliveryRetryEventRepository() DeliveryRetryEventRepository
 }
 
 // HandshakeEvaluationRepository define operaciones para persistir evaluaciones de handshake.

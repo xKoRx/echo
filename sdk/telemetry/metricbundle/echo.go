@@ -2,6 +2,7 @@ package metricbundle
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -80,6 +81,11 @@ type EchoMetrics struct {
 	RouterDispatch             metric.Int64Counter
 	RouterDispatchDuration     metric.Float64Histogram
 	RouterRejections           metric.Int64Counter
+	DeliveryCompatMode         metric.Int64Counter
+	DeliveryRetryTotal         metric.Int64Counter
+	DeliveryPendingAge         metric.Float64Histogram
+	AgentPipeRetryTotal        metric.Int64Counter
+	AgentPipeDeliveryLatency   metric.Float64Histogram
 
 	// Histograms
 	LatencyE2E               metric.Float64Histogram
@@ -103,6 +109,9 @@ type EchoMetrics struct {
 	SymbolsReported metric.Int64Counter // echo.symbols.reported
 	SymbolsValidate metric.Int64Counter // echo.symbols.validate (ok/reject)
 	SymbolsLoaded   metric.Int64Counter // echo.symbols.loaded (source=etcd/postgres/agent_report)
+
+	// i17: Buffer depth métricas EA
+	TradeIntentBufferDepth metric.Float64Histogram
 }
 
 const routerComponentName = "core.router"
@@ -454,6 +463,60 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		return nil, err
 	}
 
+	deliveryCompatMode, err := meter.Int64Counter(
+		"echo_core.delivery.compat_mode_total",
+		metric.WithDescription("Conexiones en modo compatibilidad de delivery lossless"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	deliveryRetryTotal, err := meter.Int64Counter(
+		"echo_core.delivery.retry_total",
+		metric.WithDescription("Reintentos de envío Core→Agent"),
+		metric.WithUnit("{retry}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	deliveryPendingAge, err := meter.Float64Histogram(
+		"echo_core.delivery.pending_age_ms",
+		metric.WithDescription("Edad de los comandos pendientes/ack en milisegundos"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agentPipeRetryTotal, err := meter.Int64Counter(
+		"echo_agent.pipe.retry_total",
+		metric.WithDescription("Reintentos de envío Agent→EA (Named Pipe)"),
+		metric.WithUnit("{retry}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tradeIntentBufferDepth, err := meter.Float64Histogram(
+		"echo_ea.trade_intent.buffer_depth",
+		metric.WithDescription("Profundidad del IntentQueue del Master EA"),
+		metric.WithUnit("{intent}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agentPipeDeliveryLatency, err := meter.Float64Histogram(
+		"echo_agent.pipe.delivery_latency_ms",
+		metric.WithDescription("Latencia Agent→EA (pipeline Named Pipe) por intento"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// i2: Routing metrics
 	routingMode, err := meter.Int64Counter(
 		"echo.routing.mode",
@@ -549,6 +612,12 @@ func NewEchoMetrics(meter metric.Meter) (*EchoMetrics, error) {
 		RouterDispatch:             routerDispatch,
 		RouterDispatchDuration:     routerDispatchDuration,
 		RouterRejections:           routerRejections,
+		DeliveryCompatMode:         deliveryCompatMode,
+		DeliveryRetryTotal:         deliveryRetryTotal,
+		DeliveryPendingAge:         deliveryPendingAge,
+		AgentPipeRetryTotal:        agentPipeRetryTotal,
+		AgentPipeDeliveryLatency:   agentPipeDeliveryLatency,
+		TradeIntentBufferDepth:     tradeIntentBufferDepth,
 		RoutingMode:                routingMode,     // i2
 		AccountLookup:              accountLookup,   // i2
 		SymbolsLookup:              symbolsLookup,   // i3
@@ -910,6 +979,84 @@ func (m *EchoMetrics) RecordRouterQueueDepth(ctx context.Context, workerID int, 
 	}
 	baseAttrs = append(baseAttrs, attrs...)
 	m.RouterQueueDepth.Add(ctx, delta, metric.WithAttributes(baseAttrs...))
+}
+
+// RecordDeliveryCompatMode registra agentes operando en modo compatibilidad de delivery.
+func (m *EchoMetrics) RecordDeliveryCompatMode(ctx context.Context, attrs ...attribute.KeyValue) {
+	if m.DeliveryCompatMode == nil {
+		return
+	}
+	m.DeliveryCompatMode.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordDeliveryRetry registra un reintento de envío Core→Agent.
+func (m *EchoMetrics) RecordDeliveryRetry(ctx context.Context, stage string, result string, attrs ...attribute.KeyValue) {
+	if m.DeliveryRetryTotal == nil {
+		return
+	}
+	allAttrs := append(attrs,
+		attribute.String("delivery_stage", stage),
+		attribute.String("result", result),
+	)
+	m.DeliveryRetryTotal.Add(ctx, 1, metric.WithAttributes(allAttrs...))
+}
+
+// RecordDeliveryPendingAge registra la edad acumulada de un comando pendiente.
+func (m *EchoMetrics) RecordDeliveryPendingAge(ctx context.Context, stage string, age time.Duration, attrs ...attribute.KeyValue) {
+	if m.DeliveryPendingAge == nil {
+		return
+	}
+	allAttrs := append(attrs, attribute.String("delivery_stage", stage))
+	m.DeliveryPendingAge.Record(ctx, float64(age.Milliseconds()), metric.WithAttributes(allAttrs...))
+}
+
+// RecordAgentPipeRetry registra los reintentos Agent→EA.
+func (m *EchoMetrics) RecordAgentPipeRetry(ctx context.Context, agentID, accountID, stage, result string, attrs ...attribute.KeyValue) {
+	if m.AgentPipeRetryTotal == nil {
+		return
+	}
+	allAttrs := []attribute.KeyValue{}
+	if agentID != "" {
+		allAttrs = append(allAttrs, attribute.String("agent_id", agentID))
+	}
+	if accountID != "" {
+		allAttrs = append(allAttrs, attribute.String("account_id", accountID))
+	}
+	if stage != "" {
+		allAttrs = append(allAttrs, attribute.String("delivery_stage", stage))
+	}
+	if result != "" {
+		allAttrs = append(allAttrs, attribute.String("result", result))
+	}
+	allAttrs = append(allAttrs, attrs...)
+	m.AgentPipeRetryTotal.Add(ctx, 1, metric.WithAttributes(allAttrs...))
+}
+
+// RecordAgentPipeDeliveryLatency mide la latencia del hop Agent→EA.
+func (m *EchoMetrics) RecordAgentPipeDeliveryLatency(ctx context.Context, agentID, accountID, result string, latency time.Duration, attrs ...attribute.KeyValue) {
+	if m.AgentPipeDeliveryLatency == nil {
+		return
+	}
+	allAttrs := make([]attribute.KeyValue, 0, 4+len(attrs))
+	if agentID != "" {
+		allAttrs = append(allAttrs, attribute.String("agent_id", agentID))
+	}
+	if accountID != "" {
+		allAttrs = append(allAttrs, attribute.String("account_id", accountID))
+	}
+	if result != "" {
+		allAttrs = append(allAttrs, attribute.String("result", result))
+	}
+	allAttrs = append(allAttrs, attrs...)
+	m.AgentPipeDeliveryLatency.Record(ctx, float64(latency.Milliseconds()), metric.WithAttributes(allAttrs...))
+}
+
+// RecordTradeIntentBufferDepth registra la profundidad del IntentQueue del Master EA.
+func (m *EchoMetrics) RecordTradeIntentBufferDepth(ctx context.Context, depth float64, attrs ...attribute.KeyValue) {
+	if m.TradeIntentBufferDepth == nil {
+		return
+	}
+	m.TradeIntentBufferDepth.Record(ctx, depth, metric.WithAttributes(attrs...))
 }
 
 // RecordRouterDispatch registra el resultado del procesamiento del worker.

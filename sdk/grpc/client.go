@@ -59,8 +59,8 @@ func DefaultClientConfig(target string) *ClientConfig {
 		MaxRetries:   3,
 		RetryBackoff: 2 * time.Second,
 		KeepAlive: &KeepAliveConfig{
-			Time:                60 * time.Second,
-			Timeout:             20 * time.Second,
+			Time:                5 * time.Second,
+			Timeout:             3 * time.Second,
 			PermitWithoutStream: true,
 		},
 	}

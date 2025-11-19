@@ -86,6 +86,9 @@ type Core struct {
 	telemetry   *telemetry.Client
 	echoMetrics *metricbundle.EchoMetrics
 
+	// Delivery (i17)
+	deliveryService *DeliveryService
+
 	// Handshake
 	handshakeEvaluator  *HandshakeEvaluator
 	handshakeRegistry   *HandshakeRegistry
@@ -117,6 +120,11 @@ type AgentConnection struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	createdAt time.Time
+
+	// Capacidades negociadas durante AgentHello (i17)
+	ProtocolVersion    uint32
+	SupportsLossless   bool
+	LosslessCompatMode bool
 }
 
 // New crea una nueva instancia de Core (i1).
@@ -326,6 +334,9 @@ func New(ctx context.Context) (*Core, error) {
 	// 8. Crear router
 	core.router = NewRouter(core)
 
+	// Delivery service (i17)
+	core.deliveryService = NewDeliveryService(core)
+
 	// Log de inicio
 	telClient.Info(coreCtx, "Core initialized (i3)",
 		attribute.Int("grpc_port", config.GRPCPort),
@@ -363,11 +374,11 @@ func (c *Core) Start() error {
 
 	// Crear servidor gRPC con KeepAlive (i1 - RFC-003 sección 7)
 	kaParams := keepalive.ServerParameters{
-		Time:    c.config.KeepAliveTime,    // default: 60s
-		Timeout: c.config.KeepAliveTimeout, // default: 20s
+		Time:    c.config.KeepAliveTime,    // default: 1s (enforced 1–5s)
+		Timeout: c.config.KeepAliveTimeout, // default: 1s (enforced 1–5s)
 	}
 	kaPolicy := keepalive.EnforcementPolicy{
-		MinTime:             c.config.KeepAliveMinTime, // default: 10s
+		MinTime:             c.config.KeepAliveMinTime, // default: 1s (enforced 1–5s)
 		PermitWithoutStream: false,                     // no pings sin stream activo
 	}
 
@@ -403,6 +414,13 @@ func (c *Core) Start() error {
 		return fmt.Errorf("failed to start router: %w", err)
 	}
 
+	// Arrancar delivery service (i17)
+	if c.deliveryService != nil {
+		if err := c.deliveryService.Start(); err != nil {
+			return fmt.Errorf("failed to start delivery service: %w", err)
+		}
+	}
+
 	// Arrancar dedupe cleanup persistente (i1)
 	c.wg.Add(1)
 	go c.dedupeCleanupLoop()
@@ -410,6 +428,8 @@ func (c *Core) Start() error {
 	if c.handshakeReconciler != nil {
 		c.handshakeReconciler.Start()
 	}
+
+	c.startDeliveryHeartbeatLoop()
 
 	return nil
 }
@@ -616,6 +636,26 @@ func (c *Core) GetAgent(agentID string) (*AgentConnection, bool) {
 	return conn, exists
 }
 
+func (c *Core) agentSupportsLossless(agentID string) bool {
+	c.agentsMu.RLock()
+	defer c.agentsMu.RUnlock()
+	conn, ok := c.agents[agentID]
+	if !ok || conn == nil {
+		return false
+	}
+	return conn.SupportsLossless && !conn.LosslessCompatMode
+}
+
+func (c *Core) updateAgentCapabilities(agentID string, version uint32, supportsLossless bool, compat bool) {
+	c.agentsMu.Lock()
+	defer c.agentsMu.Unlock()
+	if conn, ok := c.agents[agentID]; ok && conn != nil {
+		conn.ProtocolVersion = version
+		conn.SupportsLossless = supportsLossless
+		conn.LosslessCompatMode = compat
+	}
+}
+
 // dedupeCleanupLoop limpia entries antiguos del dedupe store (persistente i1).
 func (c *Core) dedupeCleanupLoop() {
 	defer c.wg.Done()
@@ -665,6 +705,10 @@ func (c *Core) Shutdown() error {
 	// Detener router
 	if c.router != nil {
 		c.router.Stop()
+	}
+
+	if c.deliveryService != nil {
+		c.deliveryService.Stop()
 	}
 
 	if c.handshakeReconciler != nil {
@@ -717,6 +761,143 @@ func (c *Core) Shutdown() error {
 	return nil
 }
 
+// sendMessageToAgent envía un CoreMessage serializando el acceso al canal del agent.
+func (c *Core) sendMessageToAgent(ctx context.Context, agentID string, msg *pb.CoreMessage) error {
+	if agentID == "" {
+		return fmt.Errorf("agent_id vacío")
+	}
+	if msg == nil {
+		return fmt.Errorf("core message nil")
+	}
+
+	conn, ok := c.GetAgent(agentID)
+	if !ok || conn == nil {
+		return fmt.Errorf("agent %s no conectado", agentID)
+	}
+
+	timeout := c.config.Router.WorkerTimeout
+	if timeout <= 0 {
+		timeout = 50 * time.Millisecond
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case conn.SendCh <- msg:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("timeout enviando a agent %s", agentID)
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+}
+
+func (c *Core) deliveryConfigSnapshot() DeliveryConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cfg := c.config.Delivery
+	if len(cfg.RetryBackoff) > 0 {
+		backoff := make([]time.Duration, len(cfg.RetryBackoff))
+		copy(backoff, cfg.RetryBackoff)
+		cfg.RetryBackoff = backoff
+	}
+	return cfg
+}
+
+func (c *Core) sendDeliveryHeartbeat(agentID string, cfg DeliveryConfig) {
+	if agentID == "" {
+		return
+	}
+	hb := &pb.DeliveryHeartbeat{
+		HeartbeatIntervalMs: uint32(cfg.HeartbeatInterval / time.Millisecond),
+		MaxRetries:          uint32(cfg.MaxRetries),
+		AckTimeoutMs:        uint32(cfg.AckTimeout / time.Millisecond),
+	}
+	for _, d := range cfg.RetryBackoff {
+		if d <= 0 {
+			continue
+		}
+		hb.RetryBackoffMs = append(hb.RetryBackoffMs, uint32(d/time.Millisecond))
+	}
+
+	msg := &pb.CoreMessage{
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.CoreMessage_DeliveryHeartbeat{
+			DeliveryHeartbeat: hb,
+		},
+	}
+	if err := c.sendMessageToAgent(c.ctx, agentID, msg); err != nil {
+		c.telemetry.Warn(c.ctx, "Failed to send DeliveryHeartbeat",
+			attribute.String("agent_id", agentID),
+			attribute.String("error", err.Error()),
+		)
+	}
+}
+
+func (c *Core) broadcastDeliveryHeartbeat() {
+	c.broadcastDeliveryHeartbeatWithConfig(c.deliveryConfigSnapshot())
+}
+
+func (c *Core) broadcastDeliveryHeartbeatWithConfig(cfg DeliveryConfig) {
+	for _, agentID := range c.listAgentIDs() {
+		c.sendDeliveryHeartbeat(agentID, cfg)
+	}
+}
+
+func (c *Core) listAgentIDs() []string {
+	c.agentsMu.RLock()
+	defer c.agentsMu.RUnlock()
+	ids := make([]string, 0, len(c.agents))
+	for agentID := range c.agents {
+		ids = append(ids, agentID)
+	}
+	return ids
+}
+
+func (c *Core) refreshDeliveryConfig() DeliveryConfig {
+	cfg, err := LoadDeliveryRuntimeConfig(c.ctx)
+	if err != nil {
+		c.telemetry.Warn(c.ctx, "Failed to refresh delivery config",
+			attribute.String("error", err.Error()),
+		)
+		return c.deliveryConfigSnapshot()
+	}
+	c.mu.Lock()
+	c.config.Delivery = cfg
+	c.mu.Unlock()
+	if c.deliveryService != nil {
+		c.deliveryService.UpdateConfig(cfg)
+	}
+	return cfg
+}
+
+func (c *Core) startDeliveryHeartbeatLoop() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		for {
+			cfg := c.refreshDeliveryConfig()
+			c.broadcastDeliveryHeartbeatWithConfig(cfg)
+			interval := cfg.HeartbeatInterval
+			if interval <= 0 {
+				interval = time.Second
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-timer.C:
+				timer.Stop()
+				continue
+			case <-c.ctx.Done():
+				timer.Stop()
+				return
+			}
+		}
+	}()
+}
+
 // EvaluateHandshakeForAccount fuerza una re-evaluación de handshake para una cuenta específica.
 // send indica si el resultado debe reenviarse al Agent conectado.
 func (c *Core) EvaluateHandshakeForAccount(ctx context.Context, accountID string, send bool) (*handshake.Evaluation, error) {
@@ -761,7 +942,46 @@ func (c *Core) handleAgentHello(agentID string, hello *pb.AgentHello) {
 		attribute.String("version", hello.Version),
 		attribute.String("hostname", hello.Hostname),
 		attribute.String("os", hello.Os),
+		attribute.Int("protocol_version", int(hello.GetProtocolVersion())),
+		attribute.Bool("supports_lossless", hello.GetSupportsLosslessDelivery()),
 	)
+
+	requiredVersion := uint32(c.config.Protocol.MinVersion)
+	if requiredVersion == 0 {
+		requiredVersion = uint32(handshake.ProtocolVersionV2)
+	}
+	supportsLossless := hello.GetSupportsLosslessDelivery()
+	compatMode := !supportsLossless || hello.GetProtocolVersion() < requiredVersion
+
+	c.updateAgentCapabilities(agentID, hello.GetProtocolVersion(), supportsLossless, compatMode)
+
+	coreHello := &pb.CoreMessage{
+		TimestampMs: utils.NowUnixMilli(),
+		Payload: &pb.CoreMessage_CoreHello{
+			CoreHello: &pb.CoreHello{
+				RequiredProtocolVersion: requiredVersion,
+				LosslessRequired:        true,
+				ServiceVersion:          c.config.ServiceVersion,
+				CompatModeActive:        compatMode,
+			},
+		},
+	}
+	if err := c.sendMessageToAgent(c.ctx, agentID, coreHello); err != nil {
+		c.telemetry.Warn(c.ctx, "Failed to send CoreHello",
+			attribute.String("agent_id", agentID),
+			attribute.String("error", err.Error()),
+		)
+	}
+
+	if compatMode && c.echoMetrics != nil {
+		c.echoMetrics.RecordDeliveryCompatMode(c.ctx,
+			attribute.String("agent_id", agentID),
+			attribute.Int("protocol_version", int(hello.GetProtocolVersion())),
+		)
+	}
+
+	c.sendDeliveryHeartbeat(agentID, c.deliveryConfigSnapshot())
+
 	// No registra cuentas aquí; eso se hace dinámicamente con AccountConnected
 }
 

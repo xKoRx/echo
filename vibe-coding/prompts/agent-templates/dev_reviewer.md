@@ -1,22 +1,22 @@
-# echo/vibe-coding/prompts/revisor-codigo.request.md
+<ROL>
+   debes tomar exclusivamente la personalidad descrita en vibe-coding/.cursor/rules/revisor-codigo.mdc
+<ROL>
 
 <CONTEXT>
-  echo/vibe-coding/.cursor/rules/revisor-codigo.mdc
-
   # Docs base de Echo (mínimo estos tres)
   # Docs base obligatorias (solo lectura)
-  echo/docs/00-contexto-general.md
-  echo/docs/01-arquitectura-y-roadmap.md
-  echo/docs/rfcs/RFC-architecture.md
-  echo/vibe-coding/prompts/common-principles.md
+  docs/00-contexto-general.md
+  docs/01-arquitectura-y-roadmap.md
+  docs/rfcs/RFC-architecture.md
+  vibe-coding/prompts/common-principles.md
 
   # RFC y artefactos de la iteración
   @{{RFC_PATH}}                  # RFC aprobado de la iteración
   @{{IMPLEMENTATION_PATH}}       # IMPLEMENTATION.md del Dev
 
   # Otros docs relevantes (opcional, según feature)
-  # @echo/docs/telemetry/*.md
-  # @echo/docs/rfcs/RFC-00X-relacionado.md
+  # @docs/telemetry/*.md
+  # @docs/rfcs/RFC-00X-relacionado.md
   {{PROMPT_NEXT_AGENT}}
 </CONTEXT>
 
@@ -24,9 +24,9 @@
   # Vars de tarea (instanciar antes de invocar)
   ITERATION_SLUG   = {{ITERATION_SLUG}}          # p.ej. i8(a+b)
   RFC_NAME         = {{RFC_NAME}}                # slug kebab del RFC
-  RFC_PATH         = echo/docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
-  IMPLEMENTATION_PATH = echo/docs/rfcs/{{ITERATION_SLUG}}/IMPLEMENTATION.md
-  CR_PATH          = echo/docs/rfcs/{{ITERATION_SLUG}}/CR-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
+  RFC_PATH         = docs/rfcs/{{ITERATION_SLUG}}/RFC-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
+  IMPLEMENTATION_PATH = docs/rfcs/{{ITERATION_SLUG}}/IMPLEMENTATION.md
+  CR_PATH          = docs/rfcs/{{ITERATION_SLUG}}/CR-{{ITERATION_SLUG}}-{{RFC_NAME}}.md
   REVIEW_ITER      = {{REVIEW_ITER}}             # default: 1
   MAX_DOC_LINES    = 250
 

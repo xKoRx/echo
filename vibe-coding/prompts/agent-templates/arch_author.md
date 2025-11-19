@@ -2,19 +2,23 @@
 
 ```xml
 <ROL>
-   debes tomar exclusivamente la personalidad descrita en echo/vibe-coding/.cursor/rules/arquitecto-autor.mdc
+   debes tomar exclusivamente la personalidad descrita en vibe-coding/.cursor/rules/arquitecto-autor.mdc
 <ROL>
 
 <CONTEXT>
-    echo/docs/00-contexto-general.md
-    echo/docs/01-arquitectura-y-roadmap.md
-    echo/docs/rfcs/RFC-architecture.md
-    echo/vibe-coding/prompts/common-principles.md
-    echo/docs/templates/rfc.md
+    docs/00-contexto-general.md
+    docs/01-arquitectura-y-roadmap.md
+    docs/rfcs/RFC-architecture.md
+    vibe-coding/prompts/common-principles.md
+    docs/templates/rfc.md
 
   Puedes añadir RFCs relacionados u otros docs específicos:
-    @echo/docs/rfcs/RFC-00X-relacionado.md
+    @docs/rfcs/RFC-00X-relacionado.md
+    
 </CONTEXT>
+
+<EXTRA-CONTEXT>
+</EXTRA-CONTEXT>
 
 <REQUEST>
   # Vars de tarea (rellenar antes de invocar)

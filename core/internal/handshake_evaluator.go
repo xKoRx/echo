@@ -276,9 +276,9 @@ func (e *HandshakeEvaluator) buildEvaluation(
 			if specMaxAge > 0 && specAge > specMaxAge {
 				entry.Warnings = append(entry.Warnings, handshake.Issue{
 					Code:    handshake.IssueCodeSpecStale,
-					Message: fmt.Sprintf("Spec con %dms de antigüedad supera umbral", specAge.Milliseconds()),
+					Message: "Spec de antigüedad supera umbral configurado",
 					Metadata: map[string]string{
-						"spec_age_ms": fmt.Sprintf("%d", specAge.Milliseconds()),
+						"threshold_ms": fmt.Sprintf("%d", specMaxAge.Milliseconds()),
 					},
 				})
 				if entry.Status == handshake.RegistrationStatusAccepted {

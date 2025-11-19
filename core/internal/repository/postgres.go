@@ -31,6 +31,8 @@ type PostgresFactory struct {
 	symbolQuoteRepo domain.SymbolQuoteRepository
 	riskPolicyRepo  domain.RiskPolicyRepository
 	handshakeRepo   domain.HandshakeEvaluationRepository
+	deliveryJournal domain.DeliveryJournalRepository
+	deliveryRetry   domain.DeliveryRetryEventRepository
 }
 
 // NewPostgresFactory crea un factory de repositorios PostgreSQL.
@@ -128,6 +130,22 @@ func (f *PostgresFactory) HandshakeRepository() domain.HandshakeEvaluationReposi
 		f.handshakeRepo = &postgresHandshakeRepo{db: f.db}
 	}
 	return f.handshakeRepo
+}
+
+// DeliveryJournalRepository retorna el repositorio del journal de delivery.
+func (f *PostgresFactory) DeliveryJournalRepository() domain.DeliveryJournalRepository {
+	if f.deliveryJournal == nil {
+		f.deliveryJournal = &postgresDeliveryJournalRepo{db: f.db}
+	}
+	return f.deliveryJournal
+}
+
+// DeliveryRetryEventRepository retorna el repositorio del historial de retries.
+func (f *PostgresFactory) DeliveryRetryEventRepository() domain.DeliveryRetryEventRepository {
+	if f.deliveryRetry == nil {
+		f.deliveryRetry = &postgresDeliveryRetryRepo{db: f.db}
+	}
+	return f.deliveryRetry
 }
 
 // ===========================================================================

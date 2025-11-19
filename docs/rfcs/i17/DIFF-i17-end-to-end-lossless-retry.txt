@@ -1,0 +1,31 @@
++++ SDK
+* `sdk/proto/v1/trade.proto`: define `TradeIntentAck`/`PipeDeliveryAck` y regenerar pb.
+* `sdk/proto/v1/agent.proto` + `sdk/pb/v1/agent.pb.go`: `DeliveryHeartbeat` incluye `ack_timeout_ms` para alinear Core y Agent.
+* `sdk/domain/{delivery.go,repository.go}`: exponer repositorios y modelos de journal.
+* `sdk/domain/transformers.go`: helpers JSON↔proto para los nuevos acks.
+* `sdk/telemetry/metricbundle/echo.go`: contadores `delivery.compat_mode_total`, `delivery.retry_total`, `delivery.pending_age_ms`, `echo_agent.pipe.retry_total` y nuevo histograma `echo_ea.trade_intent.buffer_depth`.
+
++++ Core
+* `deploy/postgres/migrations/i17_delivery_journal.sql`: tablas `echo.delivery_journal` y `echo.delivery_retry_event`.
+* `core/internal/delivery_service.go`: el journal/reconciler ahora encapsula `Insert/UpdateStatus/AssignAgent/MarkAcked` con `withJournalRetry` (backoff ≤ `max_retries`), mantiene spans `core.delivery.*` y delega fallos no recuperables al router.
+* `core/internal/core.go/router.go`: integración con DeliveryService, handling `CommandAck`, envío de `CoreHello`/`DeliveryHeartbeat` y nueva ruta de error `core_delivery_failed` + `echo_core.delivery.retry_total{delivery_stage="journal"}` cuando se agotan reintentos.
+* `core/internal/core.go`: `startDeliveryHeartbeatLoop` recalcula el intervalo en runtime y reenvía heartbeats periódicos con la configuración fresca.
+* `core/internal/config.go`: factoriza `defaultDeliveryConfig`/`LoadDeliveryRuntimeConfig` (incluye `reconciler_interval_ms`) y sincroniza `grpc/keepalive/*` con `/echo/core/delivery/heartbeat_interval_ms`, imponiendo el rango 1–5 s en ambos binarios.
+* `core/internal/repository/delivery_postgres.go`: repositorio Postgres para journal/retry events.
+
++++ Agent
+* `agent/internal/delivery_manager.go` + `ack_ledger.go`: persist-before-send con RWMutex para la config, retries con backoff, métricas `echo_agent.pipe.retry_total`/`echo_agent.pipe.delivery_latency_ms`, spans `agent.pipe.delivery` y consumo explícito de `ack_timeout_ms`.
+* `agent/internal/pipe_manager.go`: registra `echo_ea.trade_intent.buffer_depth` usando `buffer_depth` enviado por el Master, genera spans `ea.intent.buffer` y envía mensajes `delivery_config` con la secuencia propagada desde `DeliveryHeartbeat`.
+* `agent/internal/master_delivery_config.go` + `pipe_manager_stub.go`: snapshot/thread-safe de backoff para maestros y stubs no-Windows.
+* `agent/internal/stream.go`: aborta envío a pipes si ledger falla, propaga errores y actualiza el snapshot de delivery al recibir `DeliveryHeartbeat`.
+* `agent/internal/config.go`: parámetros `Delivery.*`, path del ledger (Bolt) y clamp del `grpc/client_keepalive` para que use el mismo `heartbeat_interval_ms` global (1–5 s).
+
++++ Clients MT4
+* `clients/mt4/master.mq4`: `IntentQueue` persistente (archivo JSONL), `command_id` en intents/acks, campo `buffer_depth`, reintentos con `next_retry_ms` y soporte `delivery_config` para actualizar `retry_backoff_ms`/`max_retries` sin recompilar.
+* `clients/mt4/slave.mq4`: envío/consumo `PipeDeliveryAck` y gating handshake/precio antes de ejecutar.
+
++++ Docs
+* `docs/rfcs/i17/IMPLEMENTATION.md`: plan actualizado con broadcast de `retry_backoff_ms`, spans, enforcement de heartbeats y casos borde de Postgres.
+* `docs/rfcs/i17/IMPLEMENTATION-REPORT.md`: reporte de cierre de gaps H1/H2.
+* `docs/rfcs/i17/CI-i17-end-to-end-lossless-retry.md`: resultados de build/test/lint (fallo conocido de golangci-lint en Go 1.25).
+

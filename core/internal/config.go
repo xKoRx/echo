@@ -3,6 +3,7 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -12,6 +13,16 @@ import (
 	"github.com/xKoRx/echo/sdk/domain"
 	"github.com/xKoRx/echo/sdk/domain/handshake"
 	"github.com/xKoRx/echo/sdk/etcd"
+)
+
+const (
+	minGRPCHeartbeatSeconds = 1
+	maxGRPCHeartbeatSeconds = 5
+)
+
+var (
+	minHeartbeatInterval = time.Duration(minGRPCHeartbeatSeconds) * time.Second
+	maxHeartbeatInterval = time.Duration(maxGRPCHeartbeatSeconds) * time.Second
 )
 
 // Config configuración del Core (i1).
@@ -42,6 +53,7 @@ type Config struct {
 	Risk             RiskConfig
 	Protocol         ProtocolConfig
 	Router           RouterConfig
+	Delivery         DeliveryConfig
 
 	// PostgreSQL
 	PostgresHost        string // postgres/host
@@ -82,6 +94,36 @@ type ProtocolConfig struct {
 	RequiredFeatures []string
 	RetryInterval    time.Duration
 	VersionRange     *handshake.VersionRange
+}
+
+// DeliveryConfig agrupa parámetros del journal/ack i17.
+type DeliveryConfig struct {
+	AckTimeout         time.Duration
+	RetryBackoff       []time.Duration
+	MaxRetries         int
+	ReconcilerInterval time.Duration
+	HeartbeatInterval  time.Duration
+}
+
+func defaultDeliveryConfig() DeliveryConfig {
+	return DeliveryConfig{
+		AckTimeout: 150 * time.Millisecond,
+		RetryBackoff: []time.Duration{
+			50 * time.Millisecond,
+			100 * time.Millisecond,
+			200 * time.Millisecond,
+			400 * time.Millisecond,
+			800 * time.Millisecond,
+			1600 * time.Millisecond,
+			3200 * time.Millisecond,
+			6400 * time.Millisecond,
+			12800 * time.Millisecond,
+			25600 * time.Millisecond,
+		},
+		MaxRetries:         100,
+		ReconcilerInterval: 500 * time.Millisecond,
+		HeartbeatInterval:  1 * time.Second,
+	}
 }
 
 // FixedRiskEngineConfig agrupa la configuración del motor FixedRisk.
@@ -125,9 +167,9 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 	cfg := &Config{
 		// Defaults (sobrescritos por ETCD si existen)
 		GRPCPort:            50051,
-		KeepAliveTime:       60 * time.Second,
-		KeepAliveTimeout:    20 * time.Second,
-		KeepAliveMinTime:    10 * time.Second,
+		KeepAliveTime:       5 * time.Second,
+		KeepAliveTimeout:    3 * time.Second,
+		KeepAliveMinTime:    1 * time.Second,
 		DefaultLotSize:      0.10,
 		DedupeTTL:           60 * time.Minute,
 		SymbolWhitelist:     []string{"XAUUSD"}, // Deprecated i3, mantener para compatibilidad
@@ -161,7 +203,7 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		},
 		Protocol: ProtocolConfig{
 			MinVersion:       handshake.ProtocolVersionV1,
-			MaxVersion:       handshake.ProtocolVersionV2,
+			MaxVersion:       handshake.ProtocolVersionV3,
 			BlockedVersions:  []int{},
 			RequiredFeatures: []string{},
 			RetryInterval:    5 * time.Minute,
@@ -171,6 +213,7 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 			QueueDepthMax:  8,
 			WorkerTimeout:  50 * time.Millisecond,
 		},
+		Delivery: defaultDeliveryConfig(),
 	}
 
 	// Cargar endpoints
@@ -356,6 +399,47 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		}
 	}
 
+	// Delivery (i17)
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/ack_timeout_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.Delivery.AckTimeout = time.Duration(ms) * time.Millisecond
+		} else {
+			return nil, fmt.Errorf("invalid core/delivery/ack_timeout_ms: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/max_retries", ""); err == nil && val != "" {
+		if retries, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.Delivery.MaxRetries = retries
+		} else {
+			return nil, fmt.Errorf("invalid core/delivery/max_retries: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/reconciler_interval_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.Delivery.ReconcilerInterval = time.Duration(ms) * time.Millisecond
+		} else {
+			return nil, fmt.Errorf("invalid core/delivery/reconciler_interval_ms: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/heartbeat_interval_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.Delivery.HeartbeatInterval = time.Duration(ms) * time.Millisecond
+		} else {
+			return nil, fmt.Errorf("invalid core/delivery/heartbeat_interval_ms: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/retry_backoff_ms", ""); err == nil && val != "" {
+		var raw []int
+		if err := json.Unmarshal([]byte(strings.TrimSpace(val)), &raw); err != nil {
+			return nil, fmt.Errorf("invalid core/delivery/retry_backoff_ms JSON: %w", err)
+		}
+		backoff, err := parseBackoffSequence(raw)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Delivery.RetryBackoff = backoff
+	}
+
 	// Protocol versioning (i5)
 	protocolMin := cfg.Protocol.MinVersion
 	protocolMax := cfg.Protocol.MaxVersion
@@ -518,7 +602,91 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		return nil, fmt.Errorf("core/router/worker_timeout_ms must be between 20 and 200")
 	}
 
+	if err := cfg.applyDeliveryHeartbeatPolicy(); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.validateGRPCHeartbeat(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// LoadDeliveryRuntimeConfig obtiene únicamente la sección Delivery desde ETCD para refrescos en caliente.
+func LoadDeliveryRuntimeConfig(ctx context.Context) (DeliveryConfig, error) {
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "development"
+	}
+	etcdClient, err := etcd.New(
+		etcd.WithApp("echo"),
+		etcd.WithEnv(env),
+	)
+	if err != nil {
+		return DeliveryConfig{}, fmt.Errorf("failed to create ETCD client: %w", err)
+	}
+	defer etcdClient.Close()
+
+	cfg := defaultDeliveryConfig()
+
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/ack_timeout_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.AckTimeout = time.Duration(ms) * time.Millisecond
+		} else {
+			return DeliveryConfig{}, fmt.Errorf("invalid core/delivery/ack_timeout_ms: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/max_retries", ""); err == nil && val != "" {
+		if retries, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.MaxRetries = retries
+		} else {
+			return DeliveryConfig{}, fmt.Errorf("invalid core/delivery/max_retries: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/heartbeat_interval_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.HeartbeatInterval = time.Duration(ms) * time.Millisecond
+		} else {
+			return DeliveryConfig{}, fmt.Errorf("invalid core/delivery/heartbeat_interval_ms: %w", err)
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/retry_backoff_ms", ""); err == nil && val != "" {
+		var raw []int
+		if err := json.Unmarshal([]byte(strings.TrimSpace(val)), &raw); err != nil {
+			return DeliveryConfig{}, fmt.Errorf("invalid core/delivery/retry_backoff_ms JSON: %w", err)
+		}
+		backoff, err := parseBackoffSequence(raw)
+		if err != nil {
+			return DeliveryConfig{}, err
+		}
+		cfg.RetryBackoff = backoff
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/reconciler_interval_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.ReconcilerInterval = time.Duration(ms) * time.Millisecond
+		} else {
+			return DeliveryConfig{}, fmt.Errorf("invalid core/delivery/reconciler_interval_ms: %w", err)
+		}
+	}
+	return enforceDeliveryHeartbeatBounds(cfg)
+}
+
+func parseBackoffSequence(raw []int) ([]time.Duration, error) {
+	if len(raw) < 5 {
+		return nil, fmt.Errorf("core/delivery/retry_backoff_ms must include at least 5 values")
+	}
+	durations := make([]time.Duration, len(raw))
+	for i, ms := range raw {
+		if ms <= 0 {
+			return nil, fmt.Errorf("core/delivery/retry_backoff_ms values must be > 0")
+		}
+		if i > 0 && ms < raw[i-1] {
+			return nil, fmt.Errorf("core/delivery/retry_backoff_ms must be sorted ascending")
+		}
+		durations[i] = time.Duration(ms) * time.Millisecond
+	}
+	return durations, nil
 }
 
 // PostgresConnStr retorna el connection string de PostgreSQL.
@@ -542,4 +710,74 @@ func (c *Config) PostgresConnStr() string {
 
 func isPowerOfTwo(value int) bool {
 	return value > 0 && (value&(value-1)) == 0
+}
+
+func (c *Config) validateGRPCHeartbeat() error {
+	if c.KeepAliveTime < minHeartbeatInterval || c.KeepAliveTime > maxHeartbeatInterval {
+		return fmt.Errorf("grpc/keepalive/time_s must be between %d and %d seconds, got %s",
+			minGRPCHeartbeatSeconds, maxGRPCHeartbeatSeconds, c.KeepAliveTime)
+	}
+	if c.KeepAliveTimeout < minHeartbeatInterval || c.KeepAliveTimeout > maxHeartbeatInterval {
+		return fmt.Errorf("grpc/keepalive/timeout_s must be between %d and %d seconds, got %s",
+			minGRPCHeartbeatSeconds, maxGRPCHeartbeatSeconds, c.KeepAliveTimeout)
+	}
+	if c.KeepAliveMinTime < minHeartbeatInterval || c.KeepAliveMinTime > maxHeartbeatInterval {
+		return fmt.Errorf("grpc/keepalive/min_time_s must be between %d and %d seconds, got %s",
+			minGRPCHeartbeatSeconds, maxGRPCHeartbeatSeconds, c.KeepAliveMinTime)
+	}
+	if c.KeepAliveMinTime > c.KeepAliveTime {
+		return fmt.Errorf("grpc/keepalive/min_time_s (%s) cannot exceed keepalive time (%s)",
+			c.KeepAliveMinTime, c.KeepAliveTime)
+	}
+	if c.KeepAliveTimeout > c.KeepAliveTime {
+		return fmt.Errorf("grpc/keepalive/timeout_s (%s) cannot exceed keepalive time (%s)",
+			c.KeepAliveTimeout, c.KeepAliveTime)
+	}
+	return nil
+}
+
+func (c *Config) applyDeliveryHeartbeatPolicy() error {
+	interval, err := normalizeHeartbeatInterval(c.Delivery.HeartbeatInterval)
+	if err != nil {
+		return err
+	}
+	c.Delivery.HeartbeatInterval = interval
+	c.KeepAliveTime = interval
+	c.KeepAliveMinTime = interval
+	c.KeepAliveTimeout = deriveKeepAliveTimeout(interval)
+	return nil
+}
+
+func normalizeHeartbeatInterval(value time.Duration) (time.Duration, error) {
+	if value <= 0 {
+		return minHeartbeatInterval, nil
+	}
+	if value < minHeartbeatInterval || value > maxHeartbeatInterval {
+		return 0, fmt.Errorf("core/delivery/heartbeat_interval_ms must be between %d and %d milliseconds, got %s",
+			minHeartbeatInterval.Milliseconds(),
+			maxHeartbeatInterval.Milliseconds(),
+			value,
+		)
+	}
+	return value, nil
+}
+
+func deriveKeepAliveTimeout(interval time.Duration) time.Duration {
+	timeout := interval / 2
+	if timeout < minHeartbeatInterval {
+		timeout = minHeartbeatInterval
+	}
+	if timeout > interval {
+		timeout = interval
+	}
+	return timeout
+}
+
+func enforceDeliveryHeartbeatBounds(cfg DeliveryConfig) (DeliveryConfig, error) {
+	interval, err := normalizeHeartbeatInterval(cfg.HeartbeatInterval)
+	if err != nil {
+		return DeliveryConfig{}, err
+	}
+	cfg.HeartbeatInterval = interval
+	return cfg, nil
 }

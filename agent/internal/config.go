@@ -3,13 +3,21 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/xKoRx/echo/sdk/etcd"
+)
+
+const (
+	minClientHeartbeatSeconds = 1
+	maxClientHeartbeatSeconds = 5
 )
 
 // Config configuración del Agent (i1).
@@ -45,6 +53,9 @@ type Config struct {
 	ProtocolMaxVersion  int
 	ProtocolAllowLegacy bool
 
+	// Delivery/Ack (i17)
+	Delivery DeliveryConfig
+
 	// Telemetry
 	ServiceName     string // telemetry/service_name
 	ServiceVersion  string // telemetry/service_version
@@ -52,6 +63,14 @@ type Config struct {
 	OTLPEndpoint    string // endpoints/otel/otlp_endpoint
 	MetricsEndpoint string // endpoints/otel/metrics_endpoint
 	LogLevel        string // agent/log_level (INFO, DEBUG, WARN, ERROR)
+}
+
+// DeliveryConfig define parámetros locales del ledger de comandos (i17).
+type DeliveryConfig struct {
+	AckTimeout   time.Duration
+	RetryBackoff []time.Duration
+	MaxRetries   int
+	LedgerPath   string
 }
 
 // LoadConfig carga configuración desde ETCD.
@@ -102,8 +121,8 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		FlushForce:          false,
 		SendQueueSize:       100,
 		ReconnectBackoff:    5 * time.Second,
-		KeepAliveTime:       60 * time.Second,
-		KeepAliveTimeout:    20 * time.Second,
+		KeepAliveTime:       5 * time.Second,
+		KeepAliveTimeout:    3 * time.Second,
 		PermitWithoutStream: false,
 		ServiceName:         "echo-agent",
 		ServiceVersion:      "1.0.0-i1",
@@ -111,9 +130,15 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		LogLevel:            "INFO", // Default
 		CanonicalSymbols:    []string{"XAUUSD"},
 		ProtocolMinVersion:  1,
-		ProtocolMaxVersion:  2,
+		ProtocolMaxVersion:  3,
 		ProtocolAllowLegacy: true,
+		Delivery: DeliveryConfig{
+			AckTimeout:   150 * time.Millisecond,
+			RetryBackoff: []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond},
+			MaxRetries:   100,
+		},
 	}
+	cfg.Delivery.LedgerPath = defaultLedgerPath(cfg.AgentID)
 	if val, err := etcdClient.GetVarWithDefault(ctx, "core/canonical_symbols", ""); err == nil && val != "" {
 		symbols := strings.Split(val, ",")
 		for i := range symbols {
@@ -202,6 +227,43 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		}
 	}
 
+	// Delivery overrides
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/delivery/ack_timeout_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && ms > 0 {
+			cfg.Delivery.AckTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/delivery/retry_backoff_ms", ""); err == nil && val != "" {
+		var raw []int
+		if err := json.Unmarshal([]byte(strings.TrimSpace(val)), &raw); err == nil && len(raw) > 0 {
+			backoff := make([]time.Duration, 0, len(raw))
+			for _, ms := range raw {
+				if ms <= 0 {
+					continue
+				}
+				backoff = append(backoff, time.Duration(ms)*time.Millisecond)
+			}
+			if len(backoff) > 0 {
+				cfg.Delivery.RetryBackoff = backoff
+			}
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/delivery/max_retries", ""); err == nil && val != "" {
+		if retries, err := strconv.Atoi(val); err == nil {
+			cfg.Delivery.MaxRetries = retries
+		}
+	}
+	if val, err := etcdClient.GetVarWithDefault(ctx, "agent/delivery/ledger_path", ""); err == nil && val != "" {
+		cfg.Delivery.LedgerPath = strings.TrimSpace(val)
+	}
+
+	deliveryHeartbeatInterval := time.Second
+	if val, err := etcdClient.GetVarWithDefault(ctx, "core/delivery/heartbeat_interval_ms", ""); err == nil && val != "" {
+		if ms, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && ms > 0 {
+			deliveryHeartbeatInterval = time.Duration(ms) * time.Millisecond
+		}
+	}
+
 	// Cargar gRPC KeepAlive cliente
 	if val, err := etcdClient.GetVarWithDefault(ctx, "grpc/client_keepalive/time_s", ""); err == nil && val != "" {
 		if seconds, err := strconv.Atoi(val); err == nil {
@@ -218,6 +280,8 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 			cfg.PermitWithoutStream = permit
 		}
 	}
+
+	cfg.applyClientHeartbeatInterval(deliveryHeartbeatInterval)
 
 	// Cargar Telemetry
 	if val, err := etcdClient.GetVarWithDefault(ctx, "telemetry/service_name", ""); err == nil && val != "" {
@@ -243,5 +307,66 @@ func LoadConfig(ctx context.Context) (*Config, error) {
 		return nil, fmt.Errorf("agent/master_accounts or agent/slave_accounts not configured in ETCD")
 	}
 
+	if err := cfg.validateKeepAlive(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+func defaultLedgerPath(agentID string) string {
+	base := os.Getenv("PROGRAMDATA")
+	if runtime.GOOS != "windows" {
+		base = "/var/lib/echo"
+	}
+	if base == "" {
+		base = "."
+	}
+	return filepath.Join(base, "Echo", "agent", "acks", fmt.Sprintf("%s.db", agentID))
+}
+
+func (c *Config) validateKeepAlive() error {
+	min := time.Duration(minClientHeartbeatSeconds) * time.Second
+	max := time.Duration(maxClientHeartbeatSeconds) * time.Second
+
+	if c.KeepAliveTime < min || c.KeepAliveTime > max {
+		return fmt.Errorf("grpc/client_keepalive/time_s must be between %d and %d seconds, got %s",
+			minClientHeartbeatSeconds, maxClientHeartbeatSeconds, c.KeepAliveTime)
+	}
+	if c.KeepAliveTimeout < min || c.KeepAliveTimeout > max {
+		return fmt.Errorf("grpc/client_keepalive/timeout_s must be between %d and %d seconds, got %s",
+			minClientHeartbeatSeconds, maxClientHeartbeatSeconds, c.KeepAliveTimeout)
+	}
+	if c.KeepAliveTimeout > c.KeepAliveTime {
+		return fmt.Errorf("grpc/client_keepalive/timeout_s (%s) cannot exceed time_s (%s)",
+			c.KeepAliveTimeout, c.KeepAliveTime)
+	}
+	return nil
+}
+
+func (c *Config) applyClientHeartbeatInterval(interval time.Duration) {
+	min := time.Duration(minClientHeartbeatSeconds) * time.Second
+	max := time.Duration(maxClientHeartbeatSeconds) * time.Second
+
+	if interval <= 0 {
+		interval = min
+	}
+	if interval < min {
+		interval = min
+	}
+	if interval > max {
+		interval = max
+	}
+
+	c.KeepAliveTime = interval
+
+	timeout := interval / 2
+	if timeout < min {
+		timeout = min
+	}
+	if timeout > interval {
+		timeout = interval
+	}
+
+	c.KeepAliveTimeout = timeout
 }
